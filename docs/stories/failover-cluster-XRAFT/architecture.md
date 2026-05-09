@@ -467,7 +467,7 @@ The `EventLoop` in `xraft-server` connects the components:
     │                    │ persist + fsync     │                     │
     │                    │                     │                     │
     │                    │    ┌── Fetch round 1 ──┐                  │
-    │                    │◄───┤ FetchReq(off=4)   │                  │
+    │                    │◄───┤ FetchReq(off=5)   │                  │
     │                    │    └────────────────────┘                  │
     │                    │                     │                     │
     │                    │── FetchResp ────────►│                     │
@@ -476,7 +476,7 @@ The `EventLoop` in `xraft-server` connects the components:
     │                    │                     │ persist + fsync     │
     │                    │                     │                     │
     │                    │    ┌── Fetch from C ──────────────────────┐
-    │                    │◄───────────────────────┤ FetchReq(off=4) │
+    │                    │◄───────────────────────┤ FetchReq(off=5) │
     │                    │    └──────────────────────────────────────┘
     │                    │                     │                     │
     │                    │── FetchResp ─────────────────────────────►│
@@ -489,7 +489,7 @@ The `EventLoop` in `xraft-server` connects the components:
     │                    │ to state machine     │                     │
     │                    │                     │                     │
     │                    │    ┌── Fetch round 2 ──┐                  │
-    │                    │◄───┤ FetchReq(off=5)   │                  │
+    │                    │◄───┤ FetchReq(off=6)   │                  │
     │                    │    └────────────────────┘                  │
     │                    │                     │                     │
     │                    │── FetchResp ────────►│                     │
@@ -509,9 +509,9 @@ replication and is consistent with KRaft's design.
 ```
   Leader (A)                               Slow Follower (D)
     │                                           │
-    │◄────────── FetchReq(offset=100) ─────────┤
+    │◄────────── FetchReq(fetch_offset=101) ───┤
     │                                           │
-    │  [offset 100 < log_start_offset(500)]     │
+    │  [offset 101 < log_start_offset(501)]     │
     │                                           │
     │── FetchResp(snapshot_hint) ──────────────►│
     │   snapshot_id=(index=500, term=4)         │
@@ -527,8 +527,8 @@ replication and is consistent with KRaft's design.
     │                               machine          │
     │                               set log_start=500│
     │                                           │
-    │◄────────── FetchReq(offset=500) ─────────┤
-    │── FetchResp(entries=[501..]) ────────────►│
+    │◄────────── FetchReq(fetch_offset=501) ───┤
+    │── FetchResp(entries=[501,502,...]) ───────►│
     │                                           │
 ```
 
@@ -540,28 +540,32 @@ writes), the leader detects the mismatch and responds with a `DivergingEpoch`:
 ```
   Leader (A, term=3)                  Follower (B, has stale entries from term=2)
     │                                      │
-    │◄── FetchReq(offset=10, epoch=2) ────┤
+    │◄── FetchReq(fetch_offset=11,     ───┤
+    │             epoch=2)                 │
     │                                      │
     │  [leader checks leader-epoch-        │
     │   checkpoint: epoch 2 ended          │
     │   at offset 8]                       │
     │                                      │
     │── FetchResp ────────────────────────►│
-    │   diverging_epoch=(epoch=2, off=8)   │
+    │   diverging_epoch=(epoch=2, end=8)   │
     │                                      │
     │                    truncate_after(8)  │
     │                    persist            │
     │                                      │
-    │◄── FetchReq(offset=8, epoch=3) ─────┤
+    │◄── FetchReq(fetch_offset=9,      ───┤
+    │             epoch=3)                 │
     │── FetchResp(entries=[9,10,...]) ─────►│
     │                                      │
 ```
 
 ### 5.5 Check-Quorum Leader Step-Down
 
-Dynamic quorum changes (`AddVoter` / `RemoveVoter`) are **out of scope for v1**
-(see `tech-spec.md` §3). The voter set is fixed at bootstrap. Instead, this
-section documents the Check-Quorum protocol that prevents stale leadership:
+Dynamic quorum changes (`AddVoter` / `RemoveVoter`) are a **stretch goal** for
+this story (see `tech-spec.md` §2.7 and §3). The architecture defines
+`AddVoter`/`RemoveVoter` interfaces for future use, but the core v1
+implementation targets static membership with a fixed voter set at bootstrap.
+This section documents the Check-Quorum protocol that prevents stale leadership:
 
 ```
   Leader (A, term=3)            Follower (B)             Follower (C)
@@ -601,7 +605,7 @@ allows the reachable majority to elect a new leader.
 ## 6. Safety Invariants
 
 The following invariants are enforced by `xraft-core` and verified by
-`xraft-test` in every test run:
+`xraft-testkit` in every test run:
 
 | # | Invariant | Enforcement |
 |---|---|---|
@@ -685,7 +689,7 @@ http_listen_address = "0.0.0.0:9090"
 |---|---|---|
 | **Pull-based (Fetch) replication** over push-based AppendEntries | Matches KRaft's approach; leader doesn't manage per-follower outbound connections; scales better with many observers. | Two fetch rounds needed for commit visibility; slightly higher commit latency compared to push-based. |
 | **Single-threaded event loop** for consensus logic | Eliminates lock contention and data races in the consensus hot path (KRaft does the same). | All consensus work is serialised; throughput bounded by single core. Mitigated by batching. |
-| **Separate `xraft-core` crate with no I/O** | Enables deterministic testing with `xraft-test`; makes the algorithm auditable independent of runtime concerns. | Requires trait-based indirection for storage and transport. |
+| **Separate `xraft-core` crate with no I/O** | Enables deterministic testing with `xraft-testkit`; makes the algorithm auditable independent of runtime concerns. | Requires trait-based indirection for storage and transport. |
 | **gRPC (tonic) for transport** | Mature Rust ecosystem; streaming support for snapshot transfer; schema evolution via protobuf. | Heavier than a custom TCP protocol; acceptable for controller-plane traffic. |
 | **Segment-file log with memory-mapped index** | Proven pattern (Kafka, etcd); efficient sequential writes; O(1) lookups via sparse index. | Requires periodic compaction; index rebuild on unclean shutdown. |
 | **Pre-Vote + Check-Quorum** by default | Prevents unnecessary elections from partitioned nodes and split-brain. | Adds one extra RPC round before election; negligible cost. |
@@ -694,6 +698,6 @@ http_listen_address = "0.0.0.0:9090"
 
 ## 10. Relationship to Sibling Documents
 
-- **`tech-spec.md`**: Defines the problem statement, scope boundaries (in-scope vs. out-of-scope), hard constraints (language, concurrency model, persistence, timing), identified risks, and key resolved decisions (gRPC transport, protobuf encoding, pull-based replication). This document describes *what* the components are and how they interact; tech-spec establishes *why* those choices were made and *what limits* they operate under.
-- **`implementation-plan.md`**: Breaks this architecture into ordered implementation phases with crate-level milestones. References component names from this document.
+- **`tech-spec.md`**: Defines the problem statement, scope boundaries (in-scope vs. out-of-scope), hard constraints (language, concurrency model, persistence, timing), identified risks, and key resolved decisions (gRPC transport, protobuf encoding, pull-based replication). This document describes *what* the components are and how they interact; tech-spec establishes *why* those choices were made and *what limits* they operate under. Crate names in this document are aligned with `tech-spec.md` §5.6 (`xraft-log`, `xraft-rpc`, `xraft-testkit`). The `xraft-client` scope matches `tech-spec.md` §2.6 (external consumer library with `propose`/`read`). Dynamic membership (`AddVoter`/`RemoveVoter`) is treated as a stretch goal per `tech-spec.md` §2.7 and §3.
+- **`implementation-plan.md`**: Breaks this architecture into ordered implementation phases with crate-level milestones. References component names from this document. Where `implementation-plan.md` uses the name `InstallSnapshot`, it refers to the same operation as `FetchSnapshot` defined here.
 - **`e2e-scenarios.md`**: Defines integration test scenarios (election under partition, snapshot catch-up, check-quorum step-down) against the sequence flows in Section 5.
