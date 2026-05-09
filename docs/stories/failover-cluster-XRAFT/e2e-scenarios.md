@@ -435,10 +435,13 @@ Feature: Check Quorum prevents split-brain
 
 ```gherkin
 Feature: Inter-node request routing and leader discovery
-  Per tech-spec §2.6, `xraft-client` is an internal infrastructure crate used
-  by `xraft-server` for inter-node communication and admin tooling.  No external
-  client SDK is in scope for v1.  Leader discovery occurs through Fetch RPC
-  responses that carry leader_id and epoch metadata.
+  Per tech-spec §2.6, `xraft-client` serves a dual role: it is both an external
+  consumer library (providing `propose`/`read` for callers outside the cluster)
+  and an internal peer/admin client used by `xraft-server` for inter-node
+  communication and leader discovery.  Leader discovery occurs through Fetch RPC
+  responses that carry leader_id and epoch metadata.  Feature 11 focuses on the
+  inter-node routing and leader-discovery behaviour; the external consumer API
+  (`propose`/`read`) is exercised in Feature 14 (client-facing operations).
 
   Background:
     Given a cluster of 3 nodes
@@ -482,9 +485,12 @@ Feature: Inter-node request routing and leader discovery
 ```gherkin
 Feature: Static voter membership with observer join
   Per tech-spec §2.7, the voter set is fixed at cluster bootstrap for v1.
-  Dynamic membership (AddVoter/RemoveVoter) is out of scope for v1 and deferred
-  to a future story entirely — it is not a stretch goal within XRAFT (tech-spec §2.7, §3).
-  Observers (non-voting nodes) may join to replicate the log for read scaling.
+  Dynamic membership (AddVoter/RemoveVoter) is a **stretch goal** within this
+  story (tech-spec §2.7, §3; architecture.md §5.5; implementation-plan.md
+  Stage 7.2).  The core v1 deliverable uses static membership; dynamic
+  membership may be delivered if schedule permits but is not part of the base
+  commitment.  Observers (non-voting nodes) may join to replicate the log for
+  read scaling.
 
   Background:
     Given a cluster of 3 voters [node-0, node-1, node-2] configured at startup
@@ -495,7 +501,7 @@ Feature: Static voter membership with observer join
     When the cluster starts
     Then all 3 nodes load the static voter configuration
     And quorum size is fixed at 2 of 3
-    And AddVoter or RemoveVoter RPCs are not available in v1
+    And AddVoter or RemoveVoter RPCs are not available in the core v1 deliverable (stretch goal)
 
   Scenario: Observer joins and replicates the log
     Given observer-0 is configured as a non-voting observer
@@ -513,13 +519,13 @@ Feature: Static voter membership with observer join
     And observer-0 initiates a FetchSnapshot RPC
     And observer-0 loads the snapshot and resumes Fetch from index 8,001
 
-  Scenario: AddVoter/RemoveVoter are not available in v1
+  Scenario: AddVoter/RemoveVoter are not available in the core v1 deliverable
     When an operator attempts to issue an AddVoter or RemoveVoter command
     Then the node rejects the request with an UNSUPPORTED error
     And the voter set remains unchanged
-    # Note: dynamic membership (AddVoter/RemoveVoter) is out of scope for v1
-    # and deferred to a future story entirely — not a stretch goal within XRAFT
-    # (tech-spec §2.7, §3).
+    # Note: dynamic membership (AddVoter/RemoveVoter) is a stretch goal within
+    # this story (tech-spec §2.7, §3; architecture.md §5.5; implementation-plan.md
+    # Stage 7.2).  May be delivered if schedule permits.
 ```
 
 ---
@@ -690,26 +696,28 @@ The following design decisions are resolved in sibling docs and reflected in the
 2. **Observer role** — in scope per `tech-spec.md` §2.2. Observers replicate via Fetch but
    do not vote or count toward quorum.
 
-3. **Static voter membership for v1** — per `tech-spec.md` §2.7, the voter set is fixed
-   at bootstrap. Dynamic membership (`AddVoter`/`RemoveVoter`) is **out of scope for v1**
-   and deferred to a future story entirely — it is not a stretch goal within XRAFT.
-   Feature 12 reflects static-membership-only behaviour.
+3. **Static voter membership for v1 (stretch goal: dynamic membership)** — per `tech-spec.md`
+   §2.7/§3, `architecture.md` §5.5, and `implementation-plan.md` Stage 7.2, the voter set is
+   fixed at bootstrap for the core v1 deliverable.  Dynamic membership
+   (`AddVoter`/`RemoveVoter`) is a **stretch goal within this story** — it may be delivered
+   if schedule permits but is not part of the base commitment.  Feature 12 tests the core
+   static-membership behaviour; stretch-goal dynamic membership scenarios would be added if
+   that scope is delivered.
 
-4. **Internal peer/admin client (`xraft-client`)** — per `tech-spec.md` §2.6, `xraft-client`
-   is an **internal infrastructure crate** used by `xraft-server` for inter-node communication
-   and admin tooling.  It is **not** an external consumer SDK — no external client SDK is in
-   scope for v1.  Feature 11 tests inter-node routing, leader discovery via Fetch, and
-   internal admin operations only.
-   Note: `architecture.md` §2.5 (line 186) now reflects this internal scope, but its
-   cross-reference appendix (§8) still contains legacy text describing `xraft-client` as an
-   "external consumer library with `propose`/`read`."  A future iteration of `architecture.md`
-   should reconcile that appendix text with §2.5.
+4. **Dual-role client (`xraft-client`)** — per `tech-spec.md` §2.6, `xraft-client` serves a
+   dual role: it is both an **external consumer library** (providing `propose`/`read` for
+   callers outside the cluster) and an **internal peer/admin client** used by `xraft-server`
+   for inter-node RPC and leader discovery.  `architecture.md` §2.5 describes it as
+   internal-only, which is a narrower scope than `tech-spec.md` §2.6's dual-role definition.
+   Feature 11 tests the internal inter-node routing and leader-discovery behaviour;
+   Feature 14 exercises client-facing operations that include the external `propose`/`read`
+   path.
 
-5. **Dynamic membership out of v1 scope** — per `tech-spec.md` §2.7/§3, `AddVoter`/`RemoveVoter`
-   RPCs are deferred to a future story entirely and are not in scope for v1.
-   Note: `architecture.md` §5.5 still labels them a "stretch goal" for this story, which is a
-   softer exclusion than the tech-spec's full deferral.  These scenarios follow the tech-spec's
-   stricter boundary: Feature 12 covers v1 static-membership behaviour only.
+5. **Dynamic membership is a stretch goal** — per `tech-spec.md` §2.7/§3, `architecture.md`
+   §5.5, and `implementation-plan.md` Stage 7.2, `AddVoter`/`RemoveVoter` RPCs are a
+   **stretch goal within this story**.  The core v1 deliverable uses static membership;
+   dynamic membership may be delivered if schedule permits.  Feature 12 tests the core
+   static-membership behaviour for the base commitment.
 
 6. **Observability endpoints** — `/health` (liveness/readiness) and `/metrics` (Prometheus format)
    per `tech-spec.md` §2.4. Feature 15 metric names are aligned with `architecture.md` §7.
