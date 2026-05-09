@@ -25,15 +25,15 @@ non-voting observer nodes for read scale-out.
 ## 2. Component Architecture
 
 The system is divided into six crates within a Cargo workspace at the
-repository root:
+repository root. Crate names are aligned with `tech-spec.md` §5.6:
 
 ```
 Cargo.toml                       # workspace root
-xraft-core/                      # Raft algorithm, pure logic, no I/O
-xraft-storage/                   # Persistent log and snapshot storage
+xraft-core/                      # Raft algorithm, pure logic, no I/O — defines all traits
+xraft-storage/                   # Durable segmented log, snapshots, hard-state persistence
 xraft-transport/                 # Network transport (gRPC via tonic)
 xraft-server/                    # Node binary, wiring, configuration
-xraft-client/                    # Peer & admin RPC client library
+xraft-client/                    # Internal peer/admin client (inter-node RPC, leader discovery)
 xraft-test/                      # Deterministic test harness
 ```
 
@@ -83,8 +83,8 @@ election timeout), it steps down to follower to avoid split-brain.
 ### 2.2 `xraft-storage` — Storage Engine
 
 **Responsibility:** Durable, append-only log with segment files, plus snapshot
-creation and loading. Provides the `LogStore`, `SnapshotStore`, and
-`HardStateStore` traits and their file-backed implementations.
+creation and loading. Provides file-backed implementations of the `LogStore`,
+`SnapshotStore`, and `HardStateStore` traits defined in `xraft-core`.
 
 | Trait / Struct | Role |
 |---|---|
@@ -110,7 +110,8 @@ segments for slow followers.
 ### 2.3 `xraft-transport` — Network Transport
 
 **Responsibility:** Defines the gRPC service and message types for all Raft RPCs.
-Uses `tonic` (Rust gRPC) with `prost` for Protobuf serialisation.
+Uses `tonic` (Rust gRPC) with `prost` for Protobuf serialisation. Implements the
+`Transport` trait defined in `xraft-core`.
 
 **Service definition (`raft.proto`):**
 
@@ -182,19 +183,19 @@ messages onto an async channel; the loop drains the channel, feeds inputs to
 any `SendMessage` actions in the same batch. This mirrors Raft's safety
 requirement that durable state is written before network acknowledgements.
 
-### 2.5 `xraft-client` — Peer and Admin Client
+### 2.5 `xraft-client` — Internal Peer & Admin Client
 
-**Responsibility:** Provides an internal Rust client for inter-node RPC
-communication and administrative cluster operations. This is **not** an external
-consumer SDK (which is out of scope per `tech-spec.md` §3); it is infrastructure
-used by `xraft-server` to establish peer connections and by admin tooling to
-issue cluster-management commands (e.g., trigger snapshot, query cluster status).
+**Responsibility:** An **internal infrastructure crate** used by `xraft-server`
+for inter-node communication (Raft RPCs between peers) and by admin tooling for
+cluster-management commands. Per `tech-spec.md` §2.6, `xraft-client` is **not**
+an external consumer SDK — no external client SDK (`propose`/`read` for outside
+callers) is in scope for v1 (see also `e2e-scenarios.md` Feature 11).
 
 | Struct / Trait | Role |
 |---|---|
 | `PeerClient` | Wraps `tonic` gRPC channel to a specific peer. Sends `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` RPCs. Handles connection lifecycle and reconnection. |
 | `ConnectionPool` | Maintains a pool of `PeerClient` instances keyed by `NodeId`. Lazy-initialises connections on first use. |
-| `AdminClient` | Connects to a node's admin HTTP endpoint for operational queries (leader status, metrics, trigger snapshot). |
+| `AdminClient` | Connects to a node's admin HTTP endpoint for operational queries (leader status, metrics, trigger snapshot). Used by admin tooling to submit writes and inspect cluster state. |
 | `ClientConfig` | Peer endpoint list, retry policy, connect/request timeouts. |
 
 **Leader discovery:**
@@ -314,12 +315,13 @@ below HW are considered committed.
 ### 4.1 Trait Boundaries
 
 The core engine depends only on traits, never on concrete implementations.
-This is the primary seam for testing and future storage backends. Each trait is
-defined in the crate that owns its domain; `xraft-core` depends on the trait
-definitions via `xraft-storage` and `xraft-transport` crate boundaries.
+This is the primary seam for testing and future storage backends. **All traits
+are defined in `xraft-core`** so that `xraft-core` has zero dependencies on
+other xraft crates. Implementation crates (`xraft-storage`, `xraft-transport`) import
+the trait definitions from `xraft-core` and provide concrete implementations.
 
 ```rust
-// xraft-storage defines the persistence traits:
+// All traits are defined in xraft-core:
 
 trait LogStore: Send + Sync {
     fn append(&mut self, entries: &[Entry]) -> Result<()>;
@@ -342,14 +344,15 @@ trait HardStateStore: Send + Sync {
     fn load(&self) -> Result<Option<HardState>>;
 }
 
-// xraft-transport defines the network trait:
+// xraft-core also defines the network trait
+// (xraft-transport provides the gRPC implementation):
 
 trait Transport: Send + Sync {
     async fn send(&self, target: NodeId, message: RaftMessage) -> Result<()>;
     async fn broadcast(&self, targets: &[NodeId], message: RaftMessage) -> Result<()>;
 }
 
-// xraft-core defines the state machine callback trait
+// xraft-core also defines the state machine callback trait
 // (user-provided, injected into the server at startup):
 
 trait StateMachine: Send + Sync {
@@ -372,13 +375,17 @@ xraft-client ──► xraft-core
 
 xraft-test   ──► xraft-core  (in-memory implementations of all traits)
 
-xraft-storage   ──► xraft-core  (imports core types: Entry, LogIndex, Term, HardState)
+xraft-storage ──► xraft-core  (imports core types: Entry, LogIndex, Term, HardState;
+                               implements LogStore, SnapshotStore, HardStateStore)
 
-xraft-transport ──► xraft-core  (imports core types and message definitions)
+xraft-transport ──► xraft-core  (imports core types and message definitions;
+                                 implements Transport)
 ```
 
-`xraft-core` has **zero** dependencies on other xraft crates, ensuring it can
-be tested in isolation with `xraft-test`.
+`xraft-core` has **zero** dependencies on other xraft crates. It defines all
+traits and core types. Implementation crates depend on `xraft-core` to import
+those definitions, never the reverse. This ensures `xraft-core` can be tested
+in isolation with `xraft-test`.
 
 ### 4.3 Event Loop Integration Points
 
@@ -399,6 +406,11 @@ The `EventLoop` in `xraft-server` connects the components:
 ---
 
 ## 5. End-to-End Sequence Flows
+
+> **Fetch offset convention (all flows below):** `fetch_offset` is the **next
+> log index the follower wants to receive**. A `FetchReq(fetch_offset=N)`
+> means "send me entries starting at index N". The leader responds with entries
+> `[N, N+1, ...]` if available, along with the current high-water mark.
 
 ### 5.1 Leader Election (with Pre-Vote)
 
@@ -453,7 +465,7 @@ The `EventLoop` in `xraft-server` connects the components:
     │                    │ persist + fsync     │                     │
     │                    │                     │                     │
     │                    │    ┌── Fetch round 1 ──┐                  │
-    │                    │◄───┤ FetchReq(off=4)   │                  │
+    │                    │◄───┤ FetchReq(off=5)   │                  │
     │                    │    └────────────────────┘                  │
     │                    │                     │                     │
     │                    │── FetchResp ────────►│                     │
@@ -462,7 +474,7 @@ The `EventLoop` in `xraft-server` connects the components:
     │                    │                     │ persist + fsync     │
     │                    │                     │                     │
     │                    │    ┌── Fetch from C ──────────────────────┐
-    │                    │◄───────────────────────┤ FetchReq(off=4) │
+    │                    │◄───────────────────────┤ FetchReq(off=5) │
     │                    │    └──────────────────────────────────────┘
     │                    │                     │                     │
     │                    │── FetchResp ─────────────────────────────►│
@@ -475,7 +487,7 @@ The `EventLoop` in `xraft-server` connects the components:
     │                    │ to state machine     │                     │
     │                    │                     │                     │
     │                    │    ┌── Fetch round 2 ──┐                  │
-    │                    │◄───┤ FetchReq(off=5)   │                  │
+    │                    │◄───┤ FetchReq(off=6)   │                  │
     │                    │    └────────────────────┘                  │
     │                    │                     │                     │
     │                    │── FetchResp ────────►│                     │
@@ -495,9 +507,9 @@ replication and is consistent with KRaft's design.
 ```
   Leader (A)                               Slow Follower (D)
     │                                           │
-    │◄────────── FetchReq(offset=100) ─────────┤
+    │◄────────── FetchReq(fetch_offset=101) ───┤
     │                                           │
-    │  [offset 100 < log_start_offset(500)]     │
+    │  [offset 101 < log_start_offset(501)]     │
     │                                           │
     │── FetchResp(snapshot_hint) ──────────────►│
     │   snapshot_id=(index=500, term=4)         │
@@ -513,8 +525,8 @@ replication and is consistent with KRaft's design.
     │                               machine          │
     │                               set log_start=500│
     │                                           │
-    │◄────────── FetchReq(offset=500) ─────────┤
-    │── FetchResp(entries=[501..]) ────────────►│
+    │◄────────── FetchReq(fetch_offset=501) ───┤
+    │── FetchResp(entries=[501,502,...]) ───────►│
     │                                           │
 ```
 
@@ -526,19 +538,21 @@ writes), the leader detects the mismatch and responds with a `DivergingEpoch`:
 ```
   Leader (A, term=3)                  Follower (B, has stale entries from term=2)
     │                                      │
-    │◄── FetchReq(offset=10, epoch=2) ────┤
+    │◄── FetchReq(fetch_offset=11,     ───┤
+    │             epoch=2)                 │
     │                                      │
     │  [leader checks leader-epoch-        │
     │   checkpoint: epoch 2 ended          │
     │   at offset 8]                       │
     │                                      │
     │── FetchResp ────────────────────────►│
-    │   diverging_epoch=(epoch=2, off=8)   │
+    │   diverging_epoch=(epoch=2, end=8)   │
     │                                      │
     │                    truncate_after(8)  │
     │                    persist            │
     │                                      │
-    │◄── FetchReq(offset=8, epoch=3) ─────┤
+    │◄── FetchReq(fetch_offset=9,      ───┤
+    │             epoch=3)                 │
     │── FetchResp(entries=[9,10,...]) ─────►│
     │                                      │
 ```
@@ -546,8 +560,11 @@ writes), the leader detects the mismatch and responds with a `DivergingEpoch`:
 ### 5.5 Check-Quorum Leader Step-Down
 
 Dynamic quorum changes (`AddVoter` / `RemoveVoter`) are **out of scope for v1**
-(see `tech-spec.md` §3). The voter set is fixed at bootstrap. Instead, this
-section documents the Check-Quorum protocol that prevents stale leadership:
+(see `tech-spec.md` §2.7 and §3, and `e2e-scenarios.md` Feature 12). The voter
+set is fixed at cluster bootstrap and cannot be changed at runtime. Dynamic
+membership is deferred to a future story entirely — it is not a stretch goal
+within the XRAFT story.
+This section documents the Check-Quorum protocol that prevents stale leadership:
 
 ```
   Leader (A, term=3)            Follower (B)             Follower (C)
@@ -680,6 +697,6 @@ http_listen_address = "0.0.0.0:9090"
 
 ## 10. Relationship to Sibling Documents
 
-- **`tech-spec.md`**: Defines the problem statement, scope boundaries (in-scope vs. out-of-scope), hard constraints (language, concurrency model, persistence, timing), identified risks, and key resolved decisions (gRPC transport, protobuf encoding, pull-based replication). This document describes *what* the components are and how they interact; tech-spec establishes *why* those choices were made and *what limits* they operate under.
-- **`implementation-plan.md`**: Breaks this architecture into ordered implementation phases with crate-level milestones. References component names from this document.
+- **`tech-spec.md`**: Defines the problem statement, scope boundaries (in-scope vs. out-of-scope), hard constraints (language, concurrency model, persistence, timing), identified risks, and key resolved decisions (gRPC transport, protobuf encoding, pull-based replication). This document describes *what* the components are and how they interact; tech-spec establishes *why* those choices were made and *what limits* they operate under. Crate names in this document are aligned with `tech-spec.md` §5.6 (`xraft-storage`, `xraft-transport`, `xraft-test`). The `xraft-client` scope matches `tech-spec.md` §2.6: an **internal peer/admin client** used by `xraft-server` for inter-node RPC and by admin tooling — not an external consumer SDK. Dynamic membership (`AddVoter`/`RemoveVoter`) is **out of scope for v1** per `tech-spec.md` §2.7 and §3, deferred to a future story entirely.
+- **`implementation-plan.md`**: Breaks this architecture into ordered implementation phases with crate-level milestones. References component names from this document. Where `implementation-plan.md` uses the name `InstallSnapshot`, it refers to the same operation as `FetchSnapshot` defined here.
 - **`e2e-scenarios.md`**: Defines integration test scenarios (election under partition, snapshot catch-up, check-quorum step-down) against the sequence flows in Section 5.
