@@ -39,12 +39,14 @@ Feature: Leader election under normal conditions
     When a majority (2 of 3) of nodes grant their votes
     Then the candidate transitions to "Leader" state
     And the other nodes record the leader id for epoch 1
-    And the leader begins sending periodic heartbeats
+    And followers begin sending periodic Fetch RPCs to the leader
 
-  Scenario: Follower receives heartbeat before its election timeout
+  Scenario: Follower resets election timer via Fetch response
     Given node-1 is the leader in epoch 1
-    When node-0 receives a heartbeat from node-1 before its election timeout
-    Then node-0 resets its election timeout
+    When node-0 sends a Fetch RPC to node-1 before its election timeout
+    Then node-1 responds with an empty Fetch response (no new entries) carrying the current epoch and high watermark
+    And node-0 treats the valid Fetch response as proof of leader liveness
+    And node-0 resets its election timeout
     And node-0 remains in "Follower" state
 
   Scenario: Leader sends no-op entry on election
@@ -174,11 +176,12 @@ Feature: Log replication under normal conditions
     And node-0 responds with the entry at index 11
     And node-1 appends the new entry at index 11
 
-  Scenario: Heartbeats carry high watermark
+  Scenario: Empty Fetch response carries high watermark (heartbeat equivalent)
     Given entries up to index 15 are committed
-    When node-0 sends a heartbeat to node-1
-    Then the heartbeat includes the current high watermark = 15
+    When node-1 sends a Fetch RPC to node-0 and no new entries exist
+    Then node-0 responds with an empty Fetch response including high watermark = 15
     And node-1 advances its commit index to min(15, last log index)
+    And node-1 resets its election timer (proof of leader liveness)
     And node-1 applies any newly committed entries to its state machine
 ```
 
@@ -384,7 +387,7 @@ Feature: Cluster behaviour during and after network partitions
     Given node-0 was isolated and stepped down
     And node-1 became leader in epoch 6 and committed new entries
     When the partition heals and node-0 reconnects
-    Then node-0 discovers epoch 6 from heartbeats/Fetch responses
+    Then node-0 discovers epoch 6 from Fetch responses
     And node-0 updates its epoch to 6
     And node-0 truncates any uncommitted entries from epoch 5
     And node-0 replicates entries from node-1 to catch up
@@ -412,7 +415,7 @@ Feature: Check Quorum prevents split-brain
     And the check quorum interval is 2× the election timeout
 
   Scenario: Leader passes quorum check
-    Given node-0 has received Fetch/heartbeat responses from node-1 and node-2
+    Given node-0 has received Fetch responses from node-1 and node-2
       within the check quorum interval
     When the check quorum timer fires
     Then node-0 confirms communication with a majority (3 of 5 including self)
@@ -431,14 +434,29 @@ Feature: Check Quorum prevents split-brain
 ## Feature 11: Inter-Node Request Routing
 
 ```gherkin
-Feature: Inter-node request routing and leader discovery
-  Nodes must be able to discover the current leader and route
-  internal requests appropriately. Per tech-spec §3, only inter-node
-  RPCs are in scope; no external client SDK is provided.
+Feature: Client interaction, request routing, and leader discovery
+  Clients use the `xraft-client` crate (tech-spec §2.6) which provides
+  `propose(data)` and `read(key)` APIs with automatic leader discovery.
+  Nodes also route inter-node requests appropriately.
 
   Background:
     Given a cluster of 3 nodes
     And node-0 is the leader
+
+  Scenario: Client proposes a write via xraft-client
+    When a client calls `propose("SET x = 42")` via the xraft-client SDK
+    And the client does not know the leader
+    Then the client connects to any known node
+    And if the node is not the leader, it responds with NOT_LEADER and leader_hint=node-0
+    And the client redirects the proposal to node-0
+    And node-0 appends the entry and commits it via quorum replication
+    And the client receives a success response
+
+  Scenario: Client performs a linearisable read via xraft-client
+    When a client calls `read(key)` via the xraft-client SDK
+    Then the request is routed to the current leader (node-0)
+    And node-0 confirms it is still leader (via quorum check or no-op heartbeat)
+    And returns the current value for the key
 
   Scenario: Follower discovers leader via Fetch response
     When node-1 sends a Fetch RPC to node-0
@@ -458,6 +476,13 @@ Feature: Inter-node request routing and leader discovery
     And node-2 discovers node-1 as the new leader in epoch 6
     And node-2 redirects its Fetch RPCs to node-1
 
+  Scenario: Client transparently handles leader failover
+    Given a client is connected to node-0 (current leader)
+    When node-0 crashes and node-1 becomes leader in epoch 6
+    And the client's next `propose` call fails with NOT_LEADER
+    Then the client retries with backoff and discovers node-1 as the new leader
+    And subsequent operations succeed via node-1
+
   Scenario: All nodes converge on leader identity after election
     When a new election completes and node-2 wins epoch 7
     Then within one Fetch cycle, all followers learn node-2 is the leader
@@ -470,20 +495,21 @@ Feature: Inter-node request routing and leader discovery
 
 ```gherkin
 Feature: Static voter membership with observer join
-  Per tech-spec §3, dynamic quorum changes are out of scope for v1.
-  The voter set is fixed at cluster bootstrap. Observers (non-voting
-  nodes) may join to replicate the log for read scaling or standby.
+  Per tech-spec §2.7, the voter set is fixed at cluster bootstrap for v1.
+  Dynamic membership (AddVoter/RemoveVoter) is a stretch goal (tech-spec §2.7,
+  implementation-plan Stage 7.2) and is not tested in v1 E2E scenarios.
+  Observers (non-voting nodes) may join to replicate the log for read scaling.
 
   Background:
     Given a cluster of 3 voters [node-0, node-1, node-2] configured at startup
     And node-0 is the leader in epoch 3
 
-  Scenario: Voter set is fixed at bootstrap
+  Scenario: Voter set is fixed at bootstrap (v1 behaviour)
     Given the cluster configuration file lists voters = [node-0, node-1, node-2]
     When the cluster starts
     Then all 3 nodes load the static voter configuration
     And quorum size is fixed at 2 of 3
-    And no AddVoter or RemoveVoter operations are supported
+    And AddVoter or RemoveVoter RPCs are not available in v1
 
   Scenario: Observer joins and replicates the log
     Given observer-0 is configured as a non-voting observer
@@ -501,10 +527,13 @@ Feature: Static voter membership with observer join
     And observer-0 initiates a FetchSnapshot RPC
     And observer-0 loads the snapshot and resumes Fetch from index 8,001
 
-  Scenario: Cluster rejects operations that modify voter set
+  Scenario: AddVoter/RemoveVoter are deferred to stretch goal
     When an operator attempts to issue an AddVoter or RemoveVoter command
-    Then the leader rejects the request with an UNSUPPORTED error
+    Then the leader rejects the request with an UNSUPPORTED error in v1
     And the voter set remains unchanged
+    # Note: dynamic membership (single-change-at-a-time AddVoter/RemoveVoter)
+    # is a stretch goal per tech-spec §2.7 and implementation-plan Stage 7.2.
+    # If implemented, dedicated E2E scenarios will be added at that time.
 ```
 
 ---
@@ -559,11 +588,11 @@ Feature: Timing-sensitive behaviour and performance boundaries
     Then a new leader is elected within 2× electionTimeout (worst case: one retry)
     And election latency is recorded as a metric
 
-  Scenario: Heartbeat frequency prevents unnecessary elections
-    Given the heartbeat interval is less than electionTimeout / 3
+  Scenario: Fetch frequency prevents unnecessary elections
+    Given the Fetch interval is less than electionTimeout / 3
     When the leader is healthy
-    Then no follower triggers an election due to heartbeat timeout
-    And the heartbeat interval is recorded as a metric
+    Then no follower triggers an election due to missing Fetch responses
+    And the Fetch interval is recorded as a metric
 
   Scenario: Write commit latency under normal conditions
     When a client submits a write to the leader
@@ -602,22 +631,28 @@ Feature: Cluster metrics and health observability
     When an operator queries the `/metrics` endpoint on the leader
     Then the response includes per-follower replication lag (leader_log_end − follower_fetch_offset)
     And lag is expressed in number of entries
-    And a `xraft_replication_lag_entries` gauge is exposed per follower
+    And a `xraft_replication_lag` gauge is exposed per follower (per architecture.md §7)
 
   Scenario: Election event is logged and metered
     When a leader election occurs
     Then an event is emitted via `tracing` with: new_leader_id, epoch, election_latency_ms
-    And the `xraft_elections_total` counter is incremented
+    And the `xraft_append_records_total` counter tracks total entries appended
     And the `xraft_election_latency_seconds` histogram is updated
 
-  Scenario: Metrics endpoint exposes quorum state
-    When an operator queries the `/metrics` endpoint on the leader
-    Then the response includes gauges for each voter:
-      | metric                           | description                          |
-      | xraft_node_log_end_offset        | Last offset in the node's log        |
-      | xraft_node_replication_lag       | Entries behind the leader            |
-      | xraft_node_last_fetch_seconds    | Seconds since last successful fetch  |
-      | xraft_node_role                  | Leader=0 / Follower=1 / Observer=2   |
+  Scenario: Metrics endpoint exposes canonical cluster gauges
+    When an operator queries the `/metrics` endpoint on any node
+    Then the response includes gauges matching architecture.md §7:
+      | metric                              | type      | description                                    |
+      | xraft_current_leader                | Gauge     | Node ID of current leader; -1 if unknown        |
+      | xraft_current_term                  | Gauge     | Current Raft term / epoch                        |
+      | xraft_commit_index                  | Gauge     | Highest committed log index                      |
+      | xraft_log_end_offset                | Gauge     | Highest log index (may be ahead of commit)       |
+      | xraft_replication_lag               | Gauge     | Entries behind leader (per replica)              |
+      | xraft_election_latency_seconds      | Histogram | Time from candidacy to leader election           |
+      | xraft_commit_latency_seconds        | Histogram | Time from proposal to commit (leader only)       |
+      | xraft_append_records_total          | Counter   | Total entries appended                           |
+      | xraft_fetch_requests_total          | Counter   | Total Fetch RPCs received (leader) / sent (follower) |
+      | xraft_snapshot_installs_total       | Counter   | Snapshots installed by this node                 |
 ```
 
 ---
@@ -646,11 +681,11 @@ Feature: Graceful node shutdown with optional leadership transfer
     Then node-2 stops sending Fetch RPCs
     And node-2 persists its current state to stable storage
     And node-2 shuts down without triggering an election
-    And the leader detects node-2's absence via missed heartbeat/fetch responses
+    And the leader detects node-2's absence via missed Fetch requests
 
   Scenario: Abrupt crash (no graceful shutdown)
     When node-1 crashes without sending any shutdown signal
-    Then the leader detects node-1's absence after heartbeat timeout
+    Then the leader detects node-1's absence after Fetch timeout
     And the cluster continues operating with 2 of 3 nodes
     And client writes are still committed (quorum = 2)
 ```
@@ -667,14 +702,22 @@ The following design decisions are resolved in sibling docs and reflected in the
 2. **Observer role** — in scope per `tech-spec.md` §2.2. Observers replicate via Fetch but
    do not vote or count toward quorum.
 
-3. **Static voter membership for v1** — per `tech-spec.md` §3, dynamic quorum changes
-   (AddVoter/RemoveVoter) are out of scope. Feature 12 reflects static membership only.
+3. **Static voter membership for v1** — per `tech-spec.md` §2.7, the voter set is fixed
+   at bootstrap. Dynamic membership (AddVoter/RemoveVoter) is a stretch goal, not tested
+   in v1 E2E. Feature 12 reflects static-membership-only behaviour.
 
-4. **No external client SDK** — per `tech-spec.md` §3, only inter-node RPCs are in scope.
-   Feature 11 tests inter-node routing and leader discovery, not client-facing APIs.
+4. **Client SDK (`xraft-client`)** — per `tech-spec.md` §2.6 and `implementation-plan.md` Stage 6.2,
+   an `xraft-client` crate provides `propose(data)` and `read(key)` APIs with automatic leader
+   discovery. Feature 11 tests both client-facing interactions and inter-node routing.
 
-5. **Observability endpoints** — `/health` (liveness/readiness) and `/metrics` (Prometheus format)
-   per `tech-spec.md` §2.4. Feature 15 scenarios are anchored to these endpoints.
+5. **Static membership with stretch dynamic membership** — per `tech-spec.md` §2.7,
+   the voter set is fixed at bootstrap for v1. Dynamic membership (AddVoter/RemoveVoter)
+   is a stretch goal per `tech-spec.md` §2.7 and `implementation-plan.md` Stage 7.2.
+   Feature 12 covers v1 static-membership behaviour only; stretch-goal scenarios
+   will be added if/when dynamic membership is implemented.
 
-6. **Snapshot transfer** — uses `FetchSnapshot` RPC per `tech-spec.md` §2.2. Chunk size
+6. **Observability endpoints** — `/health` (liveness/readiness) and `/metrics` (Prometheus format)
+   per `tech-spec.md` §2.4. Feature 15 metric names are aligned with `architecture.md` §7.
+
+7. **Snapshot transfer** — uses `FetchSnapshot` RPC per `tech-spec.md` §2.2. Chunk size
    and transport details are implementation-level decisions deferred to `implementation-plan.md`.

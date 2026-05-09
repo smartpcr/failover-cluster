@@ -61,7 +61,7 @@ The following capabilities are in scope for the XRAFT story:
 | **Log replication** | Append-only log with high-watermark tracking and log consistency checks (`prevLogIndex` / `prevLogTerm`).  In our KRaft-inspired model, followers pull entries via `Fetch` RPCs rather than receiving leader-pushed `AppendEntries` (see §2.2); the consistency guarantees are identical to textbook Raft — only the initiator of the RPC changes. |
 | **Safety invariants** | All five Raft safety properties (§1 table) enforced and tested |
 | **Persistent state** | `currentTerm`, `votedFor`, and log durably persisted (`fsync`) before RPC responses |
-| **Heartbeats** | In the pull-based model, the leader does **not** push standalone heartbeat messages.  Instead, followers send periodic `Fetch` RPCs; when no new entries exist, the leader returns an empty `Fetch` response carrying the current term and high watermark.  Followers treat any valid `Fetch` response (empty or not) as proof of leader liveness and reset their election timer accordingly.  This is functionally equivalent to textbook Raft heartbeats but initiated by the follower, consistent with the KRaft design. |
+| **Heartbeats** | In the pull-based model, the leader does **not** push standalone heartbeat messages.  Instead, followers send periodic `Fetch` RPCs; when no new entries exist, the leader returns an empty `Fetch` response carrying the current term and high watermark.  Followers treat any valid `Fetch` response (empty or not) as proof of leader liveness and reset their election timer accordingly.  This is functionally equivalent to textbook Raft heartbeats but initiated by the follower, consistent with the KRaft design.  **Terminology note:** `e2e-scenarios.md` Features 1, 10, 14, and 16 use the word "heartbeat" as a shorthand for this follower-initiated Fetch cycle.  When those scenarios say "heartbeat interval" or "heartbeat timeout," they mean the Fetch polling interval and the election timer, respectively — there is no separate leader-pushed heartbeat RPC. |
 | **Commit protocol** | Leader commits when majority acknowledges; followers apply on HW advance |
 | **No-op on election** | New leader appends a blank entry to commit pending entries from prior term |
 
@@ -101,24 +101,30 @@ The following capabilities are in scope for the XRAFT story:
 | **Integration tests** | Real-network 3-node and 5-node cluster scenarios |
 | **Linearisability checking** | Jepsen-style validation via `stateright` or equivalent model checker |
 
-### 2.6  Client Library (`xraft-client`)
+### 2.6  Peer & Admin Client (`xraft-client`)
 
 | Capability | Detail |
 |---|---|
-| **Leader discovery** | Automatic leader discovery with transparent redirect on `NotLeader` errors |
-| **Propose / Read API** | `propose(data)` to submit entries, `read(key)` for linearisable reads |
-| **Connection management** | gRPC connection to cluster with retry and backoff |
+| **Peer RPC client** | `PeerClient` wraps a `tonic` gRPC channel to a specific peer for `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` RPCs with connection lifecycle management |
+| **Leader discovery** | Tracks last-known leader via hints in `FetchResponse` / `VoteResponse`; transparently retries against the hinted leader on `NOT_LEADER` errors |
+| **Connection pool** | `ConnectionPool` maintains lazy-initialised `PeerClient` instances keyed by `NodeId` |
+| **Admin client** | `AdminClient` connects to a node's admin HTTP endpoint for operational queries (leader status, metrics, trigger snapshot) |
 
-The `xraft-client` crate is defined in `architecture.md` §2.5 and scaffolded in
-`implementation-plan.md` Phase 7.  It provides a Rust client library for
-external consumers to interact with the XRAFT cluster.
+Per `architecture.md` §2.5, `xraft-client` is an **internal infrastructure crate** used by `xraft-server` for inter-node communication and by admin tooling for cluster-management commands.  It is **not** an external consumer SDK — no external client SDK is in scope for v1 (see §3 and `e2e-scenarios.md` Feature 11).
 
 ### 2.7  Administrative Operations
 
 | Capability | Detail |
 |---|---|
-| **AdminApi** | HTTP API for cluster status, triggering snapshots, and (in later phases) dynamic membership changes via `AddVoter` / `RemoveVoter` RPCs |
-| **Dynamic membership (stretch)** | Single-change-at-a-time `AddVoter`/`RemoveVoter` as defined in `architecture.md` §2.3.  This is a **stretch goal** — core election and replication take priority within the 13-point budget. |
+| **AdminApi** | HTTP API for cluster status and triggering snapshots |
+
+> **Dynamic membership (`AddVoter`/`RemoveVoter`) is out of scope for v1.**
+> Per `architecture.md` §5.5 and `e2e-scenarios.md` Feature 12, the voter set
+> is fixed at cluster bootstrap.  Dynamic quorum changes are not a stretch goal
+> for this story — they are explicitly deferred to a future story.  The
+> `AdminApi` supports status queries and snapshot triggers only; no membership
+> mutation endpoints are provided in v1.
+
 | **Optional TLS** | TLS configuration (`tls.cert_path` / `tls.key_path`) is supported as an optional transport setting per `architecture.md` §2.3.  Not mandatory for v1 functional correctness, but the configuration surface exists. |
 
 ---
@@ -129,7 +135,8 @@ external consumers to interact with the XRAFT cluster.
 |---|---|
 | **Application-level state machine** | XRAFT provides the replicated log; what the consumer does with committed entries is outside this story |
 | **Multi-Raft / sharding** | Single Raft group only; partitioning across multiple groups is a future story |
-| **Dynamic quorum changes (full)** | The `AddVoter`/`RemoveVoter` RPCs are defined in `architecture.md` and scaffolded in later implementation phases, but the core election + replication work in this story targets **static membership first**.  Dynamic membership is a stretch goal within this story and may be deferred if the 13-point budget is exhausted. |
+| **Dynamic quorum changes** | `AddVoter`/`RemoveVoter` RPCs are **out of scope for v1**, per `architecture.md` §5.5 and `e2e-scenarios.md` Feature 12.  The voter set is fixed at bootstrap.  Dynamic membership is deferred to a future story, not a stretch goal within XRAFT. |
+| **External client SDK** | `xraft-client` is an internal peer/admin client (§2.6), not an external consumer SDK.  No public client API (`propose`/`read` for external callers) is provided in v1, per `e2e-scenarios.md` Feature 11. |
 | **Kafka wire protocol compatibility** | We borrow KRaft *design*, not its binary protocol |
 | **Disk-based log storage engine** | v1 uses a simple file-per-segment approach; a production WAL engine (e.g., `sled`, `rocksdb`) is a future optimisation |
 | **Benchmarking / performance tuning** | Functional correctness first; optimisation follows |
@@ -208,11 +215,11 @@ defined in `architecture.md` §2:
 | Crate | Responsibility |
 |---|---|
 | `xraft-core` | Protocol state machine, elections, log abstraction — no I/O |
-| `xraft-log` | Durable segmented log, snapshots, hard-state persistence |
-| `xraft-rpc` | gRPC service definitions and transport (`tonic` + `prost`) |
-| `xraft-server` | Binary that wires core + log + rpc; event loop, config, metrics, `AdminApi` |
-| `xraft-client` | Client library for external consumers (leader discovery, propose, read) |
-| `xraft-testkit` | Deterministic simulation harness and integration test utilities |
+| `xraft-storage` | Durable segmented log, snapshots, hard-state persistence |
+| `xraft-transport` | gRPC service definitions and transport (`tonic` + `prost`) |
+| `xraft-server` | Binary that wires core + storage + transport; event loop, config, metrics, `AdminApi` |
+| `xraft-client` | Internal peer RPC client and admin client (see §2.6 — not an external SDK) |
+| `xraft-test` | Deterministic simulation harness and integration test utilities |
 
 `xraft-core` must be deterministic and I/O-free so it can be driven by both
 real networking and deterministic simulation.
@@ -222,7 +229,8 @@ real networking and deterministic simulation.
 | Purpose | Crate | Rationale |
 |---|---|---|
 | Async runtime | `tokio` | Industry standard for Rust async |
-| Serialisation | `prost` | Protobuf encoding for both RPCs and on-disk log entries; single format across the stack (§7) |
+| Serialisation (wire) | `prost` | Protobuf encoding for gRPC RPCs |
+| Serialisation (disk) | Custom binary | On-disk log entries use `[length: u32][term: u64][index: u64][entry_type: u8][data: bytes][crc32: u32]` per `implementation-plan.md` Stage 2.1.  Protobuf is used on the wire; disk uses a compact binary format with CRC integrity checks for performance and simplicity. |
 | Logging | `tracing` | Structured, async-aware |
 | Metrics | `metrics` | Façade pattern; pluggable exporters |
 | RPC | `tonic` + `prost` | Mature, HTTP/2-based gRPC framework (firm decision — see §2.3) |
@@ -262,7 +270,7 @@ real networking and deterministic simulation.
 | Risk | Impact | Mitigation |
 |---|---|---|
 | No TLS in v1 leaves cluster traffic unencrypted | **Medium** — not production-safe without network-level isolation | Document as known limitation; plan TLS story |
-| Static membership means replacing a failed node requires cluster restart | **Medium** — availability impact during maintenance | Document operational procedure; dynamic membership is planned for a future story |
+| Static membership means replacing a failed node requires cluster restart | **Medium** — availability impact during maintenance | Document operational procedure; dynamic membership is deferred to a future story |
 
 ---
 
@@ -274,35 +282,39 @@ this spec to avoid cross-document dependency on files that may not yet exist:
 1. **RPC transport → gRPC (`tonic`).**  gRPC provides HTTP/2 streaming (needed
    for `Fetch` long-poll), built-in backpressure, and proto codegen.  The heavier
    binary is an acceptable trade-off.  See §2.3.
-2. **Log encoding format → `protobuf` (`prost`).**  Since the RPC layer uses
-   `tonic`/`prost`, using protobuf for on-disk log encoding keeps one serialisation
-   format across the stack.  Cross-language decoding of log segments is a bonus
-   even though cross-language bindings are a non-goal (§4).
+2. **Log encoding format → dual-format.**  Wire RPCs use `protobuf` (`prost`)
+   via `tonic` codegen.  On-disk log entries use a **custom binary format**:
+   `[length: u32][term: u64][index: u64][entry_type: u8][data: bytes][crc32: u32]`,
+   as specified in `implementation-plan.md` Stage 2.1.  The binary format avoids
+   protobuf overhead on the hot append path and provides CRC32 integrity checking.
+   Protobuf is reserved for the RPC layer where codegen and interop matter more.
 3. **Pull-based replication → confirmed.**  Followers initiate `Fetch` RPCs to
    the leader.  This is a firm design decision, not pending.  The mapping from
    textbook Raft's push-based `AppendEntries` to KRaft's pull-based `Fetch` is
    documented in §2.1 and §2.2.
-4. **Crate naming → aligned with `architecture.md`.**  `xraft-log` (not
-   `xraft-storage`), `xraft-rpc` (not `xraft-transport`), `xraft-testkit` (not
-   `xraft-test`), plus `xraft-client`.  See §5.6.
+4. **Crate naming → aligned with `architecture.md`.**  `xraft-storage` (not
+   `xraft-log`), `xraft-transport` (not `xraft-rpc`), `xraft-test` (not
+   `xraft-testkit`), plus `xraft-client`.  See §5.6.
 5. **Snapshot RPC naming → `FetchSnapshot`.**  `architecture.md` defines
    `FetchSnapshot` as the canonical gRPC method; `implementation-plan.md` uses
    `InstallSnapshot` in some places.  Both refer to the same chunked snapshot
    transfer operation.  The proto service should use `FetchSnapshot`.
-6. **Dynamic membership scope → stretch goal.**  `AddVoter`/`RemoveVoter` RPCs
-   are defined in the architecture and scaffolded in later implementation phases,
-   but core election + replication + static membership is the priority.  Dynamic
-   membership is a stretch goal within the 13-point budget (see §2.7 and §3).
+6. **Dynamic membership scope → out of scope for v1.**  `AddVoter`/`RemoveVoter`
+   RPCs are **not** a stretch goal within this story.  Per `architecture.md` §5.5
+   and `e2e-scenarios.md` Feature 12, the voter set is fixed at bootstrap and
+   dynamic quorum changes are deferred to a future story entirely.  See §2.7 and §3.
 7. **TLS → optional configuration surface.**  TLS is not mandatory for v1
    functional correctness but the configuration knobs exist per `architecture.md`.
    It is not "out of scope" but is not a gating requirement.
 
-> **Cross-doc alignment (iteration 3):** This spec now uses the same crate
-> names, RPC names, and scope boundaries as `architecture.md`.  Where
-> `implementation-plan.md` or `e2e-scenarios.md` use different names (e.g.,
-> `InstallSnapshot` vs. `FetchSnapshot`, `AppendEntries` in proto definitions),
-> the discrepancy is noted inline and should be resolved in their next
-> iteration.
+> **Cross-doc alignment (iteration 4):** This spec now uses the same crate
+> names (`xraft-storage`, `xraft-transport`, `xraft-test`), RPC names, scope
+> boundaries, and on-disk encoding format as `architecture.md` and
+> `implementation-plan.md`.  The `xraft-client` crate is correctly described as
+> an internal peer/admin client, not an external consumer SDK.  Dynamic
+> membership (`AddVoter`/`RemoveVoter`) is fully out of scope for v1.  The
+> "heartbeat" terminology used in `e2e-scenarios.md` is explicitly mapped to
+> the pull-based Fetch model in §2.1.
 
 ---
 
@@ -335,4 +347,4 @@ this spec to avoid cross-document dependency on files that may not yet exist:
 ---
 
 *Document: `docs/stories/failover-cluster-XRAFT/tech-spec.md`*
-*Story: failover-cluster:XRAFT · Status: Draft · Iteration 3*
+*Story: failover-cluster:XRAFT · Status: Draft · Iteration 4*

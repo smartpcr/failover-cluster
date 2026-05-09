@@ -25,16 +25,16 @@ non-voting observer nodes for read scale-out.
 ## 2. Component Architecture
 
 The system is divided into six crates within a Cargo workspace at the
-repository root. Crate names are aligned with `tech-spec.md` §5.6:
+repository root:
 
 ```
 Cargo.toml                       # workspace root
-xraft-core/                      # Raft algorithm, pure logic, no I/O — defines all traits
-xraft-log/                       # Durable segmented log, snapshots, hard-state persistence
-xraft-rpc/                       # Network transport (gRPC via tonic)
+xraft-core/                      # Raft algorithm, pure logic, no I/O
+xraft-storage/                   # Persistent log and snapshot storage
+xraft-transport/                 # Network transport (gRPC via tonic)
 xraft-server/                    # Node binary, wiring, configuration
-xraft-client/                    # External client library (propose, read, leader discovery)
-xraft-testkit/                   # Deterministic test harness
+xraft-client/                    # Peer & admin RPC client library
+xraft-test/                      # Deterministic test harness
 ```
 
 ### 2.1 `xraft-core` — Consensus Engine
@@ -80,11 +80,11 @@ The leader periodically verifies it can communicate with a majority of voters.
 If it cannot reach a quorum within `check_quorum_interval` (typically 2×
 election timeout), it steps down to follower to avoid split-brain.
 
-### 2.2 `xraft-log` — Storage Engine
+### 2.2 `xraft-storage` — Storage Engine
 
 **Responsibility:** Durable, append-only log with segment files, plus snapshot
-creation and loading. Provides file-backed implementations of the `LogStore`,
-`SnapshotStore`, and `HardStateStore` traits defined in `xraft-core`.
+creation and loading. Provides the `LogStore`, `SnapshotStore`, and
+`HardStateStore` traits and their file-backed implementations.
 
 | Trait / Struct | Role |
 |---|---|
@@ -107,11 +107,10 @@ Segments whose entries are fully covered by the latest snapshot are eligible for
 deletion. A configurable `log.retention.min_segments` (default 2) keeps recent
 segments for slow followers.
 
-### 2.3 `xraft-rpc` — Network Transport
+### 2.3 `xraft-transport` — Network Transport
 
 **Responsibility:** Defines the gRPC service and message types for all Raft RPCs.
-Uses `tonic` (Rust gRPC) with `prost` for Protobuf serialisation. Implements the
-`Transport` trait defined in `xraft-core`.
+Uses `tonic` (Rust gRPC) with `prost` for Protobuf serialisation.
 
 **Service definition (`raft.proto`):**
 
@@ -183,18 +182,16 @@ messages onto an async channel; the loop drains the channel, feeds inputs to
 any `SendMessage` actions in the same batch. This mirrors Raft's safety
 requirement that durable state is written before network acknowledgements.
 
-### 2.5 `xraft-client` — External Client Library
+### 2.5 `xraft-client` — Peer and Admin Client
 
-**Responsibility:** Provides a Rust client library for external consumers to
-interact with the XRAFT cluster, as defined in `tech-spec.md` §2.6. It offers
-`propose(data)` to submit entries and `read(key)` for linearisable reads, plus
-automatic leader discovery with transparent redirect on `NotLeader` errors.
-Additionally, `xraft-server` uses this crate internally for inter-node RPC
-communication (peer connections).
+**Responsibility:** Provides an internal Rust client for inter-node RPC
+communication and administrative cluster operations. This is **not** an external
+consumer SDK (which is out of scope per `tech-spec.md` §3); it is infrastructure
+used by `xraft-server` to establish peer connections and by admin tooling to
+issue cluster-management commands (e.g., trigger snapshot, query cluster status).
 
 | Struct / Trait | Role |
 |---|---|
-| `XRaftClient` | Primary external API. Exposes `propose(data) -> Result<ProposalId>` and `read(key) -> Result<Vec<u8>>` for consumers. Handles leader discovery and automatic redirect. |
 | `PeerClient` | Wraps `tonic` gRPC channel to a specific peer. Sends `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` RPCs. Handles connection lifecycle and reconnection. |
 | `ConnectionPool` | Maintains a pool of `PeerClient` instances keyed by `NodeId`. Lazy-initialises connections on first use. |
 | `AdminClient` | Connects to a node's admin HTTP endpoint for operational queries (leader status, metrics, trigger snapshot). |
@@ -205,7 +202,7 @@ communication (peer connections).
 and `VoteResponse` messages. When a peer connection fails or returns a redirect,
 the client transparently retries against the hinted leader endpoint.
 
-### 2.6 `xraft-testkit` — Deterministic Testing
+### 2.6 `xraft-test` — Deterministic Testing
 
 **Responsibility:** A simulated network and clock for testing the consensus
 engine without real I/O. Inspired by deterministic simulation testing (Jepsen-style).
@@ -317,13 +314,12 @@ below HW are considered committed.
 ### 4.1 Trait Boundaries
 
 The core engine depends only on traits, never on concrete implementations.
-This is the primary seam for testing and future storage backends. **All traits
-are defined in `xraft-core`** so that `xraft-core` has zero dependencies on
-other xraft crates. Implementation crates (`xraft-log`, `xraft-rpc`) import
-the trait definitions from `xraft-core` and provide concrete implementations.
+This is the primary seam for testing and future storage backends. Each trait is
+defined in the crate that owns its domain; `xraft-core` depends on the trait
+definitions via `xraft-storage` and `xraft-transport` crate boundaries.
 
 ```rust
-// All traits are defined in xraft-core:
+// xraft-storage defines the persistence traits:
 
 trait LogStore: Send + Sync {
     fn append(&mut self, entries: &[Entry]) -> Result<()>;
@@ -346,15 +342,14 @@ trait HardStateStore: Send + Sync {
     fn load(&self) -> Result<Option<HardState>>;
 }
 
-// xraft-core also defines the network trait
-// (xraft-rpc provides the gRPC implementation):
+// xraft-transport defines the network trait:
 
 trait Transport: Send + Sync {
     async fn send(&self, target: NodeId, message: RaftMessage) -> Result<()>;
     async fn broadcast(&self, targets: &[NodeId], message: RaftMessage) -> Result<()>;
 }
 
-// xraft-core also defines the state machine callback trait
+// xraft-core defines the state machine callback trait
 // (user-provided, injected into the server at startup):
 
 trait StateMachine: Send + Sync {
@@ -368,26 +363,22 @@ trait StateMachine: Send + Sync {
 
 ```
 xraft-server ──► xraft-core
-             ──► xraft-log
-             ──► xraft-rpc
+             ──► xraft-storage
+             ──► xraft-transport
              ──► xraft-client
 
 xraft-client ──► xraft-core
-             ──► xraft-rpc
+             ──► xraft-transport
 
-xraft-testkit ──► xraft-core  (in-memory implementations of all traits)
+xraft-test   ──► xraft-core  (in-memory implementations of all traits)
 
-xraft-log    ──► xraft-core  (imports core types: Entry, LogIndex, Term, HardState;
-                              implements LogStore, SnapshotStore, HardStateStore)
+xraft-storage   ──► xraft-core  (imports core types: Entry, LogIndex, Term, HardState)
 
-xraft-rpc    ──► xraft-core  (imports core types and message definitions;
-                              implements Transport)
+xraft-transport ──► xraft-core  (imports core types and message definitions)
 ```
 
-`xraft-core` has **zero** dependencies on other xraft crates. It defines all
-traits and core types. Implementation crates depend on `xraft-core` to import
-those definitions, never the reverse. This ensures `xraft-core` can be tested
-in isolation with `xraft-testkit`.
+`xraft-core` has **zero** dependencies on other xraft crates, ensuring it can
+be tested in isolation with `xraft-test`.
 
 ### 4.3 Event Loop Integration Points
 
@@ -396,10 +387,10 @@ The `EventLoop` in `xraft-server` connects the components:
 ```
                          ┌───────────────┐
      ┌──── gRPC ────────►│               │
-     │                   │  EventLoop    │──── LogStore (xraft-log)
-     ├──── TickDriver ──►│  (single      │──── HardStateStore (xraft-log)
-     │                   │   thread)     │──── SnapshotStore (xraft-log)
-     └──── AdminApi ────►│               │──── Transport (xraft-rpc)
+     │                   │  EventLoop    │──── LogStore (xraft-storage)
+     ├──── TickDriver ──►│  (single      │──── HardStateStore (xraft-storage)
+     │                   │   thread)     │──── SnapshotStore (xraft-storage)
+     └──── AdminApi ────►│               │──── Transport (xraft-transport)
                          │  RaftNode     │──── StateMachine (user-provided)
                          │  (xraft-core) │──── MetricsRegistry
                          └───────────────┘
@@ -408,11 +399,6 @@ The `EventLoop` in `xraft-server` connects the components:
 ---
 
 ## 5. End-to-End Sequence Flows
-
-> **Fetch offset convention (all flows below):** `fetch_offset` is the **next
-> log index the follower wants to receive**. A `FetchReq(fetch_offset=N)`
-> means "send me entries starting at index N". The leader responds with entries
-> `[N, N+1, ...]` if available, along with the current high-water mark.
 
 ### 5.1 Leader Election (with Pre-Vote)
 
