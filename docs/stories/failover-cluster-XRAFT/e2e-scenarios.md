@@ -499,24 +499,25 @@ Feature: Inter-node request routing and leader discovery
 ## Feature 12: Static Cluster Membership and Observer Join
 
 ```gherkin
-Feature: Static voter membership with observer join
-  Per tech-spec §2.7 and §3, the voter set is fixed at cluster bootstrap for v1.
-  Dynamic membership (`AddVoter`/`RemoveVoter`) is **out of scope for v1** and
-  deferred to a future story entirely — it is not a stretch goal within XRAFT
-  (per `architecture.md` §5.5 and `implementation-plan.md` Stage 7.2, which
-  covers static voter set bootstrap and observer support only).  Observers
-  (non-voting nodes) may join to replicate the log for read scaling.
+Feature: Static voter membership with observer join and stretch-goal dynamic membership
+  Per tech-spec §2.7 and §3, the voter set is fixed at cluster bootstrap for the
+  core v1 deliverable.  Dynamic membership (`AddVoter`/`RemoveVoter`) is a
+  **stretch goal** within this story — it may be delivered if schedule permits
+  (per `tech-spec.md` §2.7/§3 and `architecture.md` §5.5/§10).
+  `implementation-plan.md` Stage 7.2 covers the static voter set bootstrap and
+  observer support as the baseline.  Observers (non-voting nodes) may join to
+  replicate the log for read scaling.
 
   Background:
     Given a cluster of 3 voters [node-0, node-1, node-2] configured at startup
     And node-0 is the leader in epoch 3
 
-  Scenario: Voter set is fixed at bootstrap (v1 behaviour)
+  Scenario: Voter set is fixed at bootstrap (v1 baseline behaviour)
     Given the cluster configuration file lists voters = [node-0, node-1, node-2]
     When the cluster starts
     Then all 3 nodes load the static voter configuration
     And quorum size is fixed at 2 of 3
-    And AddVoter or RemoveVoter RPCs are not available (out of scope for v1; deferred to a future story)
+    And the voter set remains unchanged unless the dynamic membership stretch goal is implemented
 
   Scenario: Observer joins and replicates the log
     Given observer-0 is configured as a non-voting observer
@@ -534,13 +535,27 @@ Feature: Static voter membership with observer join
     And observer-0 initiates a FetchSnapshot RPC
     And observer-0 loads the snapshot and resumes Fetch from index 8,001
 
-  Scenario: AddVoter/RemoveVoter are out of scope for v1
+  Scenario: AddVoter/RemoveVoter stretch goal — baseline rejection
     When an operator attempts to issue an AddVoter or RemoveVoter command
+    And the dynamic membership stretch goal has NOT been implemented
     Then the node rejects the request with an UNSUPPORTED error
     And the voter set remains unchanged
-    # Note: dynamic membership (AddVoter/RemoveVoter) is out of scope for v1
-    # and deferred to a future story entirely (tech-spec §2.7, §3;
-    # architecture.md §5.5; implementation-plan.md Stage 7.2).
+
+  Scenario: AddVoter stretch goal — adding a voter (if implemented)
+    Given the dynamic membership stretch goal has been implemented
+    When an operator issues an AddVoter command for node-3
+    Then the leader appends a ConfigChange entry to the log
+    And once the ConfigChange is committed, node-3 becomes a voting member
+    And quorum size adjusts to reflect the new voter set
+    # Note: this scenario applies only if the stretch goal ships (tech-spec §2.7)
+
+  Scenario: RemoveVoter stretch goal — removing a voter (if implemented)
+    Given the dynamic membership stretch goal has been implemented
+    When an operator issues a RemoveVoter command for node-2
+    Then the leader appends a ConfigChange entry to the log
+    And once the ConfigChange is committed, node-2 is removed from the voter set
+    And quorum size adjusts to reflect the new voter set
+    # Note: this scenario applies only if the stretch goal ships (tech-spec §2.7)
 ```
 
 ---
@@ -602,13 +617,15 @@ Feature: Timing-sensitive behaviour and performance boundaries
     And the Fetch interval is recorded as a metric
 
   Scenario: Write commit latency under normal conditions
-    When a client submits a write to the leader
-    Then the entry is committed within broadcastTime + fsync latency
+    When an external caller uses `XRaftClient.propose(data)` to submit a write
+    Then the entry is committed within broadcastTime + follower Fetch scheduling delay + fsync latency
     And the commit latency is recorded as a metric
     And commit latency is recorded as a histogram metric for operational monitoring
-    # Note: benchmarking/performance tuning is out of scope for v1 (tech-spec §3);
-    # no specific p99 threshold is mandated.  This scenario validates functional
-    # timing correctness, not performance targets.
+    # Note: in pull-based replication, commit latency includes the time until
+    # followers' next scheduled Fetch retrieves the entry, plus fsync on both
+    # leader and a quorum of followers.  Benchmarking/performance tuning is out
+    # of scope for v1 (tech-spec §3); no specific p99 threshold is mandated.
+    # This scenario validates functional timing correctness, not performance targets.
 
   Scenario: Leader fsync runs concurrently with Fetch serving
     When the leader appends an entry to its local log
