@@ -18,8 +18,8 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Create `xraft-server` crate (binary) with `main.rs` stub and dependencies on all library crates
 - [ ] Create `xraft-client` crate (library) with `lib.rs` stub and dependency on `xraft-core` and `xraft-transport`
 - [ ] Create `xraft-test` crate (library, dev-dependency only) with `lib.rs` stub for deterministic simulation harness and integration test utilities, depending on `xraft-core` and `xraft-storage`
-- [ ] Add shared workspace dependencies in root `Cargo.toml`: `tokio`, `serde`, `serde_json`, `tracing`, `tracing-subscriber`, `thiserror`, `bytes`, `prost`, `tonic`
-- [ ] Add `rust-toolchain.toml` pinning stable Rust edition 2024
+- [ ] Add shared workspace dependencies in root `Cargo.toml`: `tokio`, `serde`, `serde_json`, `tracing`, `tracing-subscriber`, `thiserror`, `bytes`, `prost`, `tonic`, `uuid`, `toml`, `rand`, `crc32fast`, `axum`, `prometheus-client`
+- [ ] Add `rust-toolchain.toml` pinning stable channel (e.g. `channel = "stable"`); set `edition = "2024"` in each crate's `Cargo.toml` manifest
 - [ ] Add `.gitignore` for Rust (`/target`, `Cargo.lock` for libraries)
 - [ ] Verify `cargo check --workspace` succeeds with no errors
 
@@ -253,8 +253,8 @@ storyId: "failover-cluster:XRAFT"
 
 ### Implementation Steps
 - [ ] Implement snapshot trigger logic in `RaftNode`: initiate snapshot when `commit_index - last_snapshot_index > max_log_entries_before_compaction`
-- [ ] Implement `take_snapshot()` in `RaftNode`: call `state_machine.snapshot()`, save via `SnapshotStore`, record snapshot metadata, truncate log entries before snapshot index
-- [ ] Implement `install_snapshot()` handler for followers: receive snapshot chunks via `FetchSnapshot` RPC stream, assemble complete snapshot, call `state_machine.restore()`, update `last_applied` and `commit_index`
+- [ ] Implement `take_snapshot()` in `RaftNode` as I/O-free: when the trigger fires, return `Action::TakeSnapshot { through_index }` so the external driver calls `state_machine.snapshot()` and `SnapshotStore::save_snapshot()` outside the core; on completion the driver feeds `Input::SnapshotComplete { metadata }` back into the node, which records metadata and returns `Action::TruncateLog { before_index }`
+- [ ] Implement `install_snapshot()` as I/O-free: receiving a `FetchSnapshot` response produces `Action::InstallSnapshot { metadata, data }` so the driver calls `state_machine.restore()` and `SnapshotStore::save_snapshot()` externally; on completion the driver feeds `Input::SnapshotInstalled { metadata }` and the node updates `last_applied` and `commit_index`
 - [ ] Implement leader-side snapshot sending: when a follower's `last_fetch_offset` is before the log start (entries were compacted), respond to the follower's Fetch with a redirect to `FetchSnapshot`, then stream snapshot chunks
 - [ ] Add snapshot progress tracking: log percentage complete for large snapshot transfers
 
@@ -332,7 +332,7 @@ storyId: "failover-cluster:XRAFT"
 
 ### Implementation Steps
 - [ ] Implement cluster bootstrap from a fixed voter set defined in configuration: on first start with no persisted state, initialize `VoterSet` from config and persist it as part of `HardState`
-- [ ] Implement `VoterSet` validation at startup: reject configurations with even numbers of voters or fewer than 3 voters; verify the local node is in the voter set
+- [ ] Implement `VoterSet` validation at startup: require at least 1 voter; warn (but allow) even-numbered voter sets since they have lower fault tolerance per node; verify the local node is either in the voter set or registered as an observer
 - [ ] Implement `Observer` role: non-voting nodes that replicate the log via Fetch RPCs for read scaling or standby purposes, without participating in elections or quorum calculations
 - [ ] Implement observer registration: observers connect to the leader and send Fetch RPCs like voters, but the leader excludes them from high-watermark quorum computation
 - [ ] Persist the `VoterSet` in snapshots so that nodes restoring from a snapshot know the cluster membership without re-reading configuration
@@ -343,7 +343,8 @@ storyId: "failover-cluster:XRAFT"
 ### Test Scenarios
 - [ ] Scenario: bootstrap-voter-set — Given a 3-node cluster configuration, When all nodes start for the first time, Then each node initializes with the same VoterSet and an election produces a leader
 - [ ] Scenario: observer-replicates-without-voting — Given a 3-node cluster with 1 observer, When the observer sends Fetch RPCs, Then it receives log entries but does not count toward quorum and cannot become a candidate
-- [ ] Scenario: reject-invalid-voter-count — Given a configuration with 2 voters, When the server starts, Then it exits with an error rejecting even-numbered voter sets
+- [ ] Scenario: single-node-cluster — Given a configuration with 1 voter, When the server starts, Then it elects itself leader immediately and can commit entries without waiting for peers
+- [ ] Scenario: even-voter-warning — Given a configuration with 2 voters, When the server starts, Then it logs a warning about reduced fault tolerance but proceeds to form a cluster
 
 ## Stage 7.3: Log Compaction Pipeline
 
