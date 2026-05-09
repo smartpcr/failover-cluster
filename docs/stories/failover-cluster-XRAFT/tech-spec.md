@@ -58,7 +58,7 @@ The following capabilities are in scope for the XRAFT story:
 | Capability | Detail |
 |---|---|
 | **Leader election** | Term-based voting with randomised election timeouts, `RequestVote` RPC, majority quorum |
-| **Log replication** | Append-only log, `AppendEntries`/`Fetch`-style RPC, high-watermark tracking, log consistency checks (`prevLogIndex` / `prevLogTerm`) |
+| **Log replication** | Append-only log with high-watermark tracking and log consistency checks (`prevLogIndex` / `prevLogTerm`).  In our KRaft-inspired model, followers pull entries via `Fetch` RPCs rather than receiving leader-pushed `AppendEntries` (see §2.2); the consistency guarantees are identical to textbook Raft — only the initiator of the RPC changes. |
 | **Safety invariants** | All five Raft safety properties (§1 table) enforced and tested |
 | **Persistent state** | `currentTerm`, `votedFor`, and log durably persisted (`fsync`) before RPC responses |
 | **Heartbeats** | Leader sends periodic heartbeats; followers reset election timer on receipt |
@@ -69,7 +69,7 @@ The following capabilities are in scope for the XRAFT story:
 
 | Capability | Detail |
 |---|---|
-| **Pull-based replication** | Followers and observers initiate `Fetch` RPCs instead of leader-push `AppendEntries` |
+| **Pull-based replication** | Followers and observers initiate `Fetch` RPCs to the leader instead of receiving leader-pushed RPCs.  This replaces the textbook `AppendEntries` push model: the leader responds to each `Fetch` with new log entries, consistency metadata (`prevLogIndex` / `prevLogTerm`), and the current high watermark.  All Raft safety invariants are preserved — only the direction of initiation changes. |
 | **Pre-Vote** | Candidate checks quorum reachability before incrementing term |
 | **Check Quorum** | Leader periodically verifies majority contact; steps down on quorum loss |
 | **Snapshot support** | Periodic snapshots of applied state; `FetchSnapshot` RPC for slow/new followers |
@@ -81,7 +81,7 @@ The following capabilities are in scope for the XRAFT story:
 | Capability | Detail |
 |---|---|
 | **Async I/O** | Built on `tokio` async runtime |
-| **RPC layer** | gRPC (via `tonic`) or custom TCP framing — architecture doc decides |
+| **RPC layer** | gRPC via `tonic` + `prost`.  gRPC provides HTTP/2 streaming (useful for `Fetch` long-poll), backpressure, and codegen.  The added binary size is acceptable given the observability and interop benefits.  This is a **firm decision**, not deferred. |
 | **Multiplexed connections** | Connection pooling between peers |
 
 ### 2.4  Observability
@@ -202,7 +202,7 @@ real networking and deterministic simulation.
 | Purpose | Crate | Rationale |
 |---|---|---|
 | Async runtime | `tokio` | Industry standard for Rust async |
-| Serialisation | `serde` + `bincode` or `prost` | Compact binary encoding for log entries and RPCs |
+| Serialisation | `prost` | Protobuf encoding for both RPCs and on-disk log entries; single format across the stack (§7) |
 | Logging | `tracing` | Structured, async-aware |
 | Metrics | `metrics` | Façade pattern; pluggable exporters |
 | RPC (if gRPC) | `tonic` + `prost` | Mature, HTTP/2-based |
@@ -234,7 +234,7 @@ real networking and deterministic simulation.
 | Risk | Impact | Mitigation |
 |---|---|---|
 | 13 story points may be tight for full snapshot + observer support | **Medium** — incomplete delivery | Prioritise core election + replication first; snapshot and observer are lower-priority extensions that can be deferred |
-| Pull-based model is architecturally different from textbook Raft | **Medium** — design confusion | Document the mapping between KRaft concepts and standard Raft explicitly in the architecture doc |
+| Pull-based model is architecturally different from textbook Raft | **Medium** — design confusion | Document the mapping between KRaft concepts and standard Raft explicitly (see §2.1 and §2.2 for the reconciliation) |
 | No existing Rust code in repo to build on | **Low** — cold start | Scaffold workspace with `cargo init` early; unblocks parallel work |
 
 ### 6.4  Operational Risk
@@ -246,20 +246,26 @@ real networking and deterministic simulation.
 
 ---
 
-## 7  Key Decisions Pending
+## 7  Key Decisions — Resolved
 
-These decisions affect multiple sibling documents and should be resolved
-consistently across `architecture.md`, `implementation-plan.md`, and this spec:
+The following decisions were pending in iteration 1 and are now resolved within
+this spec to avoid cross-document dependency on files that may not yet exist:
 
-1. **RPC transport**: gRPC (`tonic`) vs. custom TCP framing.  gRPC is heavier
-   but gives streaming, backpressure, and codegen for free.  Custom TCP is
-   lighter but requires hand-rolled framing and connection management.
-2. **Log encoding format**: `bincode` (compact, Rust-native) vs. `protobuf`
-   (cross-language, self-describing).  If non-goals include cross-language
-   bindings, `bincode` is simpler.
-3. **Pull vs. push replication**: The story references KRaft (pull-based), but
-   the Raft paper describes push-based `AppendEntries`.  This spec assumes
-   pull-based per the KRaft design reference.  Architecture doc should confirm.
+1. **RPC transport → gRPC (`tonic`).**  gRPC provides HTTP/2 streaming (needed
+   for `Fetch` long-poll), built-in backpressure, and proto codegen.  The heavier
+   binary is an acceptable trade-off.  See §2.3.
+2. **Log encoding format → `protobuf` (`prost`).**  Since the RPC layer uses
+   `tonic`/`prost`, using protobuf for on-disk log encoding keeps one serialisation
+   format across the stack.  Cross-language decoding of log segments is a bonus
+   even though cross-language bindings are a non-goal (§4).
+3. **Pull-based replication → confirmed.**  Followers initiate `Fetch` RPCs to
+   the leader.  This is a firm design decision, not pending.  The mapping from
+   textbook Raft's push-based `AppendEntries` to KRaft's pull-based `Fetch` is
+   documented in §2.1 and §2.2.
+
+> **Note to sibling doc authors:** If `architecture.md` or
+> `implementation-plan.md` are written after this iteration, they should adopt
+> these decisions or flag disagreement for the next iteration cycle.
 
 ---
 
@@ -292,4 +298,4 @@ consistently across `architecture.md`, `implementation-plan.md`, and this spec:
 ---
 
 *Document: `docs/stories/failover-cluster-XRAFT/tech-spec.md`*
-*Story: failover-cluster:XRAFT · Status: Draft · Iteration 1*
+*Story: failover-cluster:XRAFT · Status: Draft · Iteration 2*
