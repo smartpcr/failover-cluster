@@ -14,7 +14,7 @@ reusable consensus library and standalone cluster binary. The system provides:
 - **Leader election** with Pre-Vote and Check-Quorum extensions.
 - **Log replication** using a pull-based (Fetch) model rather than push-based AppendEntries.
 - **Snapshot-based log compaction** for bounded storage and fast follower catch-up.
-- **Dynamic quorum membership** with single-change-at-a-time safety.
+- **Static quorum membership** with a fixed voter set defined at cluster bootstrap.
 - **An event-sourced metadata state machine** that replays a deterministic log.
 
 The implementation targets clusters of 3, 5, or 7 voter nodes, with additional
@@ -24,18 +24,17 @@ non-voting observer nodes for read scale-out.
 
 ## 2. Component Architecture
 
-The system is divided into six crates within a Cargo workspace:
+The system is divided into six crates within a Cargo workspace at the
+repository root:
 
 ```
-xraft/
-├── Cargo.toml                 # workspace root
-├── crates/
-│   ├── xraft-core/            # Raft algorithm, pure logic, no I/O
-│   ├── xraft-log/             # Persistent log and snapshot storage
-│   ├── xraft-rpc/             # Network transport (gRPC via tonic)
-│   ├── xraft-server/          # Node binary, wiring, configuration
-│   ├── xraft-client/          # Client library for external consumers
-│   └── xraft-testkit/         # Deterministic test harness
+Cargo.toml                       # workspace root
+xraft-core/                      # Raft algorithm, pure logic, no I/O
+xraft-storage/                   # Persistent log and snapshot storage
+xraft-transport/                 # Network transport (gRPC via tonic)
+xraft-server/                    # Node binary, wiring, configuration
+xraft-client/                    # Peer & admin RPC client library
+xraft-test/                      # Deterministic test harness
 ```
 
 ### 2.1 `xraft-core` — Consensus Engine
@@ -55,7 +54,7 @@ step-down) is a pure function of inputs and current state.
 | `HardState` | Persisted before any RPC reply: `current_term`, `voted_for`, `commit_index`. |
 | `VoterSet` | Set of `(NodeId, NodeDirectoryId, Vec<Endpoint>)` tuples — the current quorum configuration. |
 | `ElectionTimer` | Randomised election timeout (150–300 ms default). Reset on valid leader contact. |
-| `Input` | Enum of all inputs: `Tick`, `VoteRequest`, `VoteResponse`, `FetchRequest`, `FetchResponse`, `ClientPropose`, `AddVoter`, `RemoveVoter`. |
+| `Input` | Enum of all inputs: `Tick`, `VoteRequest`, `VoteResponse`, `FetchRequest`, `FetchResponse`, `ClientPropose`. |
 | `Action` | Enum of all side-effects: `PersistHardState`, `AppendEntries`, `SendMessage`, `ApplyToStateMachine`, `TakeSnapshot`, `InstallSnapshot`, `BecomeLeader`, `StepDown`. |
 
 **Key design choice — pull-based replication (KRaft-style):**
@@ -81,11 +80,11 @@ The leader periodically verifies it can communicate with a majority of voters.
 If it cannot reach a quorum within `check_quorum_interval` (typically 2×
 election timeout), it steps down to follower to avoid split-brain.
 
-### 2.2 `xraft-log` — Storage Engine
+### 2.2 `xraft-storage` — Storage Engine
 
 **Responsibility:** Durable, append-only log with segment files, plus snapshot
-creation and loading. Provides the `LogStore` and `SnapshotStore` traits that
-`xraft-server` injects into the core engine.
+creation and loading. Provides the `LogStore`, `SnapshotStore`, and
+`HardStateStore` traits and their file-backed implementations.
 
 | Trait / Struct | Role |
 |---|---|
@@ -108,7 +107,7 @@ Segments whose entries are fully covered by the latest snapshot are eligible for
 deletion. A configurable `log.retention.min_segments` (default 2) keeps recent
 segments for slow followers.
 
-### 2.3 `xraft-rpc` — Network Transport
+### 2.3 `xraft-transport` — Network Transport
 
 **Responsibility:** Defines the gRPC service and message types for all Raft RPCs.
 Uses `tonic` (Rust gRPC) with `prost` for Protobuf serialisation.
@@ -121,8 +120,6 @@ service RaftService {
   rpc PreVote(PreVoteRequest)       returns (PreVoteResponse);
   rpc Fetch(FetchRequest)           returns (FetchResponse);
   rpc FetchSnapshot(FetchSnapshotRequest) returns (stream FetchSnapshotChunk);
-  rpc AddVoter(AddVoterRequest)     returns (AddVoterResponse);
-  rpc RemoveVoter(RemoveVoterRequest) returns (RemoveVoterResponse);
 }
 ```
 
@@ -132,7 +129,6 @@ service RaftService {
 | `PreVote` | PreCandidate → all voters | Check electability without incrementing term. Same payload as `Vote`. |
 | `Fetch` | Follower/Observer → Leader | Pull-based log replication. Carries `fetch_offset`, `last_fetched_epoch`, `replica_id`. |
 | `FetchSnapshot` | Follower → Leader | Chunked snapshot transfer when follower is too far behind. |
-| `AddVoter` / `RemoveVoter` | Admin client → Leader | Dynamic quorum changes (one at a time). |
 
 **Identity and fencing fields (every RPC):**
 - `cluster_id: String` — rejects cross-cluster messages.
@@ -155,7 +151,7 @@ Owns the event loop, tick scheduling, and configuration loading.
 | `TickDriver` | Fires `Input::Tick` at `tick_interval` (default 50 ms). The core engine counts ticks to derive election and heartbeat timeouts. |
 | `NodeConfig` | TOML configuration: `node_id`, `data_dir`, `cluster_peers`, `election_timeout_ms`, `tick_interval_ms`, `snapshot_interval_entries`, `log.segment_max_bytes`. |
 | `MetricsRegistry` | Prometheus-compatible metrics: `current_leader`, `current_term`, `commit_latency_avg`, `append_records_rate`, `election_latency_avg`, `log_end_offset`, `replication_lag`. |
-| `AdminApi` | HTTP API for operational commands: cluster status, add/remove voter, trigger snapshot. |
+| `AdminApi` | HTTP API for operational commands: cluster status, trigger snapshot, node health. |
 
 **Event loop architecture (KRaft-inspired):**
 Like KRaft's `KafkaRaftClient`, the event loop is single-threaded to eliminate
@@ -186,31 +182,34 @@ messages onto an async channel; the loop drains the channel, feeds inputs to
 any `SendMessage` actions in the same batch. This mirrors Raft's safety
 requirement that durable state is written before network acknowledgements.
 
-### 2.5 `xraft-client` — Client Library
+### 2.5 `xraft-client` — Peer and Admin Client
 
-**Responsibility:** Provides an ergonomic Rust API for applications that want
-to use XRAFT as an embedded consensus layer or connect to a running cluster.
+**Responsibility:** Provides an internal Rust client for inter-node RPC
+communication and administrative cluster operations. This is **not** an external
+consumer SDK (which is out of scope per `tech-spec.md` §3); it is infrastructure
+used by `xraft-server` to establish peer connections and by admin tooling to
+issue cluster-management commands (e.g., trigger snapshot, query cluster status).
 
 | Struct / Trait | Role |
 |---|---|
-| `XRaftClient` | Connects to the cluster, discovers the leader, submits proposals, reads committed state. |
-| `StateMachine` (trait) | User-implements: `apply(command: &[u8]) -> Result<Vec<u8>>`, `snapshot() -> Result<Vec<u8>>`, `restore(snapshot: &[u8]) -> Result<()>`. |
-| `Proposal` | `(serial_number: u64, command: Bytes)` — idempotent command submission. Serial numbers enable deduplication. |
-| `ClientConfig` | Bootstrap endpoints, retry policy, request timeout. |
+| `PeerClient` | Wraps `tonic` gRPC channel to a specific peer. Sends `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` RPCs. Handles connection lifecycle and reconnection. |
+| `ConnectionPool` | Maintains a pool of `PeerClient` instances keyed by `NodeId`. Lazy-initialises connections on first use. |
+| `AdminClient` | Connects to a node's admin HTTP endpoint for operational queries (leader status, metrics, trigger snapshot). |
+| `ClientConfig` | Peer endpoint list, retry policy, connect/request timeouts. |
 
-**Leader discovery and redirect:**
-If a client sends a proposal to a non-leader node, that node responds with
-`ErrorCode::NotLeader { leader_hint: Option<NodeId> }`. The client transparently
-retries against the hinted leader.
+**Leader discovery:**
+`PeerClient` tracks the last-known leader via hints returned in `FetchResponse`
+and `VoteResponse` messages. When a peer connection fails or returns a redirect,
+the client transparently retries against the hinted leader endpoint.
 
-### 2.6 `xraft-testkit` — Deterministic Testing
+### 2.6 `xraft-test` — Deterministic Testing
 
 **Responsibility:** A simulated network and clock for testing the consensus
 engine without real I/O. Inspired by deterministic simulation testing (Jepsen-style).
 
 | Struct | Role |
 |---|---|
-| `SimulatedCluster` | Hosts N `RaftNode` instances with in-memory logs. |
+| `SimulatedCluster` | Hosts N `RaftNode` instances with in-memory storage implementations. |
 | `SimulatedNetwork` | Programmable message delivery: drop, delay, partition, duplicate. |
 | `SimulatedClock` | Manual tick advancement for deterministic, reproducible tests. |
 | `Invariant` | Pluggable assertion: `AtMostOneLeader`, `LogsConverge`, `CommittedEntriesNeverLost`. |
@@ -315,10 +314,12 @@ below HW are considered committed.
 ### 4.1 Trait Boundaries
 
 The core engine depends only on traits, never on concrete implementations.
-This is the primary seam for testing and future storage backends.
+This is the primary seam for testing and future storage backends. Each trait is
+defined in the crate that owns its domain; `xraft-core` depends on the trait
+definitions via `xraft-storage` and `xraft-transport` crate boundaries.
 
 ```rust
-// xraft-core defines these traits:
+// xraft-storage defines the persistence traits:
 
 trait LogStore: Send + Sync {
     fn append(&mut self, entries: &[Entry]) -> Result<()>;
@@ -341,10 +342,15 @@ trait HardStateStore: Send + Sync {
     fn load(&self) -> Result<Option<HardState>>;
 }
 
+// xraft-transport defines the network trait:
+
 trait Transport: Send + Sync {
     async fn send(&self, target: NodeId, message: RaftMessage) -> Result<()>;
     async fn broadcast(&self, targets: &[NodeId], message: RaftMessage) -> Result<()>;
 }
+
+// xraft-core defines the state machine callback trait
+// (user-provided, injected into the server at startup):
 
 trait StateMachine: Send + Sync {
     fn apply(&mut self, index: LogIndex, command: &[u8]) -> Result<Vec<u8>>;
@@ -357,20 +363,22 @@ trait StateMachine: Send + Sync {
 
 ```
 xraft-server ──► xraft-core
-             ──► xraft-log
-             ──► xraft-rpc
+             ──► xraft-storage
+             ──► xraft-transport
+             ──► xraft-client
 
-xraft-client ──► xraft-rpc
+xraft-client ──► xraft-core
+             ──► xraft-transport
 
-xraft-testkit ──► xraft-core  (in-memory implementations of all traits)
+xraft-test   ──► xraft-core  (in-memory implementations of all traits)
 
-xraft-log ──► (no xraft dependencies; uses serde, crc32fast, memmap2)
+xraft-storage   ──► xraft-core  (imports core types: Entry, LogIndex, Term, HardState)
 
-xraft-rpc ──► (no xraft dependencies; uses tonic, prost)
+xraft-transport ──► xraft-core  (imports core types and message definitions)
 ```
 
 `xraft-core` has **zero** dependencies on other xraft crates, ensuring it can
-be tested in isolation with `xraft-testkit`.
+be tested in isolation with `xraft-test`.
 
 ### 4.3 Event Loop Integration Points
 
@@ -379,10 +387,10 @@ The `EventLoop` in `xraft-server` connects the components:
 ```
                          ┌───────────────┐
      ┌──── gRPC ────────►│               │
-     │                   │  EventLoop    │──── LogStore (xraft-log)
-     ├──── TickDriver ──►│  (single      │──── HardStateStore (xraft-log)
-     │                   │   thread)     │──── SnapshotStore (xraft-log)
-     └──── AdminApi ────►│               │──── Transport (xraft-rpc)
+     │                   │  EventLoop    │──── LogStore (xraft-storage)
+     ├──── TickDriver ──►│  (single      │──── HardStateStore (xraft-storage)
+     │                   │   thread)     │──── SnapshotStore (xraft-storage)
+     └──── AdminApi ────►│               │──── Transport (xraft-transport)
                          │  RaftNode     │──── StateMachine (user-provided)
                          │  (xraft-core) │──── MetricsRegistry
                          └───────────────┘
@@ -535,49 +543,51 @@ writes), the leader detects the mismatch and responds with a `DivergingEpoch`:
     │                                      │
 ```
 
-### 5.5 Dynamic Quorum Change (Add Voter)
+### 5.5 Check-Quorum Leader Step-Down
+
+Dynamic quorum changes (`AddVoter` / `RemoveVoter`) are **out of scope for v1**
+(see `tech-spec.md` §3). The voter set is fixed at bootstrap. Instead, this
+section documents the Check-Quorum protocol that prevents stale leadership:
 
 ```
-  Admin Client         Leader (A)          New Node (D)        Follower (B)
-    │                    │                     │                     │
-    │── AddVoter(D) ───►│                     │                     │
-    │                    │                     │                     │
-    │                    │ [reject if another  │                     │
-    │                    │  change in progress]│                     │
-    │                    │                     │                     │
-    │                    │                     │◄── (D starts as     │
-    │                    │                     │    observer, fetches │
-    │                    │                     │    log until caught  │
-    │                    │                     │    up)               │
-    │                    │                     │                     │
-    │                    │ [D caught up]       │                     │
-    │                    │ append VoterSet     │                     │
-    │                    │ config entry with   │                     │
-    │                    │ D included          │                     │
-    │                    │                     │                     │
-    │                    │ ── replicate via ──────────────────────── │
-    │                    │    Fetch rounds     │                     │
-    │                    │                     │                     │
-    │                    │ [majority of NEW    │                     │
-    │                    │  voter set commits] │                     │
-    │                    │                     │                     │
-    │◄── Ok ────────────┤                     │                     │
-    │                    │                     │                     │
-    │                    │ [D is now a full    │                     │
-    │                    │  voter; quorum      │                     │
-    │                    │  size increased]    │                     │
+  Leader (A, term=3)            Follower (B)             Follower (C)
+    │                              │                         │
+    │  [check_quorum_interval      │                         │
+    │   ticks elapsed]             │                         │
+    │                              │                         │
+    │  scan ReplicaState:          │                         │
+    │   B.last_fetch_time = 200ms  │                         │
+    │   C.last_fetch_time = 8000ms │                         │
+    │   (C appears unreachable)    │                         │
+    │                              │                         │
+    │  [count reachable voters:    │                         │
+    │   self + B = 2 / 3 = ok]     │                         │
+    │  → remain Leader             │                         │
+    │                              │                         │
+    │  ─── next interval ──────    │                         │
+    │                              │                         │
+    │  scan ReplicaState:          │                         │
+    │   B.last_fetch_time = 9000ms │                         │
+    │   C.last_fetch_time = 9500ms │                         │
+    │   (B AND C unreachable)      │                         │
+    │                              │                         │
+    │  [count reachable voters:    │                         │
+    │   self only = 1 / 3 = fail]  │                         │
+    │  → step down to Follower     │                         │
+    │  → clear leader state        │                         │
+    │  → emit StepDown action      │                         │
 ```
 
-**Single-change safety:** Only one voter addition or removal may be in-flight at
-a time. This prevents disjoint majorities that could arise from concurrent
-membership changes — the same constraint KRaft enforces.
+**Purpose:** Check-Quorum prevents a leader partitioned from the majority from
+continuing to accept proposals that it can never commit. By stepping down, it
+allows the reachable majority to elect a new leader.
 
 ---
 
 ## 6. Safety Invariants
 
 The following invariants are enforced by `xraft-core` and verified by
-`xraft-testkit` in every test run:
+`xraft-test` in every test run:
 
 | # | Invariant | Enforcement |
 |---|---|---|
@@ -661,7 +671,7 @@ http_listen_address = "0.0.0.0:9090"
 |---|---|---|
 | **Pull-based (Fetch) replication** over push-based AppendEntries | Matches KRaft's approach; leader doesn't manage per-follower outbound connections; scales better with many observers. | Two fetch rounds needed for commit visibility; slightly higher commit latency compared to push-based. |
 | **Single-threaded event loop** for consensus logic | Eliminates lock contention and data races in the consensus hot path (KRaft does the same). | All consensus work is serialised; throughput bounded by single core. Mitigated by batching. |
-| **Separate `xraft-core` crate with no I/O** | Enables deterministic testing with `xraft-testkit`; makes the algorithm auditable independent of runtime concerns. | Requires trait-based indirection for storage and transport. |
+| **Separate `xraft-core` crate with no I/O** | Enables deterministic testing with `xraft-test`; makes the algorithm auditable independent of runtime concerns. | Requires trait-based indirection for storage and transport. |
 | **gRPC (tonic) for transport** | Mature Rust ecosystem; streaming support for snapshot transfer; schema evolution via protobuf. | Heavier than a custom TCP protocol; acceptable for controller-plane traffic. |
 | **Segment-file log with memory-mapped index** | Proven pattern (Kafka, etcd); efficient sequential writes; O(1) lookups via sparse index. | Requires periodic compaction; index rebuild on unclean shutdown. |
 | **Pre-Vote + Check-Quorum** by default | Prevents unnecessary elections from partitioned nodes and split-brain. | Adds one extra RPC round before election; negligible cost. |
@@ -670,6 +680,6 @@ http_listen_address = "0.0.0.0:9090"
 
 ## 10. Relationship to Sibling Documents
 
-- **`tech-spec.md`**: Defines wire formats, Protobuf schemas, and storage byte layouts in detail. This document describes *what* the components are; tech-spec defines *how* the bytes look on disk and wire.
+- **`tech-spec.md`**: Defines the problem statement, scope boundaries (in-scope vs. out-of-scope), hard constraints (language, concurrency model, persistence, timing), identified risks, and key resolved decisions (gRPC transport, protobuf encoding, pull-based replication). This document describes *what* the components are and how they interact; tech-spec establishes *why* those choices were made and *what limits* they operate under.
 - **`implementation-plan.md`**: Breaks this architecture into ordered implementation phases with crate-level milestones. References component names from this document.
-- **`e2e-scenarios.md`**: Defines integration test scenarios (election under partition, snapshot catch-up, quorum change) against the sequence flows in Section 5.
+- **`e2e-scenarios.md`**: Defines integration test scenarios (election under partition, snapshot catch-up, check-quorum step-down) against the sequence flows in Section 5.
