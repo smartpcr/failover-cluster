@@ -54,7 +54,7 @@ Feature: Leader election under normal conditions
     When node-2 becomes the leader
     Then node-2 appends a no-op log entry at the start of epoch 2
     And the no-op entry is replicated to a majority before serving reads
-    And all previously uncommitted entries from epoch 1 are implicitly committed
+    And any epoch-1 entries present on node-2's log that are now covered by the committed no-op are committed (entries from prior terms not on the new leader remain uncommitted)
 ```
 
 ---
@@ -287,7 +287,7 @@ Feature: Durable state survives crashes and restarts
     When node-1 crashes and restarts
     Then node-1 reads currentEpoch=3 from stable storage
     And node-1 reads votedFor=node-0 from stable storage
-    And node-1 replays its log from index 0 to 20 to rebuild state machine
+    And node-1 replays its log from index 1 to 20 to rebuild state machine
     And node-1 resumes as a follower without triggering a new election
 
   Scenario: Node recovers from snapshot plus log tail
@@ -543,7 +543,7 @@ Feature: Raft safety invariants hold under all conditions
 
   Scenario: Log Matching across nodes
     Given two nodes have a log entry with the same index and epoch
-    Then their logs are identical from index 0 up to that entry
+    Then their logs are identical from index 1 up to that entry
 
   Scenario: State Machine Safety
     Given node A applies entry at index I to its state machine
@@ -700,10 +700,16 @@ The following design decisions are resolved in sibling docs and reflected in the
    and admin tooling.  It is **not** an external consumer SDK — no external client SDK is in
    scope for v1.  Feature 11 tests inter-node routing, leader discovery via Fetch, and
    internal admin operations only.
+   Note: `architecture.md` §2.5 (line 186) now reflects this internal scope, but its
+   cross-reference appendix (§8) still contains legacy text describing `xraft-client` as an
+   "external consumer library with `propose`/`read`."  A future iteration of `architecture.md`
+   should reconcile that appendix text with §2.5.
 
-5. **Dynamic membership fully deferred** — per `tech-spec.md` §2.7/§3 and `architecture.md` §5.5,
-   `AddVoter`/`RemoveVoter` RPCs are **not** a stretch goal within this story.  They are
-   deferred to a future story entirely.  Feature 12 covers v1 static-membership behaviour only.
+5. **Dynamic membership out of v1 scope** — per `tech-spec.md` §2.7/§3, `AddVoter`/`RemoveVoter`
+   RPCs are deferred to a future story entirely and are not in scope for v1.
+   Note: `architecture.md` §5.5 still labels them a "stretch goal" for this story, which is a
+   softer exclusion than the tech-spec's full deferral.  These scenarios follow the tech-spec's
+   stricter boundary: Feature 12 covers v1 static-membership behaviour only.
 
 6. **Observability endpoints** — `/health` (liveness/readiness) and `/metrics` (Prometheus format)
    per `tech-spec.md` §2.4. Feature 15 metric names are aligned with `architecture.md` §7.
