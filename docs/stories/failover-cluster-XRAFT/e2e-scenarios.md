@@ -431,32 +431,18 @@ Feature: Check Quorum prevents split-brain
 
 ---
 
-## Feature 11: Inter-Node Request Routing
+## Feature 11: Inter-Node Request Routing and Leader Discovery
 
 ```gherkin
-Feature: Client interaction, request routing, and leader discovery
-  Clients use the `xraft-client` crate (tech-spec §2.6) which provides
-  `propose(data)` and `read(key)` APIs with automatic leader discovery.
-  Nodes also route inter-node requests appropriately.
+Feature: Inter-node request routing and leader discovery
+  Per tech-spec §2.6, `xraft-client` is an internal infrastructure crate used
+  by `xraft-server` for inter-node communication and admin tooling.  No external
+  client SDK is in scope for v1.  Leader discovery occurs through Fetch RPC
+  responses that carry leader_id and epoch metadata.
 
   Background:
     Given a cluster of 3 nodes
     And node-0 is the leader
-
-  Scenario: Client proposes a write via xraft-client
-    When a client calls `propose("SET x = 42")` via the xraft-client SDK
-    And the client does not know the leader
-    Then the client connects to any known node
-    And if the node is not the leader, it responds with NOT_LEADER and leader_hint=node-0
-    And the client redirects the proposal to node-0
-    And node-0 appends the entry and commits it via quorum replication
-    And the client receives a success response
-
-  Scenario: Client performs a linearisable read via xraft-client
-    When a client calls `read(key)` via the xraft-client SDK
-    Then the request is routed to the current leader (node-0)
-    And node-0 confirms it is still leader (via quorum check or no-op heartbeat)
-    And returns the current value for the key
 
   Scenario: Follower discovers leader via Fetch response
     When node-1 sends a Fetch RPC to node-0
@@ -476,17 +462,17 @@ Feature: Client interaction, request routing, and leader discovery
     And node-2 discovers node-1 as the new leader in epoch 6
     And node-2 redirects its Fetch RPCs to node-1
 
-  Scenario: Client transparently handles leader failover
-    Given a client is connected to node-0 (current leader)
-    When node-0 crashes and node-1 becomes leader in epoch 6
-    And the client's next `propose` call fails with NOT_LEADER
-    Then the client retries with backoff and discovers node-1 as the new leader
-    And subsequent operations succeed via node-1
-
   Scenario: All nodes converge on leader identity after election
     When a new election completes and node-2 wins epoch 7
     Then within one Fetch cycle, all followers learn node-2 is the leader
     And all nodes' internal leader tracking agrees on node-2 for epoch 7
+
+  Scenario: Admin tooling submits a write via internal xraft-client
+    When admin tooling uses the internal `xraft-client` crate to submit a write
+    Then the internal client connects to the cluster via inter-node gRPC
+    And if the target node is not the leader, it responds with NOT_LEADER and leader_hint
+    And the internal client redirects the request to the current leader
+    And the leader appends the entry and commits it via quorum replication
 ```
 
 ---
@@ -496,8 +482,8 @@ Feature: Client interaction, request routing, and leader discovery
 ```gherkin
 Feature: Static voter membership with observer join
   Per tech-spec §2.7, the voter set is fixed at cluster bootstrap for v1.
-  Dynamic membership (AddVoter/RemoveVoter) is a stretch goal (tech-spec §2.7,
-  implementation-plan Stage 7.2) and is not tested in v1 E2E scenarios.
+  Dynamic membership (AddVoter/RemoveVoter) is out of scope for v1 and deferred
+  to a future story entirely — it is not a stretch goal within XRAFT (tech-spec §2.7, §3).
   Observers (non-voting nodes) may join to replicate the log for read scaling.
 
   Background:
@@ -527,13 +513,13 @@ Feature: Static voter membership with observer join
     And observer-0 initiates a FetchSnapshot RPC
     And observer-0 loads the snapshot and resumes Fetch from index 8,001
 
-  Scenario: AddVoter/RemoveVoter are deferred to stretch goal
+  Scenario: AddVoter/RemoveVoter are not available in v1
     When an operator attempts to issue an AddVoter or RemoveVoter command
-    Then the leader rejects the request with an UNSUPPORTED error in v1
+    Then the node rejects the request with an UNSUPPORTED error
     And the voter set remains unchanged
-    # Note: dynamic membership (single-change-at-a-time AddVoter/RemoveVoter)
-    # is a stretch goal per tech-spec §2.7 and implementation-plan Stage 7.2.
-    # If implemented, dedicated E2E scenarios will be added at that time.
+    # Note: dynamic membership (AddVoter/RemoveVoter) is out of scope for v1
+    # and deferred to a future story entirely — not a stretch goal within XRAFT
+    # (tech-spec §2.7, §3).
 ```
 
 ---
@@ -543,7 +529,7 @@ Feature: Static voter membership with observer join
 ```gherkin
 Feature: Raft safety invariants hold under all conditions
   These properties must be verified continuously, including during
-  fault injection, network partitions, and membership changes.
+  fault injection, network partitions, crash-recovery, and observer join.
 
   Scenario: Leader Append-Only
     Given any node is in "Leader" state
@@ -657,12 +643,13 @@ Feature: Cluster metrics and health observability
 
 ---
 
-## Feature 16: Graceful Shutdown and Controlled Leadership Transfer
+## Feature 16: Graceful Shutdown and Leader Step-Down
 
 ```gherkin
-Feature: Graceful node shutdown with optional leadership transfer
-  A node being shut down should drain cleanly and, if it is the leader,
-  optionally transfer leadership before stopping.
+Feature: Graceful node shutdown with leader step-down
+  A node being shut down should drain cleanly.  If it is the leader,
+  it steps down and allows a natural election (via the standard Vote RPC)
+  rather than using out-of-scope RPCs like TimeoutNow.
 
   Background:
     Given a cluster of 3 nodes
@@ -670,11 +657,12 @@ Feature: Graceful node shutdown with optional leadership transfer
 
   Scenario: Leader initiates graceful shutdown with transfer
     When node-0 receives a shutdown signal
-    Then node-0 selects the most caught-up follower (e.g., node-1)
-    And node-0 sends a TimeoutNow RPC to node-1
-    And node-1 immediately starts an election (skipping its election timeout)
-    And node-1 becomes the new leader in epoch+1
-    And node-0 stops accepting new requests and shuts down
+    Then node-0 stops accepting new proposals
+    And node-0 waits for in-flight entries to commit (or a short timeout)
+    And node-0 steps down from leadership
+    And a follower detects the absence of Fetch responses and triggers an election
+    And a new leader is elected in epoch+1
+    And node-0 shuts down cleanly
 
   Scenario: Follower graceful shutdown
     When node-2 receives a shutdown signal
@@ -703,18 +691,19 @@ The following design decisions are resolved in sibling docs and reflected in the
    do not vote or count toward quorum.
 
 3. **Static voter membership for v1** — per `tech-spec.md` §2.7, the voter set is fixed
-   at bootstrap. Dynamic membership (AddVoter/RemoveVoter) is a stretch goal, not tested
-   in v1 E2E. Feature 12 reflects static-membership-only behaviour.
+   at bootstrap. Dynamic membership (`AddVoter`/`RemoveVoter`) is **out of scope for v1**
+   and deferred to a future story entirely — it is not a stretch goal within XRAFT.
+   Feature 12 reflects static-membership-only behaviour.
 
-4. **Client SDK (`xraft-client`)** — per `tech-spec.md` §2.6 and `implementation-plan.md` Stage 6.2,
-   an `xraft-client` crate provides `propose(data)` and `read(key)` APIs with automatic leader
-   discovery. Feature 11 tests both client-facing interactions and inter-node routing.
+4. **Internal peer/admin client (`xraft-client`)** — per `tech-spec.md` §2.6, `xraft-client`
+   is an **internal infrastructure crate** used by `xraft-server` for inter-node communication
+   and admin tooling.  It is **not** an external consumer SDK — no external client SDK is in
+   scope for v1.  Feature 11 tests inter-node routing, leader discovery via Fetch, and
+   internal admin operations only.
 
-5. **Static membership with stretch dynamic membership** — per `tech-spec.md` §2.7,
-   the voter set is fixed at bootstrap for v1. Dynamic membership (AddVoter/RemoveVoter)
-   is a stretch goal per `tech-spec.md` §2.7 and `implementation-plan.md` Stage 7.2.
-   Feature 12 covers v1 static-membership behaviour only; stretch-goal scenarios
-   will be added if/when dynamic membership is implemented.
+5. **Dynamic membership fully deferred** — per `tech-spec.md` §2.7/§3 and `architecture.md` §5.5,
+   `AddVoter`/`RemoveVoter` RPCs are **not** a stretch goal within this story.  They are
+   deferred to a future story entirely.  Feature 12 covers v1 static-membership behaviour only.
 
 6. **Observability endpoints** — `/health` (liveness/readiness) and `/metrics` (Prometheus format)
    per `tech-spec.md` §2.4. Feature 15 metric names are aligned with `architecture.md` §7.
