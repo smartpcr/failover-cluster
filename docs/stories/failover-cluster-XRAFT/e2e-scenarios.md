@@ -39,7 +39,7 @@ Feature: Leader election under normal conditions
     When a majority (2 of 3) of nodes grant their votes
     Then the candidate transitions to "Leader" state
     And the other nodes record the leader id for epoch 1
-    And the leader begins sending periodic heartbeat AppendEntries RPCs
+    And the leader begins sending periodic heartbeats
 
   Scenario: Follower receives heartbeat before its election timeout
     Given node-1 is the leader in epoch 1
@@ -68,10 +68,10 @@ Feature: Leader election under adverse conditions
 
   Scenario: Split vote causes election retry
     When node-1 and node-3 both time out and become candidates in epoch 3
-    And node-1 receives votes from {node-0, node-1}
-    And node-3 receives votes from {node-3, node-4}
-    And node-2 has already voted for node-1
-    Then neither candidate reaches quorum (3 of 5)
+    And node-1 receives votes from {node-0, node-1} (2 of 5)
+    And node-3 receives votes from {node-3, node-4} (2 of 5)
+    And node-2 is temporarily unreachable and does not respond to either candidate
+    Then neither candidate reaches quorum (need 3 of 5)
     And both candidates' election timeouts expire (with randomised jitter)
     And a new election begins in epoch 4
     And exactly one leader is elected in epoch 4
@@ -140,41 +140,44 @@ Feature: Pre-Vote prevents disruptive elections
 
 ```gherkin
 Feature: Log replication under normal conditions
-  The leader must replicate client commands to a majority of followers
-  before committing, ensuring linearisable reads and writes.
+  Following KRaft's pull-based model, followers initiate Fetch RPCs
+  to the leader to retrieve new log entries. The leader commits
+  once a majority of voters have fetched and acknowledged entries.
 
   Background:
     Given a cluster of 3 nodes [node-0, node-1, node-2]
     And node-0 is the leader in epoch 1
 
-  Scenario: Client write is replicated and committed
+  Scenario: Client write is replicated via follower Fetch and committed
     When a client sends command "SET x = 42" to node-0
     Then node-0 appends the entry at the next log index with epoch 1
-    And node-0 sends AppendEntries RPCs to node-1 and node-2
-    When node-1 acknowledges the entry
-    Then the entry is committed (majority = 2 of 3 including leader)
-    And node-0 applies the entry to its state machine
+    When node-1 sends a Fetch RPC with its current fetch_offset
+    Then node-0 responds with the new entry and the current high watermark
+    When node-2 also fetches and acknowledges the entry
+    Then node-0 advances the high watermark (majority = 2 of 3 including leader)
+    And on the next Fetch response, followers learn the new high watermark
+    And followers apply the committed entry to their state machines
     And node-0 returns success to the client
-    And node-2 eventually applies the committed entry to its state machine
 
-  Scenario: Multiple entries are batched in a single AppendEntries
+  Scenario: Multiple entries are batched in a single Fetch response
     When the client sends 5 commands in rapid succession
-    Then node-0 batches them into a single AppendEntries RPC
-    And followers append all 5 entries atomically
-    And all 5 entries are committed once a majority acknowledges
+    And node-0 appends all 5 entries to its local log
+    When node-1 sends a Fetch RPC
+    Then node-0 returns all 5 entries in a single Fetch response
+    And node-1 appends all 5 entries atomically
+    And all 5 entries are committed once a majority has fetched them
 
-  Scenario: Follower consistency check passes
+  Scenario: Follower consistency check passes during Fetch
     Given node-1's log matches node-0's log up to index 10
-    When node-0 sends AppendEntries with prevLogIndex=10 and prevLogTerm=1
-    And the new entry is at index 11
-    Then node-1 verifies its log entry at index 10 has term 1
+    When node-1 sends a Fetch RPC with fetch_offset=11 and last_fetched_epoch=1
+    Then node-0 verifies the consistency of node-1's log position
+    And node-0 responds with the entry at index 11
     And node-1 appends the new entry at index 11
-    And node-1 returns success
 
-  Scenario: Heartbeats carry commit index
+  Scenario: Heartbeats carry high watermark
     Given entries up to index 15 are committed
-    When node-0 sends a heartbeat (empty AppendEntries) to node-1
-    Then the heartbeat includes leaderCommitIndex = 15
+    When node-0 sends a heartbeat to node-1
+    Then the heartbeat includes the current high watermark = 15
     And node-1 advances its commit index to min(15, last log index)
     And node-1 applies any newly committed entries to its state machine
 ```
@@ -184,36 +187,38 @@ Feature: Log replication under normal conditions
 ## Feature 5: Log Replication — Conflict Resolution
 
 ```gherkin
-Feature: Log conflict detection and resolution
-  When a follower's log diverges from the leader, the leader must
-  repair the follower's log to re-establish the Log Matching invariant.
+Feature: Log conflict detection and resolution via Fetch
+  When a follower's log diverges from the leader, the Fetch response
+  signals the divergence and the follower truncates and re-fetches
+  to re-establish the Log Matching invariant.
 
   Background:
     Given a cluster of 3 nodes [node-0, node-1, node-2]
     And node-0 is the leader in epoch 3
 
-  Scenario: Follower with conflicting entry truncates and re-appends
+  Scenario: Follower with conflicting entry truncates and re-fetches
     Given node-1 has entry (index=8, epoch=2, cmd="SET y=1")
     And node-0 has entry (index=8, epoch=3, cmd="SET y=2")
-    When node-0 sends AppendEntries with prevLogIndex=7, prevLogTerm=2, entry at index 8
-    And node-1's entry at index 7 matches prevLogTerm=2
-    Then node-1 deletes its entry at index 8 (conflicting epoch)
-    And node-1 appends the leader's entry (index=8, epoch=3, cmd="SET y=2")
+    When node-1 sends a Fetch RPC with fetch_offset=9 and last_fetched_epoch=2
+    Then node-0 detects the divergence at offset 8
+    And node-0 responds with a DivergingEpoch field indicating truncation to index 7
+    And node-1 truncates its log from index 8 onwards
+    And node-1 re-fetches from index 8 and receives the leader's entry
 
-  Scenario: Follower with missing entries receives backfill
+  Scenario: Follower with missing entries receives backfill via Fetch
     Given node-2 has entries only up to index 5
     And node-0 has entries up to index 10
-    When node-0 sends AppendEntries with prevLogIndex=5
-    And node-2 confirms its log matches at index 5
-    Then node-0 sends entries 6 through 10 in subsequent RPCs
-    And node-2's log converges with the leader's log
+    When node-2 sends a Fetch RPC with fetch_offset=6
+    Then node-0 responds with entries 6 through 10
+    And node-2 appends all entries and its log converges with the leader's log
 
-  Scenario: Follower rejects AppendEntries with mismatched prevLogTerm
+  Scenario: Fetch detects epoch mismatch and triggers truncation
     Given node-1 has entry (index=7, epoch=1)
-    And node-0 sends AppendEntries with prevLogIndex=7, prevLogTerm=2
-    Then node-1 rejects the AppendEntries
-    And node-0 decrements nextIndex for node-1
-    And node-0 retries with a lower prevLogIndex until consistency is found
+    And node-0's log at index 7 has epoch=2
+    When node-1 sends a Fetch RPC with fetch_offset=8 and last_fetched_epoch=1
+    Then node-0 responds with DivergingEpoch indicating the divergence point
+    And node-1 truncates its log back to the point of agreement
+    And node-1 re-fetches from the corrected offset
 ```
 
 ---
@@ -328,17 +333,18 @@ Feature: Log compaction via periodic snapshotting
     And the snapshot includes the current voter set
     And node-0 discards log entries up to index 8,000
 
-  Scenario: Leader sends snapshot to slow follower
+  Scenario: Leader sends snapshot to slow follower via FetchSnapshot
     Given node-0 has discarded log entries before index 8,000 (snapshot taken)
-    And node-2's nextIndex is 5,000 (it fell behind)
-    When node-0 attempts to send AppendEntries for index 5,000
-    Then node-0 detects the entry has been discarded
-    And node-0 sends an InstallSnapshot RPC to node-2
+    And node-2's fetch_offset is 5,000 (it fell behind)
+    When node-2 sends a Fetch RPC with fetch_offset=5,000
+    Then node-0 detects the requested offset has been compacted
+    And node-0 responds indicating that a snapshot is required
+    And node-2 initiates a FetchSnapshot RPC to node-0
     And the snapshot is transferred in chunks
     When node-2 finishes receiving the snapshot
     Then node-2 loads the snapshot state machine
     And node-2 sets its log start offset to 8,001
-    And subsequent Fetch/AppendEntries RPCs resume from index 8,001
+    And subsequent Fetch RPCs resume from index 8,001
 
   Scenario: Snapshot consistency across nodes
     Given all 3 nodes independently take snapshots
@@ -422,95 +428,83 @@ Feature: Check Quorum prevents split-brain
 
 ---
 
-## Feature 11: Client Interaction and Request Routing
+## Feature 11: Inter-Node Request Routing
 
 ```gherkin
-Feature: Client request handling and routing
-  Clients must be able to discover the leader and have their
-  requests handled idempotently.
+Feature: Inter-node request routing and leader discovery
+  Nodes must be able to discover the current leader and route
+  internal requests appropriately. Per tech-spec §3, only inter-node
+  RPCs are in scope; no external client SDK is provided.
 
   Background:
     Given a cluster of 3 nodes
     And node-0 is the leader
 
-  Scenario: Client sends write to the leader
-    When a client sends "SET key=value" to node-0
-    Then node-0 accepts the request and begins replication
-    And responds with success after the entry is committed
+  Scenario: Follower discovers leader via Fetch response
+    When node-1 sends a Fetch RPC to node-0
+    Then the Fetch response includes the current leader_id (node-0) and epoch
+    And node-1 caches the leader identity for subsequent operations
 
-  Scenario: Client sends write to a follower
-    When a client sends "SET key=value" to node-1 (a follower)
-    Then node-1 rejects the request
-    And node-1 returns a redirect response containing the leader id (node-0)
-    And the client retries the request against node-0
+  Scenario: Node sends Fetch to a non-leader
+    When node-2 sends a Fetch RPC to node-1 (a follower)
+    Then node-1 responds with NOT_LEADER and includes leader_hint=node-0
+    And node-2 redirects its Fetch RPCs to node-0
 
-  Scenario: Idempotent client requests with serial numbers
-    Given the client sends "SET key=value" with serial_number=42
-    And the leader commits the entry
-    When the client retries "SET key=value" with serial_number=42
-      (e.g., due to network timeout before receiving the response)
-    Then the leader detects the duplicate serial number
-    And the leader returns the cached response without re-applying the command
+  Scenario: Node detects leader change via epoch bump
+    Given node-0 was the leader in epoch 5
+    And node-1 becomes the new leader in epoch 6
+    When node-2 sends a Fetch RPC to node-0
+    Then node-0 responds indicating it is no longer the leader
+    And node-2 discovers node-1 as the new leader in epoch 6
+    And node-2 redirects its Fetch RPCs to node-1
 
-  Scenario: Client discovers new leader after election
-    Given node-0 was the leader and has stepped down
-    And node-2 is the new leader in epoch 6
-    When the client sends a request to node-0
-    Then node-0 responds with leader_hint=node-2 and epoch=6
-    And the client updates its leader reference to node-2
+  Scenario: All nodes converge on leader identity after election
+    When a new election completes and node-2 wins epoch 7
+    Then within one Fetch cycle, all followers learn node-2 is the leader
+    And all nodes' internal leader tracking agrees on node-2 for epoch 7
 ```
 
 ---
 
-## Feature 12: Dynamic Cluster Membership
+## Feature 12: Static Cluster Membership and Observer Join
 
 ```gherkin
-Feature: Dynamic quorum changes (add/remove voter)
-  Voter set changes are applied one at a time through the replicated log
-  to prevent disjoint majorities.
+Feature: Static voter membership with observer join
+  Per tech-spec §3, dynamic quorum changes are out of scope for v1.
+  The voter set is fixed at cluster bootstrap. Observers (non-voting
+  nodes) may join to replicate the log for read scaling or standby.
 
   Background:
-    Given a cluster of 3 voters [node-0, node-1, node-2]
+    Given a cluster of 3 voters [node-0, node-1, node-2] configured at startup
     And node-0 is the leader in epoch 3
 
-  Scenario: Add a new voter to the cluster
-    Given node-3 joins as a non-voting observer
-    And node-3 catches up with the leader's log (lag < threshold)
-    When the operator sends AddVoter(node-3) to the leader
-    Then node-0 appends a VotersRecord to the metadata log:
-      voters = [node-0, node-1, node-2, node-3]
-    And the VotersRecord is replicated to a majority of the OLD config (2 of 3)
-    And once committed, node-3 becomes a full voting member
-    And the quorum size increases to 3 of 4
+  Scenario: Voter set is fixed at bootstrap
+    Given the cluster configuration file lists voters = [node-0, node-1, node-2]
+    When the cluster starts
+    Then all 3 nodes load the static voter configuration
+    And quorum size is fixed at 2 of 3
+    And no AddVoter or RemoveVoter operations are supported
 
-  Scenario: Remove a voter from the cluster
-    Given a cluster of 4 voters [node-0, node-1, node-2, node-3]
-    When the operator sends RemoveVoter(node-3) to the leader
-    Then node-0 appends a VotersRecord with voters = [node-0, node-1, node-2]
-    And the record is committed by the current (4-node) quorum
-    And after commit, node-3 stops participating in elections
-    And the quorum size returns to 2 of 3
+  Scenario: Observer joins and replicates the log
+    Given observer-0 is configured as a non-voting observer
+    When observer-0 starts and connects to the cluster
+    Then observer-0 sends Fetch RPCs to the leader (node-0)
+    And observer-0 receives log entries and the current high watermark
+    But observer-0 does NOT count toward quorum for commits
+    And observer-0 does NOT participate in elections
 
-  Scenario: Cannot perform concurrent membership changes
-    Given an AddVoter(node-3) is in-flight (not yet committed)
-    When the operator sends AddVoter(node-4)
-    Then the leader rejects the second change with an error
-    And responds "membership change already in progress"
+  Scenario: Observer catches up from snapshot when far behind
+    Given the leader has taken a snapshot at index 8,000
+    And observer-0 joins with an empty log
+    When observer-0 sends a Fetch RPC with fetch_offset=0
+    Then the leader indicates a snapshot is required
+    And observer-0 initiates a FetchSnapshot RPC
+    And observer-0 loads the snapshot and resumes Fetch from index 8,001
 
-  Scenario: Leader being removed continues until commit
-    Given a RemoveVoter(node-0) request is submitted
-    And node-0 is the current leader
-    Then node-0 appends the VotersRecord removing itself
-    And node-0 continues serving as leader until the record is committed
-    And after commit, node-0 steps down
-    And the remaining voters elect a new leader
-
-  Scenario: New voter joins with empty log
-    Given node-4 joins the cluster with an empty log
-    Then node-4 starts as a non-voting observer
-    And node-4 fetches the latest snapshot from the leader (if available)
-    And node-4 replays log entries after the snapshot
-    And node-4 remains non-voting until promoted via AddVoter
+  Scenario: Cluster rejects operations that modify voter set
+    When an operator attempts to issue an AddVoter or RemoveVoter command
+    Then the leader rejects the request with an UNSUPPORTED error
+    And the voter set remains unchanged
 ```
 
 ---
@@ -577,10 +571,11 @@ Feature: Timing-sensitive behaviour and performance boundaries
     And the commit latency is recorded as a metric
     And p99 commit latency is below 50 ms for a 3-node local cluster
 
-  Scenario: Leader fsync runs concurrently with replication
+  Scenario: Leader fsync runs concurrently with Fetch serving
     When the leader appends an entry to its local log
-    Then the leader initiates fsync and sends AppendEntries RPCs concurrently
-    And commits as soon as a majority acknowledges (including itself after fsync)
+    Then the leader initiates fsync for its own durability
+    And serves the new entry to followers via their next Fetch RPC concurrently
+    And commits as soon as a majority has acknowledged (including itself after fsync)
 ```
 
 ---
@@ -590,39 +585,39 @@ Feature: Timing-sensitive behaviour and performance boundaries
 ```gherkin
 Feature: Cluster metrics and health observability
   Operators must be able to monitor cluster health, current leadership,
-  replication lag, and election history.
+  replication lag, and election history via the `/health` and `/metrics`
+  endpoints defined in tech-spec §2.4.
 
   Background:
     Given a running cluster of 3 nodes
 
-  Scenario: Query current leader and epoch
-    When an operator queries the cluster metadata endpoint
-    Then the response includes the current leader node id
+  Scenario: Health endpoint reports node status
+    When an operator queries the `/health` endpoint on any node
+    Then the response includes the node's current role (Leader / Follower / Observer)
     And the current epoch number
-    And the high watermark offset
+    And the current leader node id (if known)
+    And liveness and readiness status for orchestrator probes
 
-  Scenario: Monitor replication lag per follower
-    When an operator queries per-node metrics
-    Then each follower's lag (leader log end − follower log end) is reported
-    And lag is expressed in number of entries and optionally in bytes
-    And an alert fires if lag exceeds a configured threshold
+  Scenario: Metrics endpoint exposes replication lag
+    When an operator queries the `/metrics` endpoint on the leader
+    Then the response includes per-follower replication lag (leader_log_end − follower_fetch_offset)
+    And lag is expressed in number of entries
+    And a `xraft_replication_lag_entries` gauge is exposed per follower
 
   Scenario: Election event is logged and metered
     When a leader election occurs
-    Then an event is emitted with: new_leader_id, epoch, election_latency_ms
-    And the "elections_total" counter is incremented
-    And the "election_latency_avg" gauge is updated
+    Then an event is emitted via `tracing` with: new_leader_id, epoch, election_latency_ms
+    And the `xraft_elections_total` counter is incremented
+    And the `xraft_election_latency_seconds` histogram is updated
 
-  Scenario: Describe quorum state
-    When an operator queries the quorum describe endpoint
-    Then the response includes each voter's:
-      | field                 | description                          |
-      | node_id               | Unique node identifier               |
-      | log_end_offset        | Last offset in the node's log        |
-      | lag                   | Entries behind the leader            |
-      | last_fetch_timestamp  | Time since last successful fetch     |
-      | last_caught_up_time   | Time since fully caught up           |
-      | status                | Leader / Follower / Observer         |
+  Scenario: Metrics endpoint exposes quorum state
+    When an operator queries the `/metrics` endpoint on the leader
+    Then the response includes gauges for each voter:
+      | metric                           | description                          |
+      | xraft_node_log_end_offset        | Last offset in the node's log        |
+      | xraft_node_replication_lag       | Entries behind the leader            |
+      | xraft_node_last_fetch_seconds    | Seconds since last successful fetch  |
+      | xraft_node_role                  | Leader=0 / Follower=1 / Observer=2   |
 ```
 
 ---
@@ -662,20 +657,24 @@ Feature: Graceful node shutdown with optional leadership transfer
 
 ---
 
-## Open Questions for QA and Architecture Alignment
+## Alignment Notes
 
-1. **Pull vs Push replication:** The story references KRaft's pull-based (Fetch)
-   model. Scenarios cover both push (AppendEntries) and pull (Fetch) styles.
-   The tech-spec should clarify which model the Rust implementation will use —
-   some scenarios may be removed once decided.
+The following design decisions are resolved in sibling docs and reflected in these scenarios:
 
-2. **Observer role:** KRaft distinguishes voters from observers (brokers).
-   Should the Rust implementation include an observer role, or only voters?
+1. **Pull-based Fetch replication** — confirmed in `tech-spec.md` §2.2 and `architecture.md` §2.1.
+   All replication scenarios use follower-initiated Fetch RPCs (no push-based AppendEntries).
 
-3. **Snapshot transfer mechanism:** KRaft uses FetchSnapshot with chunked
-   transfer. The implementation-plan should specify the chunk size and
-   transport (TCP stream vs RPC-per-chunk).
+2. **Observer role** — in scope per `tech-spec.md` §2.2. Observers replicate via Fetch but
+   do not vote or count toward quorum.
 
-4. **Metrics exposure format:** Scenarios reference metrics endpoints.
-   Architecture should specify whether Prometheus, OpenTelemetry, or a
-   custom format is used.
+3. **Static voter membership for v1** — per `tech-spec.md` §3, dynamic quorum changes
+   (AddVoter/RemoveVoter) are out of scope. Feature 12 reflects static membership only.
+
+4. **No external client SDK** — per `tech-spec.md` §3, only inter-node RPCs are in scope.
+   Feature 11 tests inter-node routing and leader discovery, not client-facing APIs.
+
+5. **Observability endpoints** — `/health` (liveness/readiness) and `/metrics` (Prometheus format)
+   per `tech-spec.md` §2.4. Feature 15 scenarios are anchored to these endpoints.
+
+6. **Snapshot transfer** — uses `FetchSnapshot` RPC per `tech-spec.md` §2.2. Chunk size
+   and transport details are implementation-level decisions deferred to `implementation-plan.md`.
