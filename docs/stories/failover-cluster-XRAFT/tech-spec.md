@@ -101,16 +101,22 @@ The following capabilities are in scope for the XRAFT story:
 | **Integration tests** | Real-network 3-node and 5-node cluster scenarios |
 | **Linearisability checking** | Jepsen-style validation via `stateright` or equivalent model checker |
 
-### 2.6  Peer & Admin Client (`xraft-client`)
+### 2.6  Client Library (`xraft-client`)
 
 | Capability | Detail |
 |---|---|
-| **Peer RPC client** | `PeerClient` wraps a `tonic` gRPC channel to a specific peer for `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` RPCs with connection lifecycle management |
+| **External consumer API** | `XRaftClient` provides `propose(data) -> Result<ProposalId>` and `read(key) -> Result<Vec<u8>>` for external consumers to interact with the XRAFT cluster, per `architecture.md` §2.5 and `implementation-plan.md` Stage 6.2 |
 | **Leader discovery** | Tracks last-known leader via hints in `FetchResponse` / `VoteResponse`; transparently retries against the hinted leader on `NOT_LEADER` errors |
+| **Peer RPC client** | `PeerClient` wraps a `tonic` gRPC channel to a specific peer for `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` RPCs with connection lifecycle management; used internally by `xraft-server` for inter-node communication |
 | **Connection pool** | `ConnectionPool` maintains lazy-initialised `PeerClient` instances keyed by `NodeId` |
 | **Admin client** | `AdminClient` connects to a node's admin HTTP endpoint for operational queries (leader status, metrics, trigger snapshot) |
 
-Per `architecture.md` §2.5, `xraft-client` is an **internal infrastructure crate** used by `xraft-server` for inter-node communication and by admin tooling for cluster-management commands.  It is **not** an external consumer SDK — no external client SDK is in scope for v1 (see §3 and `e2e-scenarios.md` Feature 11).
+Per `architecture.md` §2.5, `xraft-client` serves a dual role: it is both an
+**external consumer library** (providing `propose`/`read` for callers outside the
+cluster) and an **internal infrastructure crate** (used by `xraft-server` for
+inter-node peer RPCs and admin tooling).  `e2e-scenarios.md` Feature 11 tests
+the inter-node routing and leader discovery behaviour of the internal peer
+client path.
 
 ### 2.7  Administrative Operations
 
@@ -118,12 +124,14 @@ Per `architecture.md` §2.5, `xraft-client` is an **internal infrastructure crat
 |---|---|
 | **AdminApi** | HTTP API for cluster status and triggering snapshots |
 
-> **Dynamic membership (`AddVoter`/`RemoveVoter`) is out of scope for v1.**
-> Per `architecture.md` §5.5 and `e2e-scenarios.md` Feature 12, the voter set
-> is fixed at cluster bootstrap.  Dynamic quorum changes are not a stretch goal
-> for this story — they are explicitly deferred to a future story.  The
-> `AdminApi` supports status queries and snapshot triggers only; no membership
-> mutation endpoints are provided in v1.
+> **Dynamic membership (`AddVoter`/`RemoveVoter`) is a stretch goal.**
+> Per `architecture.md` §5.5, dynamic quorum changes are a stretch goal for
+> this story.  `implementation-plan.md` Stage 7.2 includes detailed
+> implementation steps for dynamic cluster membership.  The core v1 deliverable
+> uses static membership (voter set fixed at bootstrap, per `e2e-scenarios.md`
+> Feature 12), but dynamic membership may be delivered if schedule permits.
+> The `AdminApi` in v1 supports status queries and snapshot triggers;
+> membership mutation endpoints are part of the stretch goal.
 
 | **Optional TLS** | TLS configuration (`tls.cert_path` / `tls.key_path`) is supported as an optional transport setting per `architecture.md` §2.3.  Not mandatory for v1 functional correctness, but the configuration surface exists. |
 
@@ -135,8 +143,7 @@ Per `architecture.md` §2.5, `xraft-client` is an **internal infrastructure crat
 |---|---|
 | **Application-level state machine** | XRAFT provides the replicated log; what the consumer does with committed entries is outside this story |
 | **Multi-Raft / sharding** | Single Raft group only; partitioning across multiple groups is a future story |
-| **Dynamic quorum changes** | `AddVoter`/`RemoveVoter` RPCs are **out of scope for v1**, per `architecture.md` §5.5 and `e2e-scenarios.md` Feature 12.  The voter set is fixed at bootstrap.  Dynamic membership is deferred to a future story, not a stretch goal within XRAFT. |
-| **External client SDK** | `xraft-client` is an internal peer/admin client (§2.6), not an external consumer SDK.  No public client API (`propose`/`read` for external callers) is provided in v1, per `e2e-scenarios.md` Feature 11. |
+| **Dynamic quorum changes** | `AddVoter`/`RemoveVoter` RPCs are a **stretch goal** (per `architecture.md` §5.5 and `implementation-plan.md` Stage 7.2).  The core v1 deliverable uses static membership (voter set fixed at bootstrap).  Dynamic membership may be delivered if schedule permits but is not part of the base commitment. |
 | **Kafka wire protocol compatibility** | We borrow KRaft *design*, not its binary protocol |
 | **Disk-based log storage engine** | v1 uses a simple file-per-segment approach; a production WAL engine (e.g., `sled`, `rocksdb`) is a future optimisation |
 | **Benchmarking / performance tuning** | Functional correctness first; optimisation follows |
@@ -164,8 +171,9 @@ touch them:
 
 ### 5.1  Language & Toolchain
 
-* **Rust stable** (≥ 1.78).  No nightly-only features.
-* **Edition 2021** minimum.
+* **Rust stable** (≥ 1.85).  No nightly-only features.
+* **Edition 2024**, per `implementation-plan.md` Stage 1.1 (`rust-toolchain.toml`
+  pinning stable Rust edition 2024).  Edition 2024 requires Rust ≥ 1.85.
 * `#![forbid(unsafe_code)]` in the consensus crate; `unsafe` allowed only in
   the storage layer with documented safety invariants.
 * Must compile on Linux x86_64 and macOS aarch64.  Windows is best-effort.
@@ -215,11 +223,16 @@ defined in `architecture.md` §2:
 | Crate | Responsibility |
 |---|---|
 | `xraft-core` | Protocol state machine, elections, log abstraction — no I/O |
-| `xraft-storage` | Durable segmented log, snapshots, hard-state persistence |
-| `xraft-transport` | gRPC service definitions and transport (`tonic` + `prost`) |
-| `xraft-server` | Binary that wires core + storage + transport; event loop, config, metrics, `AdminApi` |
-| `xraft-client` | Internal peer RPC client and admin client (see §2.6 — not an external SDK) |
-| `xraft-test` | Deterministic simulation harness and integration test utilities |
+| `xraft-log` | Durable segmented log, snapshots, hard-state persistence |
+| `xraft-rpc` | gRPC service definitions and transport (`tonic` + `prost`) |
+| `xraft-server` | Binary that wires core + log + rpc; event loop, config, metrics, `AdminApi` |
+| `xraft-client` | External client library (`propose`/`read`) and internal peer RPC client (see §2.6) |
+| `xraft-testkit` | Deterministic simulation harness and integration test utilities |
+
+> **Cross-doc note:** `implementation-plan.md` Stage 1.1 uses different names
+> (`xraft-storage`, `xraft-transport`, `xraft-test`) for the same crates.  The
+> canonical names above are aligned with `architecture.md` §2.
+> `implementation-plan.md` should be updated in a future iteration to match.
 
 `xraft-core` must be deterministic and I/O-free so it can be driven by both
 real networking and deterministic simulation.
@@ -253,7 +266,7 @@ real networking and deterministic simulation.
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| `fsync` latency dominates commit path | **Medium** — high commit latency | Batch log appends (KRaft's `BatchAccumulator` pattern); concurrent `fsync` with RPC transmission |
+| `fsync` latency dominates commit path | **Medium** — high commit latency | Batch log appends (KRaft's `BatchAccumulator` pattern) to amortise `fsync` cost across multiple entries; pipeline the *next* batch's accumulation while the current batch's `fsync` is in flight.  Note: `fsync` always completes before the corresponding RPC response is sent (per §5.3); the parallelism is between `fsync` and receiving/preparing the next batch, never between `fsync` and responding. |
 | Pull-based fetch adds one extra round-trip vs. push | **Low** — slightly higher replication latency | Acceptable trade-off for simpler leader logic; tuneable fetch interval |
 | Single-threaded event loop becomes bottleneck under high throughput | **Medium** | Batch processing within the loop; offload serialisation to I/O tasks |
 
@@ -270,7 +283,7 @@ real networking and deterministic simulation.
 | Risk | Impact | Mitigation |
 |---|---|---|
 | No TLS in v1 leaves cluster traffic unencrypted | **Medium** — not production-safe without network-level isolation | Document as known limitation; plan TLS story |
-| Static membership means replacing a failed node requires cluster restart | **Medium** — availability impact during maintenance | Document operational procedure; dynamic membership is deferred to a future story |
+| Static membership means replacing a failed node requires cluster restart | **Medium** — availability impact during maintenance | Document operational procedure; dynamic membership is a stretch goal (§2.7) |
 
 ---
 
@@ -292,29 +305,37 @@ this spec to avoid cross-document dependency on files that may not yet exist:
    the leader.  This is a firm design decision, not pending.  The mapping from
    textbook Raft's push-based `AppendEntries` to KRaft's pull-based `Fetch` is
    documented in §2.1 and §2.2.
-4. **Crate naming → aligned with `architecture.md`.**  `xraft-storage` (not
-   `xraft-log`), `xraft-transport` (not `xraft-rpc`), `xraft-test` (not
-   `xraft-testkit`), plus `xraft-client`.  See §5.6.
+4. **Crate naming → aligned with `architecture.md`.**  `xraft-log` (not
+   `xraft-storage`), `xraft-rpc` (not `xraft-transport`), `xraft-testkit` (not
+   `xraft-test`), plus `xraft-client`.  See §5.6.  Note:
+   `implementation-plan.md` Stage 1.1 currently uses different names —
+   reconciliation is needed in a future iteration of that document.
 5. **Snapshot RPC naming → `FetchSnapshot`.**  `architecture.md` defines
    `FetchSnapshot` as the canonical gRPC method; `implementation-plan.md` uses
    `InstallSnapshot` in some places.  Both refer to the same chunked snapshot
    transfer operation.  The proto service should use `FetchSnapshot`.
-6. **Dynamic membership scope → out of scope for v1.**  `AddVoter`/`RemoveVoter`
-   RPCs are **not** a stretch goal within this story.  Per `architecture.md` §5.5
-   and `e2e-scenarios.md` Feature 12, the voter set is fixed at bootstrap and
-   dynamic quorum changes are deferred to a future story entirely.  See §2.7 and §3.
+6. **Dynamic membership scope → stretch goal.**  `AddVoter`/`RemoveVoter`
+   RPCs are a **stretch goal** within this story, per `architecture.md` §5.5.
+   `implementation-plan.md` Stage 7.2 includes detailed implementation steps.
+   The core v1 commitment is static membership (voter set fixed at bootstrap,
+   per `e2e-scenarios.md` Feature 12); dynamic membership is delivered if
+   schedule permits.  See §2.7 and §3.
 7. **TLS → optional configuration surface.**  TLS is not mandatory for v1
    functional correctness but the configuration knobs exist per `architecture.md`.
    It is not "out of scope" but is not a gating requirement.
 
-> **Cross-doc alignment (iteration 4):** This spec now uses the same crate
-> names (`xraft-storage`, `xraft-transport`, `xraft-test`), RPC names, scope
-> boundaries, and on-disk encoding format as `architecture.md` and
-> `implementation-plan.md`.  The `xraft-client` crate is correctly described as
-> an internal peer/admin client, not an external consumer SDK.  Dynamic
-> membership (`AddVoter`/`RemoveVoter`) is fully out of scope for v1.  The
-> "heartbeat" terminology used in `e2e-scenarios.md` is explicitly mapped to
-> the pull-based Fetch model in §2.1.
+> **Cross-doc alignment (iteration 5):** This spec now uses the same crate
+> names as `architecture.md` §2 (`xraft-log`, `xraft-rpc`, `xraft-testkit`),
+> and notes that `implementation-plan.md` uses different names that should be
+> reconciled.  The `xraft-client` crate is correctly described as both an
+> external consumer library (`propose`/`read` per `architecture.md` §2.5) and
+> an internal peer/admin client.  Dynamic membership (`AddVoter`/`RemoveVoter`)
+> is treated as a stretch goal per `architecture.md` §5.5, consistent with
+> `implementation-plan.md` Stage 7.2.  The Rust toolchain is pinned to edition
+> 2024 (stable ≥ 1.85) per `implementation-plan.md` Stage 1.1.  The "heartbeat"
+> terminology used in `e2e-scenarios.md` is explicitly mapped to the pull-based
+> Fetch model in §2.1.  The `fsync` mitigation in §6.2 is narrowed to
+> batch-level pipelining, never sending RPC responses before `fsync` (§5.3).
 
 ---
 
@@ -347,4 +368,4 @@ this spec to avoid cross-document dependency on files that may not yet exist:
 ---
 
 *Document: `docs/stories/failover-cluster-XRAFT/tech-spec.md`*
-*Story: failover-cluster:XRAFT · Status: Draft · Iteration 4*
+*Story: failover-cluster:XRAFT · Status: Draft · Iteration 5*
