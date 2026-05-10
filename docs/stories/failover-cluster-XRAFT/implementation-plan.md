@@ -239,17 +239,17 @@ storyId: "failover-cluster:XRAFT"
 ## Stage 5.1: State Machine Callback Trait
 
 ### Implementation Steps
-- [ ] Define `StateMachineCallback` trait in `xraft-core/src/state_machine.rs` with methods: `apply(index: LogIndex, entry: &[u8]) -> Result<()>`, `snapshot() -> Result<Vec<u8>>`, `restore(data: &[u8]) -> Result<()>` — this is the extension point for consumers; XRAFT provides the replicated log, not application logic
-- [ ] Implement `NoOpStateMachine` as a minimal default in `xraft-core/src/state_machine.rs` that logs applied entries via `tracing` but discards the data — used for testing and as a baseline
-- [ ] Wire `StateMachineCallback` into the `Action::ApplyToStateMachine` dispatch path in the event loop, so committed entries are forwarded to the callback
+- [ ] Define `StateMachine` trait in `xraft-core/src/state_machine.rs` with methods: `apply(&mut self, index: LogIndex, command: &[u8]) -> Result<Vec<u8>>`, `snapshot(&self) -> Result<Vec<u8>>`, `restore(&mut self, snapshot: &[u8]) -> Result<()>` — trait name and signatures follow `architecture.md` §4.1 which is authoritative for trait definitions; `apply` returns `Result<Vec<u8>>` (the serialized result of the applied command) rather than `Result<()>` to support read-after-write patterns where library consumers need the result of a proposed command; this is the extension point for consumers — XRAFT provides the replicated log, not application logic
+- [ ] Implement `NoOpStateMachine` as a minimal default in `xraft-core/src/state_machine.rs` that logs applied entries via `tracing` and returns an empty `Vec<u8>` — used for testing and as a baseline
+- [ ] Wire `StateMachine` into the `Action::ApplyToStateMachine` dispatch path in the event loop, so committed entries are forwarded to the trait implementation
 - [ ] Implement `snapshot()` and `restore()` integration: the event loop calls `snapshot()` when a snapshot is triggered and `restore()` when a snapshot is installed from a leader
 
 ### Dependencies
 - _none — start stage_
 
 ### Test Scenarios
-- [ ] Scenario: noop-apply — Given a `NoOpStateMachine`, When `apply()` is called with 10 entries, Then no error is returned and the callback completes without side effects
-- [ ] Scenario: snapshot-restore-roundtrip — Given a `StateMachineCallback` implementation, When `snapshot()` is called and the result passed to `restore()` on a fresh instance, Then the restored state is equivalent to the original
+- [ ] Scenario: noop-apply — Given a `NoOpStateMachine`, When `apply()` is called with 10 entries, Then no error is returned and each call returns an empty `Vec<u8>`
+- [ ] Scenario: snapshot-restore-roundtrip — Given a `StateMachine` implementation, When `snapshot()` is called and the result passed to `restore()` on a fresh instance, Then the restored state is equivalent to the original
 
 ## Stage 5.2: Snapshot Coordination
 
@@ -298,7 +298,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement `PeerClient` in `xraft-client/src/peer.rs` wrapping a `tonic` gRPC channel to a specific peer, providing typed methods for `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` RPCs with connection lifecycle management
 - [ ] Implement `ConnectionPool` in `xraft-client/src/pool.rs` maintaining lazy-initialized `PeerClient` instances keyed by `NodeId`, with automatic reconnection on channel failure
 - [ ] Implement leader discovery: `PeerClient` tracks last-known leader via hints returned in `FetchResponse` and `VoteResponse` messages; followers cache the leader hint for internal routing decisions
-- [ ] Implement `AdminClient` in `xraft-client/src/admin.rs` connecting to a node's HTTP admin endpoint for operational queries (cluster status, trigger snapshot, node health) — `xraft-client` is an **internal** crate providing peer-to-peer RPC and admin/operational queries only; no external consumer SDK (`propose`/`read`) is in scope for v1 (per `tech-spec.md` §2.6, `architecture.md` §2.5, and `e2e-scenarios.md` Alignment Note 4 — all sibling docs agree on this scope; *note:* `e2e-scenarios.md` Feature 11's preamble still references a "dual-role" client per an earlier draft but its actual scenarios test only internal capabilities)
+- [ ] Implement `AdminClient` in `xraft-client/src/admin.rs` connecting to a node's HTTP admin endpoint for operational queries (cluster status, trigger snapshot, node health) — `xraft-client` is an **internal** crate providing peer-to-peer RPC and admin/operational queries only; no external consumer SDK is in scope for v1 (per `tech-spec.md` §2.6 and `e2e-scenarios.md` Feature 11/Alignment Note 4); *cross-doc note:* `architecture.md` §2.4 documents an embedded `propose(command) -> Result<LogIndex>` and `read(key) -> Result<Bytes>` API on `XRaftServer` for **library consumers** who embed `xraft-server` as a dependency — this is distinct from `xraft-client` and is the sanctioned way for application code to submit commands and query committed state; `xraft-client` itself exposes no such API
 - [ ] Add timeout and retry configuration with sensible defaults (connect: 5s, request: 30s, backoff with jitter)
 
 ### Dependencies
@@ -319,7 +319,7 @@ storyId: "failover-cluster:XRAFT"
 
 ### Implementation Steps
 - [ ] Implement Check Quorum mechanism in leader: track last successful communication time per voter peer; the leader counts itself as one voter and steps down if a majority of the full voter set (including self) has not responded within the election timeout — e.g. in a 5-node cluster, the leader needs at least 2 of the 4 other voters to have responded recently (since leader + 2 = 3 = majority of 5)
-- [ ] Implement leader lease optimization: if the leader has heard from a majority within the last election timeout period (via incoming Fetch RPCs), it may skip the extra commit-index confirmation round-trip when answering internal read queries (e.g. admin status queries or `StateMachineCallback`-based lookups); this is a leader-internal optimization and does not expose an external client read API
+- [ ] Implement leader lease optimization: if the leader has heard from a majority within the last election timeout period (via incoming Fetch RPCs), it may skip the extra commit-index confirmation round-trip when answering internal read queries (e.g. admin status queries or `StateMachine`-based lookups); this is a leader-internal optimization and does not expose an external client read API
 - [ ] Add configuration option `enable_check_quorum` (default true) and `enable_leader_lease` (default false) in `ClusterConfig`
 - [ ] Implement leader step-down on receiving a higher term from any RPC, ensuring no stale leader continues to serve
 - [ ] Register remaining canonical metrics from `architecture.md` §7 for leader and replication observability: `xraft_replication_lag` (gauge per replica — entries behind leader for each follower, computed from `leader_log_end - follower_last_fetch_offset`), `xraft_commit_latency_seconds` (histogram — time from proposal to commit, leader only), `xraft_fetch_requests_total` (counter — total Fetch RPCs received by leader / sent by follower) — these extend the MVP subset registered in Stage 6.1 toward the complete `architecture.md` §7 / `e2e-scenarios.md` Feature 15 canonical set
@@ -340,7 +340,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement `Observer` role: non-voting nodes that replicate the log via Fetch RPCs for read scaling or standby purposes, without participating in elections or quorum calculations
 - [ ] Implement observer registration: observers connect to the leader and send Fetch RPCs like voters, but the leader excludes them from high-watermark quorum computation
 - [ ] Persist the `VoterSet` in snapshots so that nodes restoring from a snapshot know the cluster membership without re-reading configuration
-- [ ] Implement `AddVoter`/`RemoveVoter` command rejection: any attempt to issue an `AddVoter` or `RemoveVoter` command must return an `UNSUPPORTED` error with a message indicating dynamic membership is **out of scope for v1** and deferred to a future story entirely — all three authoritative sibling docs agree: `tech-spec.md` §2.7 says "out of scope for v1 and deferred to a future story entirely — it is not a stretch goal within XRAFT", `architecture.md` §2.1/§10 uses the same language, and this plan enforces it via rejection; the voter set remains static for v1 (*cross-doc note:* `e2e-scenarios.md` Feature 12's preamble still labels dynamic membership a "stretch goal within this story" rather than fully deferred — that preamble should be updated to match `tech-spec.md` and `architecture.md`)
+- [ ] Implement `AddVoter`/`RemoveVoter` command rejection: any attempt to issue an `AddVoter` or `RemoveVoter` command must return an `UNSUPPORTED` error with a message indicating dynamic membership is **out of scope for v1** and deferred to a future story entirely — `tech-spec.md` §2.7 says "out of scope for v1 and deferred to a future story entirely — it is not a stretch goal within XRAFT", and `e2e-scenarios.md` Feature 12 adopts the same strict scoping; the voter set remains static for v1 (*cross-doc note:* `architecture.md` §2.1/§10 still uses the older phrase "stretch goal within this story" — `architecture.md` should be updated to match `tech-spec.md`'s stricter "out of scope" language, which `e2e-scenarios.md` Feature 12 and this plan treat as authoritative)
 
 ### Dependencies
 - phase-advanced-raft-features/stage-check-quorum-and-leader-lease
@@ -382,20 +382,20 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement `SimulatedNetwork` in `xraft-test` that simulates message passing with configurable latency, packet loss, and network partitions, plus `SimulatedClock` for deterministic tick advancement
 - [ ] Create real-network integration test infrastructure in `xraft-test` with a `RealCluster` harness that starts 3-node and 5-node clusters using actual gRPC transport (per `tech-spec.md` §2.5 which requires real-network 3-node and 5-node integration tests); each node runs as a separate Tokio task with real `RaftGrpcServer`/`RaftGrpcClient` binding to localhost ports
 - [ ] Write integration test (simulated): cluster elects a leader within 2 election timeout periods after startup
-- [ ] Write integration test (simulated): test harness submits 1000 opaque log entries as proposals through the leader's internal command channel; a test `StateMachineCallback` records applied entries; after commit, the callback's state contains all 1000 entries in order
+- [ ] Write integration test (simulated): test harness submits 1000 opaque log entries as proposals through the leader's internal command channel; a test `StateMachine` implementation records applied entries; after commit, the state machine's state contains all 1000 entries in order
 - [ ] Write integration test (simulated): killing the leader triggers re-election and the new leader has all committed entries
 - [ ] Write integration test (simulated): a partitioned follower rejoins and catches up via log replication or snapshot install
-- [ ] Write integration test (real-network): 3-node cluster over real gRPC transport elects a leader and replicates 100 opaque log entries; a test `StateMachineCallback` on each node records applied entries; all nodes' callbacks converge on the same ordered log
-- [ ] Write integration test (real-network): 5-node cluster over real gRPC transport survives leader crash (process kill) and re-elects; new leader's `StateMachineCallback` contains all previously committed entries
+- [ ] Write integration test (real-network): 3-node cluster over real gRPC transport elects a leader and replicates 100 opaque log entries; a test `StateMachine` on each node records applied entries; all nodes' state machines converge on the same ordered log
+- [ ] Write integration test (real-network): 5-node cluster over real gRPC transport survives leader crash (process kill) and re-elects; new leader's `StateMachine` contains all previously committed entries
 
 ### Dependencies
 - _none — start stage_
 
 ### Test Scenarios
 - [ ] Scenario: three-node-election — Given a 3-node cluster started simultaneously, When election timeouts elapse, Then exactly one leader is elected and all nodes agree on the term
-- [ ] Scenario: data-consistency-after-failover — Given a 3-node cluster with 500 committed opaque log entries applied to a test `StateMachineCallback`, When the leader is killed and a new leader elected, Then the new leader's `StateMachineCallback` contains all 500 entries in order
+- [ ] Scenario: data-consistency-after-failover — Given a 3-node cluster with 500 committed opaque log entries applied to a test `StateMachine`, When the leader is killed and a new leader elected, Then the new leader's `StateMachine` contains all 500 entries in order
 - [ ] Scenario: network-partition-recovery — Given a 5-node cluster split into groups of 3 and 2, When the partition heals, Then the minority group's nodes catch up and the cluster converges on one leader
-- [ ] Scenario: real-network-3-node-replication — Given a 3-node cluster using real gRPC transport on localhost, When 100 opaque log entries are proposed and committed, Then all 3 nodes' test `StateMachineCallback` instances contain the same 100 entries in order
+- [ ] Scenario: real-network-3-node-replication — Given a 3-node cluster using real gRPC transport on localhost, When 100 opaque log entries are proposed and committed, Then all 3 nodes' test `StateMachine` instances contain the same 100 entries in order
 - [ ] Scenario: real-network-5-node-leader-failover — Given a 5-node cluster using real gRPC transport with 50 committed entries, When the leader process is killed, Then a new leader is elected and all previously committed entries are present in the new leader's log
 
 ## Stage 8.2: Chaos and Stress Testing
