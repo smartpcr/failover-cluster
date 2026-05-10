@@ -500,13 +500,13 @@ Feature: Inter-node request routing and leader discovery
 
 ```gherkin
 Feature: Static voter membership with observer join and stretch-goal dynamic membership
-  Per tech-spec §2.7 and §3, the voter set is fixed at cluster bootstrap for the
-  core v1 deliverable.  Dynamic membership (`AddVoter`/`RemoveVoter`) is a
-  **stretch goal** within this story — it may be delivered if schedule permits
-  (per `tech-spec.md` §2.7/§3 and `architecture.md` §5.5/§10).
-  `implementation-plan.md` Stage 7.2 covers the static voter set bootstrap and
-  observer support as the baseline.  Observers (non-voting nodes) may join to
-  replicate the log for read scaling.
+  Per `tech-spec.md` §2.7/§3 and `architecture.md` §5.5/§10, the voter set is fixed at
+  cluster bootstrap for the core v1 deliverable.  Dynamic membership
+  (`AddVoter`/`RemoveVoter`) is a **stretch goal within this story** — it may be delivered
+  if schedule permits but is not part of the baseline commitment.
+  `implementation-plan.md` Stage 7.2 covers the static voter set bootstrap and observer
+  support as the baseline.  Observers (non-voting nodes) may join to replicate the log
+  for read scaling.
 
   Background:
     Given a cluster of 3 voters [node-0, node-1, node-2] configured at startup
@@ -517,7 +517,7 @@ Feature: Static voter membership with observer join and stretch-goal dynamic mem
     When the cluster starts
     Then all 3 nodes load the static voter configuration
     And quorum size is fixed at 2 of 3
-    And the voter set remains unchanged unless the dynamic membership stretch goal is implemented
+    And the voter set remains unchanged for the v1 baseline (dynamic membership is a stretch goal per tech-spec §2.7)
 
   Scenario: Observer joins and replicates the log
     Given observer-0 is configured as a non-voting observer
@@ -618,14 +618,16 @@ Feature: Timing-sensitive behaviour and performance boundaries
 
   Scenario: Write commit latency under normal conditions
     When an external caller uses `XRaftClient.propose(data)` to submit a write
-    Then the entry is committed within broadcastTime + follower Fetch scheduling delay + fsync latency
-    And the commit latency is recorded as a metric
+    Then the entry is committed after the leader fsync, at least one follower Fetch
+      cycle retrieving the entry, follower fsync, and a second Fetch cycle advancing
+      the high watermark
     And commit latency is recorded as a histogram metric for operational monitoring
-    # Note: in pull-based replication, commit latency includes the time until
-    # followers' next scheduled Fetch retrieves the entry, plus fsync on both
-    # leader and a quorum of followers.  Benchmarking/performance tuning is out
-    # of scope for v1 (tech-spec §3); no specific p99 threshold is mandated.
-    # This scenario validates functional timing correctness, not performance targets.
+    # Note: in pull-based replication, commit latency is not bounded by a simple
+    # formula because it depends on follower Fetch scheduling intervals, fsync
+    # durations on leader and followers, and the two-Fetch-round commit cycle.
+    # Benchmarking/performance tuning is out of scope for v1 (tech-spec §3);
+    # no specific p99 threshold is mandated.  This scenario validates that the
+    # commit sequence completes correctly, not that it meets a latency target.
 
   Scenario: Leader fsync runs concurrently with Fetch serving
     When the leader appends an entry to its local log
@@ -737,33 +739,31 @@ The following design decisions are resolved in sibling docs and reflected in the
 2. **Observer role** — in scope per `tech-spec.md` §2.2. Observers replicate via Fetch but
    do not vote or count toward quorum.
 
-3. **Static voter membership for v1 (dynamic membership deferred)** — per `tech-spec.md`
-   §2.7/§3, `architecture.md` §5.5, and `implementation-plan.md` Stage 7.2, the voter set is
-   fixed at bootstrap for v1.  Dynamic membership (`AddVoter`/`RemoveVoter`) is **out of scope
-   for v1** and deferred to a future story entirely — it is not a stretch goal within XRAFT.
-   `implementation-plan.md` Stage 7.2 covers static voter set bootstrap and observer support
-   only.  Feature 12 tests the core static-membership behaviour.
+3. **Static voter membership baseline; dynamic membership is a stretch goal** — per
+   `tech-spec.md` §2.7/§3 and `architecture.md` §5.5/§10, the voter set is fixed at bootstrap
+   for the core v1 deliverable.  Dynamic membership (`AddVoter`/`RemoveVoter`) is a **stretch
+   goal within this story** — it may be delivered if schedule permits but is not part of the
+   baseline commitment.  `implementation-plan.md` Stage 7.2 covers static voter set bootstrap
+   and observer support as the baseline.  Feature 12 tests both the static-membership baseline
+   and the stretch-goal dynamic membership scenarios (gated with "if implemented" guards).
 
-4. **Internal-only client (`xraft-client`)** — per `tech-spec.md` §2.6 and `architecture.md`
-   §2.5, `xraft-client` is an **internal infrastructure crate** providing a peer RPC client
-   (used by `xraft-server` for inter-node gRPC) and an admin client (for operational queries).
-   It is **not** an external consumer SDK — no external `propose`/`read` API for outside
-   callers is in scope for v1.  Feature 11 tests the internal inter-node routing and
-   leader-discovery behaviour.
+4. **Dual-role client (`xraft-client`)** — per `tech-spec.md` §2.6/§5.6 and `architecture.md`
+   §2.5, `xraft-client` is a **dual-role** crate: it serves as both an **external consumer
+   library** (providing `XRaftClient.propose` and `read` for callers outside the cluster) and
+   an **internal peer/admin client** (used by `xraft-server` for inter-node gRPC and
+   operational queries such as status, metrics, health, and snapshot triggering).  The
+   AdminClient role is limited to operational queries — writes and reads go through the
+   external consumer API (`XRaftClient`).  Feature 11 tests both internal routing/leader
+   discovery and the external consumer API.
 
-5. **Dynamic membership is out of scope for v1** — per `tech-spec.md` §2.7/§3, `architecture.md`
-   §5.5, and `implementation-plan.md` Stage 7.2, `AddVoter`/`RemoveVoter` RPCs are **out of
-   scope for v1** and deferred to a future story entirely — not a stretch goal within XRAFT.
-   `implementation-plan.md` Stage 7.2 covers static voter set bootstrap and observer support
-   only.  Feature 12 tests the core static-membership behaviour.
+5. **Observability endpoints** — `/health` (liveness/readiness) and `/metrics` (OpenTelemetry
+   format) per `tech-spec.md` §2.4.  Feature 15's canonical metric set is drawn from
+   `architecture.md` §7.  `implementation-plan.md` Stage 6.1 defines a smaller initial subset
+   (`xraft_current_term`, `xraft_commit_index`, `xraft_role`, `xraft_election_count`,
+   `xraft_append_latency_seconds`, `xraft_log_entries_total`); the full `architecture.md` §7
+   set is the target and may be delivered incrementally across stages.  Feature 15 tests the
+   full target set with a note about this phased delivery.
 
-6. **Observability endpoints** — `/health` (liveness/readiness) and `/metrics` (Prometheus format)
-   per `tech-spec.md` §2.4.  Feature 15's canonical metric set is drawn from `architecture.md`
-   §7.  `implementation-plan.md` Stage 6.1 defines a smaller initial subset (`xraft_current_term`,
-   `xraft_commit_index`, `xraft_role`, `xraft_election_count`, `xraft_append_latency_seconds`,
-   `xraft_log_entries_total`); the full `architecture.md` §7 set is the target and may be
-   delivered incrementally across stages.  Feature 15 tests the full target set with a note
-   about this phased delivery.
-
-7. **Snapshot transfer** — uses `FetchSnapshot` RPC per `tech-spec.md` §2.2. Chunk size
-   and transport details are implementation-level decisions deferred to `implementation-plan.md`.
+6. **Snapshot transfer** — uses `FetchSnapshot` RPC with chunked streaming per `tech-spec.md`
+   §2.2. Chunk size and transport details are implementation-level decisions deferred to
+   `implementation-plan.md`.
