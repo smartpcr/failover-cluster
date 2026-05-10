@@ -268,7 +268,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Scenario: install-snapshot-on-slow-follower — Given a leader that has compacted entries 1-50, When a follower with last_fetch_offset=10 sends a Fetch, Then the leader redirects to FetchSnapshot and the follower restores from the snapshot
 - [ ] Scenario: snapshot-chunks-reassembly — Given a 3 MB snapshot sent in 1 MB chunks, When all 3 FetchSnapshot stream chunks complete, Then the follower's state machine matches the leader's
 
-# Phase 6: Server Assembly and Client SDK
+# Phase 6: Server Assembly and Internal Client
 
 ## Dependencies
 - phase-network-transport
@@ -282,7 +282,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement signal handling: `SIGTERM`/`SIGINT` trigger graceful shutdown, `SIGHUP` reloads configuration
 - [ ] Implement structured logging with `tracing`: JSON output format, configurable log level via `RUST_LOG` env var, span context for request tracing
 - [ ] Implement health check endpoint: simple HTTP endpoint at `/health` returning node role, term, commit_index, and leader_id using `axum`
-- [ ] Add Prometheus metrics endpoint at `/metrics` using `axum` and `prometheus-client`, exposing an MVP metrics subset for initial bootstrap (per `e2e-scenarios.md` Feature 15 phased delivery): `xraft_current_term` (gauge), `xraft_commit_index` (gauge), `xraft_role` (gauge, encoded as 0=Follower/1=PreCandidate/2=Candidate/3=Leader/4=Observer), `xraft_election_count` (counter), `xraft_append_latency_seconds` (histogram), `xraft_log_entries_total` (counter) — the full canonical metrics set from `architecture.md` §7 (including `xraft_current_leader`, `xraft_replication_lag`, `xraft_commit_latency_seconds`, etc.) will be extended incrementally in later stages
+- [ ] Add Prometheus metrics endpoint at `/metrics` using `axum` and `prometheus-client`, exposing an MVP metrics subset for initial bootstrap (per `e2e-scenarios.md` Feature 15 phased delivery): `xraft_current_term` (gauge), `xraft_commit_index` (gauge), `xraft_role` (gauge, encoded as 0=Follower/1=PreCandidate/2=Candidate/3=Leader/4=Observer), `xraft_election_count` (counter), `xraft_append_latency_seconds` (histogram), `xraft_log_entries_total` (counter) — the remaining canonical metrics from `architecture.md` §7 are added in Stage 7.1 (`xraft_current_leader`, `xraft_replication_lag`, `xraft_commit_latency_seconds`, `xraft_fetch_requests_total`) and Stage 7.3 (`xraft_snapshot_installs_total`, `xraft_log_end_offset`)
 
 ### Dependencies
 - _none — start stage_
@@ -298,11 +298,11 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement `PeerClient` in `xraft-client/src/peer.rs` wrapping a `tonic` gRPC channel to a specific peer, providing typed methods for `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` RPCs with connection lifecycle management
 - [ ] Implement `ConnectionPool` in `xraft-client/src/pool.rs` maintaining lazy-initialized `PeerClient` instances keyed by `NodeId`, with automatic reconnection on channel failure
 - [ ] Implement leader discovery: `PeerClient` tracks last-known leader via hints returned in `FetchResponse` and `VoteResponse` messages; followers cache the leader hint for internal routing decisions
-- [ ] Implement `AdminClient` in `xraft-client/src/admin.rs` connecting to a node's HTTP admin endpoint for operational queries (cluster status, trigger snapshot, node health) — **cross-doc conflict on `xraft-client` scope:** `tech-spec.md` §2.6/§5.6/§7 consistently describes `xraft-client` as internal-only (peer RPC + admin, no external consumer SDK for v1); `architecture.md` §2.5/§10 and `e2e-scenarios.md` Feature 14 / Alignment Note 4 describe it as dual-role with an external consumer API (`propose`/`read`); `e2e-scenarios.md` Feature 11 aligns with the internal-only position; **this plan follows the `tech-spec.md` position** (internal peer RPC and admin only for v1) pending sibling-doc alignment on this conflict
+- [ ] Implement `AdminClient` in `xraft-client/src/admin.rs` connecting to a node's HTTP admin endpoint for operational queries (cluster status, trigger snapshot, node health) — **cross-doc note on `xraft-client` scope:** `tech-spec.md` §2.6 and §5.6 describe `xraft-client` as **dual-role** with both internal peer RPC and an external consumer API (`XRaftClient.propose`/`read`); `architecture.md` §2.5/§10 and `e2e-scenarios.md` Alignment Note 4 describe it as **internal-only** (peer RPC + admin, no external consumer SDK for v1); **this plan follows the `architecture.md` / `e2e-scenarios.md` position** (internal peer RPC and admin only for v1) — `tech-spec.md` §2.6 should be updated to align
 - [ ] Add timeout and retry configuration with sensible defaults (connect: 5s, request: 30s, backoff with jitter)
 
 ### Dependencies
-- phase-server-assembly-and-client-sdk/stage-server-bootstrap-and-lifecycle
+- phase-server-assembly-and-internal-client/stage-server-bootstrap-and-lifecycle
 
 ### Test Scenarios
 - [ ] Scenario: peer-client-reconnect — Given a PeerClient connected to a peer that restarts, When the next RPC is sent, Then the client reconnects automatically and the RPC succeeds
@@ -313,7 +313,7 @@ storyId: "failover-cluster:XRAFT"
 # Phase 7: Advanced Raft Features
 
 ## Dependencies
-- phase-server-assembly-and-client-sdk
+- phase-server-assembly-and-internal-client
 
 ## Stage 7.1: Check Quorum and Leader Lease
 
@@ -322,6 +322,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement leader lease optimization: if the leader has heard from a majority within the last election timeout period (via incoming Fetch RPCs), it may skip the extra commit-index confirmation round-trip when answering internal read queries (e.g. admin status queries or `StateMachineCallback`-based lookups); this is a leader-internal optimization and does not expose an external client read API
 - [ ] Add configuration option `enable_check_quorum` (default true) and `enable_leader_lease` (default false) in `ClusterConfig`
 - [ ] Implement leader step-down on receiving a higher term from any RPC, ensuring no stale leader continues to serve
+- [ ] Register remaining canonical metrics from `architecture.md` §7 for leader and replication observability: `xraft_current_leader` (gauge — node ID of current leader, -1 if unknown), `xraft_replication_lag` (gauge per replica — entries behind leader for each follower, computed from `leader_log_end - follower_last_fetch_offset`), `xraft_commit_latency_seconds` (histogram — time from proposal to commit, leader only), `xraft_fetch_requests_total` (counter — total Fetch RPCs received by leader / sent by follower) — these extend the MVP subset registered in Stage 6.1 to complete the `e2e-scenarios.md` Feature 15 canonical set
 
 ### Dependencies
 - _none — start stage_
@@ -339,7 +340,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement `Observer` role: non-voting nodes that replicate the log via Fetch RPCs for read scaling or standby purposes, without participating in elections or quorum calculations
 - [ ] Implement observer registration: observers connect to the leader and send Fetch RPCs like voters, but the leader excludes them from high-watermark quorum computation
 - [ ] Persist the `VoterSet` in snapshots so that nodes restoring from a snapshot know the cluster membership without re-reading configuration
-- [ ] Implement `AddVoter`/`RemoveVoter` command rejection: any attempt to issue an `AddVoter` or `RemoveVoter` command must return an `UNSUPPORTED` error with a message indicating dynamic membership is **out of scope for v1** — **cross-doc conflict on membership scope:** `e2e-scenarios.md` Alignment Note 3 and `architecture.md` §10 describe dynamic membership as a **stretch goal within this story** (may be delivered if schedule permits); `tech-spec.md` §7 describes it as **out of scope for v1 and deferred to a future story entirely**; **this plan follows the `tech-spec.md` position** (deferred to future story, not a stretch goal) pending sibling-doc alignment; the voter set remains static for v1
+- [ ] Implement `AddVoter`/`RemoveVoter` command rejection: any attempt to issue an `AddVoter` or `RemoveVoter` command must return an `UNSUPPORTED` error with a message indicating dynamic membership is **out of scope for v1** — **cross-doc note on membership scope:** `tech-spec.md` §2.7 and §3 describe dynamic membership as a **stretch goal within this story** (may be delivered if schedule permits); `e2e-scenarios.md` Alignment Note 3 and `architecture.md` §10 describe it as **out of scope for v1 and deferred to a future story entirely**; **this plan follows the `e2e-scenarios.md` / `architecture.md` position** (deferred to future story, not a stretch goal) — `tech-spec.md` §2.7/§3 should be updated to align; the voter set remains static for v1
 
 ### Dependencies
 - phase-advanced-raft-features/stage-check-quorum-and-leader-lease
@@ -359,6 +360,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement the `leader-epoch-checkpoint` file for fast diverging epoch detection during Fetch RPCs, mapping epochs to their start offsets
 - [ ] Implement log segment garbage collection: delete segment files that are entirely before the log start offset
 - [ ] Add metrics for snapshot duration, snapshot size, and log compaction events
+- [ ] Register remaining canonical metrics from `architecture.md` §7 for snapshot and log observability: `xraft_snapshot_installs_total` (counter — snapshots installed by this node), `xraft_log_end_offset` (gauge — highest log index, may be ahead of commit) — these complete the full `architecture.md` §7 / `e2e-scenarios.md` Feature 15 canonical metric set alongside the metrics registered in Stage 6.1 (MVP subset) and Stage 7.1 (leader/replication metrics)
 
 ### Dependencies
 - phase-advanced-raft-features/stage-check-quorum-and-leader-lease
@@ -376,12 +378,15 @@ storyId: "failover-cluster:XRAFT"
 ## Stage 8.1: Multi-Node Integration Tests
 
 ### Implementation Steps
-- [ ] Create integration test infrastructure in the `xraft-test` crate with a `SimulatedCluster` harness that spins up 3-node and 5-node in-process clusters using `SimulatedNetwork` (no real network)
+- [ ] Create integration test infrastructure in the `xraft-test` crate with a `SimulatedCluster` harness that spins up 3-node and 5-node in-process clusters using `SimulatedNetwork` (no real network) for deterministic, fast-running tests
 - [ ] Implement `SimulatedNetwork` in `xraft-test` that simulates message passing with configurable latency, packet loss, and network partitions, plus `SimulatedClock` for deterministic tick advancement
-- [ ] Write integration test: cluster elects a leader within 2 election timeout periods after startup
-- [ ] Write integration test: test harness submits 1000 opaque log entries as proposals through the leader's internal command channel; a test `StateMachineCallback` records applied entries; after commit, the callback's state contains all 1000 entries in order
-- [ ] Write integration test: killing the leader triggers re-election and the new leader has all committed entries
-- [ ] Write integration test: a partitioned follower rejoins and catches up via log replication or snapshot install
+- [ ] Create real-network integration test infrastructure in `xraft-test` with a `RealCluster` harness that starts 3-node and 5-node clusters using actual gRPC transport (per `tech-spec.md` §2.5 which requires real-network 3-node and 5-node integration tests); each node runs as a separate Tokio task with real `RaftGrpcServer`/`RaftGrpcClient` binding to localhost ports
+- [ ] Write integration test (simulated): cluster elects a leader within 2 election timeout periods after startup
+- [ ] Write integration test (simulated): test harness submits 1000 opaque log entries as proposals through the leader's internal command channel; a test `StateMachineCallback` records applied entries; after commit, the callback's state contains all 1000 entries in order
+- [ ] Write integration test (simulated): killing the leader triggers re-election and the new leader has all committed entries
+- [ ] Write integration test (simulated): a partitioned follower rejoins and catches up via log replication or snapshot install
+- [ ] Write integration test (real-network): 3-node cluster over real gRPC transport elects a leader and replicates 100 opaque log entries; a test `StateMachineCallback` on each node records applied entries; all nodes' callbacks converge on the same ordered log
+- [ ] Write integration test (real-network): 5-node cluster over real gRPC transport survives leader crash (process kill) and re-elects; new leader's `StateMachineCallback` contains all previously committed entries
 
 ### Dependencies
 - _none — start stage_
@@ -390,6 +395,8 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Scenario: three-node-election — Given a 3-node cluster started simultaneously, When election timeouts elapse, Then exactly one leader is elected and all nodes agree on the term
 - [ ] Scenario: data-consistency-after-failover — Given a 3-node cluster with 500 committed opaque log entries applied to a test `StateMachineCallback`, When the leader is killed and a new leader elected, Then the new leader's `StateMachineCallback` contains all 500 entries in order
 - [ ] Scenario: network-partition-recovery — Given a 5-node cluster split into groups of 3 and 2, When the partition heals, Then the minority group's nodes catch up and the cluster converges on one leader
+- [ ] Scenario: real-network-3-node-replication — Given a 3-node cluster using real gRPC transport on localhost, When 100 opaque log entries are proposed and committed, Then all 3 nodes' test `StateMachineCallback` instances contain the same 100 entries in order
+- [ ] Scenario: real-network-5-node-leader-failover — Given a 5-node cluster using real gRPC transport with 50 committed entries, When the leader process is killed, Then a new leader is elected and all previously committed entries are present in the new leader's log
 
 ## Stage 8.2: Chaos and Stress Testing
 
