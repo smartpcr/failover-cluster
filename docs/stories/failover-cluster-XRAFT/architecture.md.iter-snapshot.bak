@@ -21,8 +21,12 @@ reusable consensus library and standalone cluster binary. The system provides:
   Library consumers submit proposals and reads through `xraft-server`'s
   embedded API (see §2.4).
 
-The implementation targets clusters of 3, 5, or 7 voter nodes, with additional
-non-voting observer nodes for read scale-out.
+The implementation accepts any voter count ≥ 1. Odd-numbered clusters (3, 5, 7)
+are recommended because they maximise fault tolerance per node; even-numbered
+voter sets are allowed but produce a startup warning about reduced fault
+tolerance (per `tech-spec.md` §5.5 and `implementation-plan.md` Stage 7.2).
+A single-voter cluster self-elects immediately. Non-voting observer nodes
+provide read scale-out and standby capacity.
 
 ---
 
@@ -168,7 +172,7 @@ is internal-only; see §2.5).
 | `XRaftServer` | Top-level server. Initialises `RaftNode`, `FileLogStore`, `GrpcTransport`, starts the event loop. Exposes `propose(command: Bytes) -> Result<LogIndex>` and `read(key: Bytes) -> Result<Bytes>` for library consumers to submit commands to the leader and query committed state. |
 | `EventLoop` | Single-threaded async loop (Tokio). Processes `Input` from RPC handlers + timer ticks, feeds them to `RaftNode`, dispatches resulting `Action`s. |
 | `TickDriver` | Fires `Input::Tick` at `tick_interval` (default 50 ms). The core engine counts ticks to derive election and heartbeat timeouts. |
-| `NodeConfig` | TOML configuration: `node_id`, `cluster_id`, `data_dir`, `cluster.bootstrap_peers`, `timing.election_timeout_min_ms`, `timing.election_timeout_max_ms`, `timing.tick_interval_ms`, `snapshot.interval_entries`, `log.segment_max_bytes` (see §8 for the full reference). |
+| `NodeConfig` | TOML configuration: `node_id`, `cluster_id`, `data_dir`, `cluster.bootstrap_voters`, `cluster.bootstrap_observers`, `timing.election_timeout_min_ms`, `timing.election_timeout_max_ms`, `timing.tick_interval_ms`, `timing.fetch_interval_ms`, `timing.enable_check_quorum`, `timing.enable_leader_lease`, `snapshot.interval_entries`, `log.segment_max_bytes` (see §8 for the full reference). |
 | `MetricsRegistry` | Prometheus-compatible metrics: `current_leader`, `current_term`, `commit_latency_avg`, `append_records_rate`, `election_latency_avg`, `log_end_offset`, `replication_lag`. |
 | `AdminApi` | HTTP API for operational commands: cluster status, trigger snapshot, node health. |
 
@@ -563,7 +567,7 @@ replication and is consistent with KRaft's design.
     │                               install snapshot │
     │                               restore state    │
     │                               machine          │
-    │                               set log_start=500│
+    │                               set log_start=501│
     │                                           │
     │◄────────── FetchReq(fetch_offset=501) ───┤
     │── FetchResp(entries=[501,502,...]) ───────►│
@@ -648,7 +652,7 @@ The following invariants are enforced by `xraft-core` and verified by
 |---|---|---|
 | S1 | **Election safety:** At most one leader per term. | `voted_for` persisted before granting vote; majority required. |
 | S2 | **Leader append-only:** A leader never overwrites or deletes its own log entries. | `RaftNode` only appends when role is `Leader`. |
-| S3 | **Log matching:** If two entries share the same index and term, all preceding entries are identical. | Fetch response includes `prev_log_index` / `prev_log_term`; mismatch triggers truncation. |
+| S3 | **Log matching:** If two entries share the same index and term, all preceding entries are identical. | Enforced via KRaft-style `DivergingEpoch`: the follower sends `last_fetched_epoch` in each Fetch request; the leader returns a `DivergingEpoch(epoch, end_offset)` when the follower's epoch does not match, triggering truncation to the divergence point (see §5.4 and `tech-spec.md` §2.2). |
 | S4 | **Leader completeness:** A candidate cannot win if its log is behind the majority. | Vote is rejected if candidate's `(last_log_term, last_log_index)` is behind the voter's. |
 | S5 | **State machine safety:** No two nodes apply different entries at the same index. | Follows from S1–S4; entries below HW are immutable. |
 | S6 | **Persistence before acknowledgement:** `HardState` and log entries are fsynced before any RPC response. | `Action` dispatch order in `EventLoop`. |
@@ -684,17 +688,24 @@ cluster_id = "xraft-cluster-001"
 data_dir = "/var/lib/xraft"
 
 [cluster]
-bootstrap_peers = [
+# Voters participate in elections and quorum; observers replicate but do not vote.
+bootstrap_voters = [
   { node_id = 0, host = "node0.example.com", port = 6000 },
   { node_id = 1, host = "node1.example.com", port = 6001 },
   { node_id = 2, host = "node2.example.com", port = 6002 },
+]
+bootstrap_observers = [
+  { node_id = 3, host = "observer0.example.com", port = 6003 },
 ]
 
 [timing]
 tick_interval_ms = 50
 election_timeout_min_ms = 150
 election_timeout_max_ms = 300
+fetch_interval_ms = 50               # follower/observer Fetch RPC interval
 check_quorum_interval_ticks = 6      # 300 ms at 50 ms tick
+enable_check_quorum = true           # leader steps down if quorum lost
+enable_leader_lease = false          # lease-based reads (optional optimisation)
 
 [log]
 segment_max_bytes = 67_108_864     # 64 MiB (per implementation-plan.md Stage 2.1)

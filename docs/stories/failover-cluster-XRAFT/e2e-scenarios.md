@@ -445,15 +445,13 @@ Feature: Check Quorum prevents split-brain
 
 ```gherkin
 Feature: Inter-node request routing and leader discovery
-  Per `tech-spec.md` §2.6, `xraft-client` is an **internal** crate
-  providing peer-to-peer RPC (`PeerClient` for Fetch, Vote,
-  FetchSnapshot) with `ConnectionPool`, and an `AdminClient` for
-  operational queries.  It is **not** an external consumer SDK — no
-  `propose`/`read` API for outside callers is in scope for v1.
-  (Note: `architecture.md` §2.5 describes `xraft-client` as a dual-role
-  library with external `XRaftClient.propose`/`read`; these scenarios
-  follow the tech-spec's internal-only scoping as the authoritative v1
-  scope boundary.)
+  Per `tech-spec.md` §2.6 and `architecture.md` §2.5, `xraft-client`
+  is an **internal** crate providing peer-to-peer RPC (`PeerClient`
+  for Fetch, Vote, FetchSnapshot) with `ConnectionPool`, and an
+  `AdminClient` for operational queries.  It is **not** an external
+  consumer SDK — no `propose`/`read` API for outside callers is in
+  scope for v1.  Library consumers submit proposals and reads through
+  `xraft-server`'s embedded API (`architecture.md` §2.4).
   Leader discovery occurs through Fetch RPC responses that carry
   leader_id and epoch metadata.
 
@@ -504,13 +502,11 @@ Feature: Inter-node request routing and leader discovery
 ```gherkin
 Feature: Static voter membership with observer join
   The v1 baseline uses static membership — the voter set is fixed at cluster
-  bootstrap.  Per `tech-spec.md` §2.7/§3 and `implementation-plan.md`
-  Stage 7.2, dynamic membership (`AddVoter`/`RemoveVoter`) is **out of scope
-  for v1** and deferred to a future story entirely.  Any
-  `AddVoter`/`RemoveVoter` command is rejected with `UNSUPPORTED`.
-  (`architecture.md` §2.1/§10 uses the phrase "stretch goal within this
-  story"; these scenarios adopt the stricter `tech-spec.md` scoping because
-  the tech-spec is the authoritative scope document.)
+  bootstrap.  Per `tech-spec.md` §2.7/§3, `architecture.md` §2.1/§10, and
+  `implementation-plan.md` Stage 7.2, dynamic membership
+  (`AddVoter`/`RemoveVoter`) is **out of scope for v1** and deferred to a
+  future story entirely.  Any `AddVoter`/`RemoveVoter` command is rejected
+  with `UNSUPPORTED`.
   Observers (non-voting nodes) may join to replicate the log for read scaling.
 
   Background:
@@ -701,7 +697,7 @@ Feature: Graceful node shutdown with leader step-down
     Given a cluster of 3 nodes
     And node-0 is the leader
 
-  Scenario: Leader initiates graceful shutdown with transfer
+  Scenario: Leader initiates graceful shutdown and steps down
     When node-0 receives a shutdown signal
     Then node-0 stops accepting new proposals
     And node-0 waits for in-flight entries to commit (or a short timeout)
@@ -739,26 +735,22 @@ are stated explicitly:
    do not vote or count toward quorum.
 
 3. **Static voter membership; dynamic membership deferred** — per
-   `tech-spec.md` §2.7/§3 and `implementation-plan.md` Stage 7.2, the v1
-   baseline uses static membership (voter set fixed at bootstrap).  Dynamic
-   membership (`AddVoter`/`RemoveVoter`) is **out of scope for v1** and
-   deferred to a future story entirely.  Any `AddVoter`/`RemoveVoter` command
-   is rejected with `UNSUPPORTED`.  (`architecture.md` §2.1/§10 uses the
-   phrase "stretch goal within this story"; these scenarios adopt the stricter
-   `tech-spec.md` scoping because the tech-spec is the authoritative scope
-   document.)
+   `tech-spec.md` §2.7/§3, `architecture.md` §2.1/§10, and
+   `implementation-plan.md` Stage 7.2, the v1 baseline uses static membership
+   (voter set fixed at bootstrap).  Dynamic membership
+   (`AddVoter`/`RemoveVoter`) is **out of scope for v1** and deferred to a
+   future story entirely — it is not a stretch goal within XRAFT.  Any
+   `AddVoter`/`RemoveVoter` command is rejected with `UNSUPPORTED`.
    Feature 12 tests static membership, observer join, and the rejection of
    dynamic membership commands in the v1 baseline.
 
-4. **Internal-only client (`xraft-client`)** — per `tech-spec.md` §2.6,
-   `xraft-client` is an **internal** crate providing peer-to-peer RPC
-   (`PeerClient` for Fetch, Vote, FetchSnapshot; `ConnectionPool`) and
-   admin/operational queries (`AdminClient`).  It is **not** an external
-   consumer SDK — no `propose`/`read` API for outside callers is in scope
-   for v1.  (`architecture.md` §2.5 describes `xraft-client` as a "Dual-Role
-   Client Library" with an external `XRaftClient.propose`/`read` API; these
-   scenarios adopt `tech-spec.md` §2.6's internal-only scoping because the
-   tech-spec is the authoritative scope document for v1 boundaries.)
+4. **Internal-only client (`xraft-client`)** — per `tech-spec.md` §2.6 and
+   `architecture.md` §2.5, `xraft-client` is an **internal** crate providing
+   peer-to-peer RPC (`PeerClient` for Fetch, Vote, FetchSnapshot;
+   `ConnectionPool`) and admin/operational queries (`AdminClient`).  It is
+   **not** an external consumer SDK — no `propose`/`read` API for outside
+   callers is in scope for v1.  Library consumers submit proposals and reads
+   through `xraft-server`'s embedded API (`architecture.md` §2.4).
    Feature 11 tests internal routing, leader discovery via Fetch responses, and
    AdminClient operational queries.
 
