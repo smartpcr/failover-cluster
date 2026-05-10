@@ -445,16 +445,15 @@ Feature: Check Quorum prevents split-brain
 
 ```gherkin
 Feature: Inter-node request routing and leader discovery
-  `xraft-client` is a **dual-role** crate per `tech-spec.md` §2.6: it
-  provides (1) an internal peer-to-peer RPC layer (`PeerClient` for
-  Fetch, Vote, FetchSnapshot) with `ConnectionPool` and `AdminClient`,
-  and (2) an external consumer API (`XRaftClient.propose`/`read`) for
-  application code.  `architecture.md` §2.5 currently describes
-  `xraft-client` as internal/admin only (no external consumer SDK in v1).
-  These scenarios test the capabilities that both docs agree on —
-  internal peer RPC, leader discovery via Fetch responses, and
-  AdminClient operational queries — which are the baseline v1
-  deliverables regardless of which scoping is adopted.
+  Per `tech-spec.md` §2.6, `xraft-client` is an **internal** crate
+  providing peer-to-peer RPC (`PeerClient` for Fetch, Vote,
+  FetchSnapshot) with `ConnectionPool`, and an `AdminClient` for
+  operational queries.  It is **not** an external consumer SDK — no
+  `propose`/`read` API for outside callers is in scope for v1.
+  (Note: `architecture.md` §2.5 describes `xraft-client` as a dual-role
+  library with external `XRaftClient.propose`/`read`; these scenarios
+  follow the tech-spec's internal-only scoping as the authoritative v1
+  scope boundary.)
   Leader discovery occurs through Fetch RPC responses that carry
   leader_id and epoch metadata.
 
@@ -504,17 +503,15 @@ Feature: Inter-node request routing and leader discovery
 
 ```gherkin
 Feature: Static voter membership with observer join
-  Per `tech-spec.md` §2.7/§3 and `architecture.md` §5.5, the v1 baseline uses
-  static membership — the voter set is fixed at cluster bootstrap.  Dynamic
-  membership (`AddVoter`/`RemoveVoter`) is a **stretch goal within this story**
-  per `tech-spec.md` §2.7 and §3 — it may be delivered if schedule permits but
-  is not part of the core v1 baseline.  (`architecture.md` §2.1/§10 currently
-  describes dynamic membership as out of scope entirely; these docs should be
-  aligned in a future iteration.)  A `ConfigChange(VoterSet)` variant is reserved
-  in `EntryPayload` per `architecture.md` §2.1.  Until the stretch goal is
-  implemented, any `AddVoter`/`RemoveVoter` command is rejected with
-  `UNSUPPORTED`.  Observers (non-voting nodes) may join to replicate the log
-  for read scaling.
+  The v1 baseline uses static membership — the voter set is fixed at cluster
+  bootstrap.  Per `tech-spec.md` §2.7/§3 and `implementation-plan.md`
+  Stage 7.2, dynamic membership (`AddVoter`/`RemoveVoter`) is **out of scope
+  for v1** and deferred to a future story entirely.  Any
+  `AddVoter`/`RemoveVoter` command is rejected with `UNSUPPORTED`.
+  (`architecture.md` §2.1/§10 uses the phrase "stretch goal within this
+  story"; these scenarios adopt the stricter `tech-spec.md` scoping because
+  the tech-spec is the authoritative scope document.)
+  Observers (non-voting nodes) may join to replicate the log for read scaling.
 
   Background:
     Given a cluster of 3 voters [node-0, node-1, node-2] configured at startup
@@ -548,8 +545,8 @@ Feature: Static voter membership with observer join
     Then the node rejects the request with an UNSUPPORTED error
     And the error message indicates dynamic membership is not yet implemented
     And the voter set remains unchanged
-    # Dynamic membership (AddVoter/RemoveVoter) is a stretch goal within this
-    # story (tech-spec §2.7/§3); until implemented, commands are rejected
+    # Dynamic membership (AddVoter/RemoveVoter) is out of scope for v1
+    # and deferred to a future story (tech-spec §2.7/§3)
 ```
 
 ---
@@ -731,7 +728,9 @@ Feature: Graceful node shutdown with leader step-down
 
 ## Alignment Notes
 
-The following design decisions are resolved in sibling docs and reflected in these scenarios:
+These scenarios adopt the following resolved positions from sibling documents.
+Where sibling documents disagree, the position taken here and the rationale
+are stated explicitly:
 
 1. **Pull-based Fetch replication** — confirmed in `tech-spec.md` §2.2 and `architecture.md` §2.1.
    All replication scenarios use follower-initiated Fetch RPCs (no push-based AppendEntries).
@@ -739,45 +738,37 @@ The following design decisions are resolved in sibling docs and reflected in the
 2. **Observer role** — in scope per `tech-spec.md` §2.2. Observers replicate via Fetch but
    do not vote or count toward quorum.
 
-3. **Static voter membership; dynamic membership is a stretch goal** — per
-   `tech-spec.md` §2.7/§3, the v1 baseline uses static membership (voter set
-   fixed at bootstrap).  Dynamic membership (`AddVoter`/`RemoveVoter`) is a
-   **stretch goal within this story** — it may be delivered if schedule permits
-   but is not part of the core v1 baseline.  A `ConfigChange(VoterSet)` variant
-   is reserved in `EntryPayload` per `architecture.md` §2.1.  Until the stretch
-   goal is implemented, any `AddVoter`/`RemoveVoter` command is rejected with
-   `UNSUPPORTED`.  (Note: `architecture.md` §2.1/§10 currently describes dynamic
-   membership as out of scope for v1 entirely; this differs from `tech-spec.md`
-   which classifies it as a stretch goal within this story.  The sibling docs
-   should be aligned in a future iteration.)
+3. **Static voter membership; dynamic membership deferred** — per
+   `tech-spec.md` §2.7/§3 and `implementation-plan.md` Stage 7.2, the v1
+   baseline uses static membership (voter set fixed at bootstrap).  Dynamic
+   membership (`AddVoter`/`RemoveVoter`) is **out of scope for v1** and
+   deferred to a future story entirely.  Any `AddVoter`/`RemoveVoter` command
+   is rejected with `UNSUPPORTED`.  (`architecture.md` §2.1/§10 uses the
+   phrase "stretch goal within this story"; these scenarios adopt the stricter
+   `tech-spec.md` scoping because the tech-spec is the authoritative scope
+   document.)
    Feature 12 tests static membership, observer join, and the rejection of
    dynamic membership commands in the v1 baseline.
 
-4. **Dual-role client (`xraft-client`)** — `tech-spec.md` §2.6 defines `xraft-client`
-   as a **dual-role** crate providing both an internal peer-to-peer RPC layer
-   (`PeerClient` for Fetch, Vote, FetchSnapshot; `ConnectionPool`; `AdminClient`)
-   and an external consumer API (`XRaftClient.propose`/`read`).
-   `architecture.md` §2.5 currently describes `xraft-client` as an **internal**
-   crate (peer RPC + admin only, no external consumer SDK in v1).  These scenarios
-   test the capabilities both docs agree on — internal peer RPC, leader discovery
-   via Fetch responses, and AdminClient operational queries — which are the baseline
-   v1 deliverables.  The external consumer API scope should be aligned across
-   sibling docs in a future iteration.
+4. **Internal-only client (`xraft-client`)** — per `tech-spec.md` §2.6,
+   `xraft-client` is an **internal** crate providing peer-to-peer RPC
+   (`PeerClient` for Fetch, Vote, FetchSnapshot; `ConnectionPool`) and
+   admin/operational queries (`AdminClient`).  It is **not** an external
+   consumer SDK — no `propose`/`read` API for outside callers is in scope
+   for v1.  (`architecture.md` §2.5 describes `xraft-client` as a "Dual-Role
+   Client Library" with an external `XRaftClient.propose`/`read` API; these
+   scenarios adopt `tech-spec.md` §2.6's internal-only scoping because the
+   tech-spec is the authoritative scope document for v1 boundaries.)
    Feature 11 tests internal routing, leader discovery via Fetch responses, and
    AdminClient operational queries.
 
 5. **Observability endpoints** — `/health` (liveness/readiness) and `/metrics`
-   per `tech-spec.md` §2.4.  **Metrics format:** the operator has indicated that
-   cluster metrics should be exposed in **OpenTelemetry** format (OTLP).  However,
-   sibling docs currently specify a different approach: `tech-spec.md` §5.6 and
-   `implementation-plan.md` Stage 1.1 reference `prometheus-client` for Prometheus
-   exposition format, and `architecture.md` §7 describes a Prometheus `/metrics`
-   endpoint.  This is a **cross-doc discrepancy that needs resolution**: the sibling
-   docs should be updated to reflect the OpenTelemetry decision, or the operator
-   answer should be revisited.  These e2e scenarios test that a `/metrics` endpoint
-   exists and exposes the canonical metric set from `architecture.md` §7; the
-   specific wire format (Prometheus vs. OTLP) is deferred to implementation and
-   sibling doc alignment.
+   per `tech-spec.md` §2.4.  **Metrics format:** per `tech-spec.md` §5.6,
+   `implementation-plan.md` Stage 1.1, and `architecture.md` §7, cluster metrics
+   are exposed via the `prometheus-client` crate in Prometheus exposition format
+   on a `/metrics` HTTP endpoint.  These e2e scenarios test that a `/metrics`
+   endpoint exists and exposes the canonical metric set from `architecture.md` §7
+   in Prometheus format.
    Feature 15's canonical metric set is drawn from `architecture.md` §7.
    `implementation-plan.md` Stage 6.1 defines a smaller initial subset
    (`xraft_current_term`, `xraft_commit_index`, `xraft_role`, `xraft_election_count`,
