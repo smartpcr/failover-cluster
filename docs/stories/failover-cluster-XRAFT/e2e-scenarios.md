@@ -435,12 +435,12 @@ Feature: Check Quorum prevents split-brain
 
 ```gherkin
 Feature: Inter-node request routing and leader discovery
-  Per tech-spec §2.6, `xraft-client` is a **dual-role** crate providing both an
-  **external consumer API** (`XRaftClient.propose`/`read`) and an **internal**
-  peer-to-peer RPC layer (Fetch, Vote, FetchSnapshot) plus admin/operational
-  queries (status, metrics, health, snapshot triggering).  Leader discovery
-  occurs through Fetch RPC responses that carry leader_id and epoch metadata.
-  Feature 14 exercises the external consumer API in dedicated scenarios.
+  Per tech-spec §2.6 and architecture §2.5, `xraft-client` is an **internal**
+  crate providing peer-to-peer RPC (Fetch, Vote, FetchSnapshot) and
+  admin/operational queries (status, metrics, health, snapshot triggering).
+  It is **not** an external consumer SDK — no external `propose`/`read` API
+  for outside callers is in scope for v1.  Leader discovery occurs through
+  Fetch RPC responses that carry leader_id and epoch metadata.
 
   Background:
     Given a cluster of 3 nodes
@@ -488,13 +488,12 @@ Feature: Inter-node request routing and leader discovery
 
 ```gherkin
 Feature: Static voter membership with observer join
-  Per `tech-spec.md` §2.7/§3 and `implementation-plan.md` Stage 7.2, the voter set
-  is fixed at cluster bootstrap for the core v1 deliverable.  Dynamic membership
-  (`AddVoter`/`RemoveVoter`) is a **stretch goal within this story** — it may be
-  delivered if schedule permits, but is not part of the core v1 deliverable.
-  Until the stretch goal is implemented, any `AddVoter`/`RemoveVoter` command is
-  rejected with `UNSUPPORTED`.  Observers (non-voting nodes) may join to replicate
-  the log for read scaling.
+  Per `tech-spec.md` §2.7/§3 and `architecture.md` §5.5, the voter set is fixed
+  at cluster bootstrap.  Dynamic membership (`AddVoter`/`RemoveVoter`) is **out
+  of scope for v1** and deferred to a future story entirely — it is not a stretch
+  goal within XRAFT.  No membership mutation endpoints exist in v1.  Any
+  `AddVoter`/`RemoveVoter` command is rejected with `UNSUPPORTED`.  Observers
+  (non-voting nodes) may join to replicate the log for read scaling.
 
   Background:
     Given a cluster of 3 voters [node-0, node-1, node-2] configured at startup
@@ -523,13 +522,13 @@ Feature: Static voter membership with observer join
     And observer-0 initiates a FetchSnapshot RPC
     And observer-0 loads the snapshot and resumes Fetch from index 8,001
 
-  Scenario: AddVoter/RemoveVoter is rejected until stretch goal is implemented
+  Scenario: AddVoter/RemoveVoter is rejected — outside v1 scope
     When an operator attempts to issue an AddVoter or RemoveVoter command
     Then the node rejects the request with an UNSUPPORTED error
-    And the error message indicates dynamic membership is not yet available
+    And the error message indicates membership mutation is outside XRAFT v1
     And the voter set remains unchanged
-    # Dynamic membership is a stretch goal within this story (tech-spec §2.7/§3,
-    # implementation-plan Stage 7.2); rejected with UNSUPPORTED until implemented
+    # Dynamic membership is out of scope for v1 and deferred to a future story
+    # entirely (tech-spec §2.7/§3, architecture §5.5); no mutation endpoints exist
 ```
 
 ---
@@ -568,72 +567,7 @@ Feature: Raft safety invariants hold under all conditions
 
 ---
 
-## Feature 14: External Client API (`XRaftClient.propose`/`read`)
-
-```gherkin
-Feature: External consumer API via XRaftClient
-  Per `tech-spec.md` §2.6 and `implementation-plan.md` Stage 6.2, `xraft-client`
-  exposes an external consumer API: `XRaftClient.propose(data) → Result<ProposalId>`
-  and `XRaftClient.read(key) → Result<Vec<u8>>`.  The client tracks the last-known
-  leader via response hints and transparently redirects to the current leader.
-
-  Background:
-    Given a cluster of 3 nodes [node-0, node-1, node-2]
-    And node-0 is the leader in epoch 5
-
-  Scenario: Propose and read back committed data
-    Given an XRaftClient connected to the cluster
-    When the client calls propose(data=b"key1=value1")
-    Then the proposal is forwarded to the leader (node-0)
-    And the leader appends the entry to its log
-    And the entry is committed after replication to a majority
-    And propose returns a ProposalId indicating success
-    When the client calls read(key=b"key1")
-    Then the read returns b"value1" from committed state
-
-  Scenario: Client connected to follower is transparently redirected
-    Given an XRaftClient initially connected to node-1 (a follower)
-    When the client calls propose(data=b"key2=value2")
-    Then node-1 responds with NOT_LEADER and leader_hint=node-0
-    And the client transparently retries the proposal against node-0
-    And the proposal succeeds and returns a ProposalId
-    And the client caches node-0 as the leader for subsequent calls
-
-  Scenario: Client handles leader change during operation
-    Given an XRaftClient with cached leader = node-0
-    And node-0 steps down and node-2 becomes leader in epoch 6
-    When the client calls propose(data=b"key3=value3")
-    Then node-0 responds with NOT_LEADER and leader_hint=node-2
-    And the client retries against node-2
-    And the proposal is committed by the new leader
-    And the client updates its cached leader to node-2
-
-  Scenario: Propose fails when no leader is available
-    Given all nodes are in Candidate state (election in progress)
-    When the client calls propose(data=b"key4=value4")
-    Then the client receives a NO_LEADER error
-    And the client retries after a backoff delay
-    When a leader is elected
-    Then the retried proposal succeeds
-
-  Scenario: Read is served from leader with linearizable guarantee
-    Given node-0 is the leader with committed entries up to index 42
-    When the client calls read(key=b"key1")
-    Then node-0 confirms it still holds leadership (via Check Quorum or no-op)
-    And the read returns the committed value for key1
-    And stale reads from a deposed leader are prevented
-
-  Scenario: Multiple clients propose concurrently
-    Given two XRaftClient instances connected to the cluster
-    When both clients call propose() concurrently with different data
-    Then both proposals are serialised in the leader's log
-    And both proposals are committed
-    And each client receives a distinct ProposalId
-```
-
----
-
-## Feature 15: Timing and Performance
+## Feature 14: Timing and Performance
 
 ```gherkin
 Feature: Timing-sensitive behaviour and performance boundaries
@@ -677,7 +611,7 @@ Feature: Timing-sensitive behaviour and performance boundaries
 
 ---
 
-## Feature 16: Observability and Metrics
+## Feature 15: Observability and Metrics
 
 ```gherkin
 Feature: Cluster metrics and health observability
@@ -731,7 +665,7 @@ Feature: Cluster metrics and health observability
 
 ---
 
-## Feature 17: Graceful Shutdown and Leader Step-Down
+## Feature 16: Graceful Shutdown and Leader Step-Down
 
 ```gherkin
 Feature: Graceful node shutdown with leader step-down
@@ -778,28 +712,28 @@ The following design decisions are resolved in sibling docs and reflected in the
 2. **Observer role** — in scope per `tech-spec.md` §2.2. Observers replicate via Fetch but
    do not vote or count toward quorum.
 
-3. **Static voter membership; dynamic membership is a stretch goal within this story** — per
-   `tech-spec.md` §2.7/§3 and `implementation-plan.md` Stage 7.2, the voter set is fixed at
-   bootstrap for the core v1 deliverable.  Dynamic membership (`AddVoter`/`RemoveVoter`) is a
-   **stretch goal within this story** — it may be delivered if schedule permits, but is not part
-   of the core v1 deliverable.  Until the stretch goal is implemented, any `AddVoter`/`RemoveVoter`
-   command is rejected with `UNSUPPORTED`.  Feature 12 tests static membership, observer join,
+3. **Static voter membership; dynamic membership is out of scope for v1** — per
+   `tech-spec.md` §2.7/§3 and `architecture.md` §5.5, the voter set is fixed at
+   bootstrap.  Dynamic membership (`AddVoter`/`RemoveVoter`) is **out of scope for v1**
+   and deferred to a future story entirely — it is not a stretch goal within XRAFT.
+   No membership mutation endpoints exist in v1.  Any `AddVoter`/`RemoveVoter` command
+   is rejected with `UNSUPPORTED`.  Feature 12 tests static membership, observer join,
    and the rejection of dynamic membership commands.
 
-4. **Dual-role client (`xraft-client`)** — per `tech-spec.md` §2.6 and `implementation-plan.md`
-   Stage 6.2, `xraft-client` is a **dual-role** crate providing both an **external consumer API**
-   (`XRaftClient.propose`/`read`) and an **internal** peer-to-peer RPC layer (Fetch, Vote,
-   FetchSnapshot) plus admin/operational queries.  Feature 11 tests internal routing, leader
-   discovery via Fetch responses, and AdminClient operational queries.  Feature 14 exercises the
-   external consumer API (`propose`/`read`) with scenarios for propose-and-read, leader redirect,
-   concurrent proposals, and leader failover.
+4. **Internal-only client (`xraft-client`)** — per `tech-spec.md` §2.6 and
+   `architecture.md` §2.5, `xraft-client` is an **internal** crate providing
+   peer-to-peer RPC (Fetch, Vote, FetchSnapshot) and admin/operational queries
+   (status, metrics, health, snapshot triggering).  It is **not** an external consumer
+   SDK — no external `propose`/`read` API for outside callers is in scope for v1.
+   Feature 11 tests internal routing, leader discovery via Fetch responses, and
+   AdminClient operational queries.
 
 5. **Observability endpoints**— `/health` (liveness/readiness) and `/metrics` (OpenTelemetry
-   format) per `tech-spec.md` §2.4.  Feature 16's canonical metric set is drawn from
+   format) per `tech-spec.md` §2.4.  Feature 15's canonical metric set is drawn from
    `architecture.md` §7.  `implementation-plan.md` Stage 6.1 defines a smaller initial subset
    (`xraft_current_term`, `xraft_commit_index`, `xraft_role`, `xraft_election_count`,
    `xraft_append_latency_seconds`, `xraft_log_entries_total`); the full `architecture.md` §7
-   set is the target and may be delivered incrementally across stages.  Feature 16 tests the
+   set is the target and may be delivered incrementally across stages.  Feature 15 tests the
    full target set with a note about this phased delivery.
 
 6. **Snapshot transfer** — uses `FetchSnapshot` RPC with chunked streaming per `tech-spec.md`
