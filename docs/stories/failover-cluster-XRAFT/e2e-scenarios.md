@@ -425,14 +425,14 @@ Feature: Check Quorum prevents split-brain
     And the check quorum interval is 2× the election timeout
 
   Scenario: Leader passes quorum check
-    Given node-0 has received Fetch responses from node-1 and node-2
+    Given node-0 has received Fetch requests from node-1 and node-2
       within the check quorum interval
     When the check quorum timer fires
     Then node-0 confirms communication with a majority (3 of 5 including self)
     And node-0 remains in "Leader" state
 
   Scenario: Leader fails quorum check and steps down
-    Given node-0 has only received responses from node-1 in the last interval
+    Given node-0 has only received Fetch requests from node-1 in the last interval
     When the check quorum timer fires
     Then node-0 cannot confirm majority (only 2 of 5)
     And node-0 transitions to "Follower" state
@@ -663,11 +663,11 @@ Feature: Cluster metrics and health observability
 
   Scenario: Metrics endpoint exposes canonical cluster gauges
     # The canonical metric set is defined in architecture.md §7.
-    # implementation-plan.md Stage 6.1 lists a subset for the initial /metrics
-    # endpoint (xraft_current_term, xraft_commit_index, xraft_role,
-    # xraft_election_count, xraft_append_latency_seconds, xraft_log_entries_total).
+    # implementation-plan.md Stage 6.1 lists the MVP subset for the initial /metrics
+    # endpoint: xraft_current_term, xraft_commit_index, xraft_role,
+    # xraft_current_leader, xraft_election_latency_seconds, xraft_append_records_total.
     # The full set below from architecture.md §7 is the target; Stage 6.1's
-    # subset is the MVP that ships first and is extended in later stages.
+    # subset is the MVP that ships first and is extended in Stages 7.1 and 7.3.
     When an operator queries the `/metrics` endpoint on any node
     Then the response includes gauges matching architecture.md §7:
       | metric                              | type      | description                                    |
@@ -762,11 +762,13 @@ are stated explicitly:
    endpoint exists and exposes the canonical metric set from `architecture.md` §7
    in Prometheus format.
    Feature 15's canonical metric set is drawn from `architecture.md` §7.
-   `implementation-plan.md` Stage 6.1 defines a smaller initial subset
-   (`xraft_current_term`, `xraft_commit_index`, `xraft_role`, `xraft_election_count`,
-   `xraft_append_latency_seconds`, `xraft_log_entries_total`); the full `architecture.md` §7
-   set is the target and may be delivered incrementally across stages.  Feature 15 tests the
-   full target set with a note about this phased delivery.
+   `implementation-plan.md` Stage 6.1 defines a smaller initial MVP subset
+   (`xraft_current_term`, `xraft_commit_index`, `xraft_role`, `xraft_current_leader`,
+   `xraft_election_latency_seconds`, `xraft_append_records_total`); the remaining
+   canonical metrics from `architecture.md` §7 are added in Stage 7.1
+   (`xraft_replication_lag`, `xraft_commit_latency_seconds`, `xraft_fetch_requests_total`)
+   and Stage 7.3 (`xraft_snapshot_installs_total`, `xraft_log_end_offset`).
+   Feature 15 tests the full target set with a note about this phased delivery.
 
 6. **Snapshot transfer** — uses `FetchSnapshot` RPC with chunked streaming per `tech-spec.md`
    §2.2. Chunk size and transport details are implementation-level decisions deferred to
