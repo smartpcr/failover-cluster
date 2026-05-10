@@ -17,14 +17,15 @@ reusable consensus library and standalone cluster binary. The system provides:
 - **Static quorum membership** with a fixed voter set defined at cluster bootstrap.
   Dynamic membership (`AddVoter`/`RemoveVoter`) is **out of scope for v1** and
   deferred to a future story entirely (per `tech-spec.md` §2.7).
-- **A consumer-provided `StateMachine` trait** with `apply`, `snapshot`, and
-  `restore` methods (per `implementation-plan.md` Stage 5.1). XRAFT does not
+- **A consumer-provided `StateMachine` trait** with `apply`, `query`, `snapshot`,
+  and `restore` methods (per `implementation-plan.md` Stage 5.1). XRAFT does not
   prescribe application semantics — consumers implement their own state machine
   (e.g., a key-value store) and inject it at server startup. Library consumers
-  submit proposals through `xraft-server`'s embedded `propose` API (see §2.4);
-  reads against committed state are performed directly on the consumer-owned
-  `StateMachine` instance, or via linearizable reads by proposing a read-type
-  command and inspecting the `apply` return value.
+  submit proposals through `xraft-server`'s embedded `propose(command)` API and
+  perform reads via the embedded `read(query)` API (see §2.4); the `read` API
+  routes to `StateMachine::query` against committed state (see §4.1).
+  Alternatively, consumers can achieve linearizable reads by proposing a
+  read-type command through `propose` and inspecting the `apply` return value.
 
 The implementation accepts any voter count ≥ 1. Odd-numbered clusters (3, 5, 7)
 are recommended because they maximise fault tolerance per node; even-numbered
@@ -161,8 +162,8 @@ service RaftService {
 - `leader_epoch: u64` — fences stale leaders; followers reject requests from old epochs.
 
 **Transport configuration:**
-- Listener address per node: `controller.listener.address`.
-- TLS optional, configured via `tls.cert_path` / `tls.key_path`.
+- Listener address per node: `listen_addr` (e.g., `"0.0.0.0:6001"`).
+- TLS optional, configured via `tls_cert_path` / `tls_key_path`.
 - Connection backoff: exponential with jitter, max 5 s.
 
 ### 2.4 `xraft-server` — Node Runtime
@@ -174,10 +175,10 @@ is internal-only; see §2.5).
 
 | Struct | Role |
 |---|---|
-| `XRaftServer` | Top-level server. Initialises `RaftNode`, `FileLogStore`, `GrpcTransport`, starts the event loop. Exposes an embedded `propose(command: Bytes) -> Result<LogIndex>` API for library consumers to submit commands to the leader. Reads against committed state are performed by consumers directly on their `StateMachine` instance (which they own and inject at startup); alternatively, consumers can achieve linearizable reads by proposing a read-type command through `propose` and inspecting the `apply` return value. This embedded API is the sanctioned entry point for application code — `xraft-client` is internal-only and exposes no `propose` surface (per `tech-spec.md` §2.6 and `e2e-scenarios.md` Feature 11). `implementation-plan.md` Stage 6.2 cross-references this API. |
+| `XRaftServer` | Top-level server. Initialises `RaftNode`, `FileLogStore`, `GrpcTransport`, starts the event loop. Exposes an embedded `propose(command: Bytes) -> Result<LogIndex>` API for library consumers to submit commands to the leader, and a `read(query: Bytes) -> Result<Bytes>` API that routes read queries to the consumer-provided `StateMachine::query` method against committed state (per `implementation-plan.md` Stage 5.1 and Stage 6.2). Together, `propose` and `read` form the sanctioned entry points for application code — `xraft-client` is internal-only and exposes no `propose`/`read` surface (per `tech-spec.md` §2.6 and `e2e-scenarios.md` Feature 11). |
 | `EventLoop` | Single-threaded async loop (Tokio). Processes `Input` from RPC handlers + timer ticks, feeds them to `RaftNode`, dispatches resulting `Action`s. |
 | `TickDriver` | Fires `Input::Tick` at `tick_interval` (default 50 ms). The core engine counts ticks to derive election and heartbeat timeouts. |
-| `NodeConfig` | TOML configuration loaded at startup. Maps directly to the `ClusterConfig` struct from `implementation-plan.md` Stage 1.2, which defines all of these fields: `node_id`, `cluster_id`, `data_dir`, `listen_addr`, `peers`, `bootstrap_voters`, `bootstrap_observers` (parsed into `VoterSet` at startup), `election_timeout_min_ms`, `election_timeout_max_ms`, `tick_interval_ms`, `fetch_interval_ms`, `snapshot_interval`, `max_log_entries_before_compaction`, `enable_check_quorum`, `enable_leader_lease`, `segment_max_bytes`, `snapshot_max_chunk_bytes`, and optional TLS fields. `NodeConfig` additionally includes deployment-specific fields not in `ClusterConfig`: `connect_timeout_ms`, `request_timeout_ms`, and `admin_listen_addr` (see §8 for the full reference). |
+| `NodeConfig` | TOML configuration loaded at startup. `NodeConfig` is a superset of `ClusterConfig` (per `implementation-plan.md` Stage 1.2), embedding `ClusterConfig` via a `#[serde(flatten)]` field and adding extension fields. **`ClusterConfig` core fields** (passed to `RaftNode` via `NodeConfig::into_cluster_config()`): `node_id`, `cluster_id`, `data_dir`, `listen_addr`, `peers`, `election_timeout_min_ms`, `election_timeout_max_ms`, `tick_interval_ms`, `fetch_interval_ms`, `snapshot_interval`, `max_log_entries_before_compaction`. **`NodeConfig` extension fields** (not in `ClusterConfig`): `bootstrap_voters`, `bootstrap_observers` (parsed into `VoterSet` at startup), `enable_check_quorum` (default true), `enable_leader_lease` (default false), `segment_max_bytes` (default 64 MiB), `snapshot_max_chunk_bytes` (default 1 MiB), `connect_timeout_ms`, `request_timeout_ms`, `admin_listen_addr`, and optional TLS fields (`tls_enabled`, `tls_cert_path`, `tls_key_path`). See §8 for the full reference. |
 | `MetricsRegistry` | Prometheus-compatible metrics: `current_leader`, `current_term`, `commit_latency_avg`, `append_records_rate`, `election_latency_avg`, `log_end_offset`, `replication_lag`. |
 | `AdminApi` | HTTP API for operational commands: cluster status, trigger snapshot, node health. |
 
@@ -218,7 +219,7 @@ an `AdminClient` for operational queries. `xraft-client` is **not** an
 external consumer SDK — no `propose`/`read` API for outside callers is in
 scope for v1 (per `tech-spec.md` §2.6 and `e2e-scenarios.md` Feature 11).
 Library consumers submit proposals and reads through `xraft-server`'s
-embedded server API instead.
+embedded server API (`propose` and `read`) instead.
 
 | Struct / Trait | Role |
 |---|---|
@@ -408,6 +409,7 @@ trait Transport: Send + Sync {
 
 trait StateMachine: Send + Sync {
     fn apply(&mut self, index: LogIndex, command: &[u8]) -> Result<Vec<u8>>;
+    fn query(&self, query: &[u8]) -> Result<Vec<u8>>;
     fn snapshot(&self) -> Result<Vec<u8>>;
     fn restore(&mut self, snapshot: &[u8]) -> Result<()>;
 }
@@ -708,22 +710,23 @@ Exposed via Prometheus endpoint (`/metrics`) on the admin HTTP port:
 ```toml
 # node.toml — per-node configuration
 #
-# NodeConfig maps directly to ClusterConfig from implementation-plan.md
-# Stage 1.2. All fields below are part of ClusterConfig unless noted.
-# The only NodeConfig-specific extensions (not in ClusterConfig) are
-# deployment-specific fields: connect_timeout_ms, request_timeout_ms,
-# and admin_listen_addr.
+# NodeConfig is a superset of ClusterConfig (per implementation-plan.md
+# Stage 1.2). NodeConfig embeds ClusterConfig via #[serde(flatten)] and
+# adds extension fields. xraft-server loads NodeConfig from TOML at
+# startup; xraft-core's RaftNode accepts only ClusterConfig (via
+# NodeConfig::into_cluster_config()) to keep the consensus engine
+# independent of deployment concerns.
 #
-#   ClusterConfig fields (Stage 1.2):
+#   ClusterConfig core fields (passed to RaftNode):
 #   node_id, cluster_id, data_dir, listen_addr, peers,
-#   bootstrap_voters, bootstrap_observers,
 #   election_timeout_min_ms, election_timeout_max_ms, tick_interval_ms,
-#   fetch_interval_ms, snapshot_interval, max_log_entries_before_compaction,
-#   enable_check_quorum, enable_leader_lease, segment_max_bytes,
-#   snapshot_max_chunk_bytes, tls
+#   fetch_interval_ms, snapshot_interval, max_log_entries_before_compaction
 #
-#   Additional NodeConfig fields (not in ClusterConfig):
-#   connect_timeout_ms, request_timeout_ms, admin_listen_addr
+#   NodeConfig extension fields (not in ClusterConfig):
+#   bootstrap_voters, bootstrap_observers, enable_check_quorum,
+#   enable_leader_lease, segment_max_bytes, snapshot_max_chunk_bytes,
+#   connect_timeout_ms, request_timeout_ms, admin_listen_addr,
+#   tls_enabled, tls_cert_path, tls_key_path
 
 node_id = 1
 cluster_id = "xraft-cluster-001"
@@ -752,16 +755,16 @@ election_timeout_min_ms = 150
 election_timeout_max_ms = 300
 fetch_interval_ms = 50
 
-# Feature flags (ClusterConfig fields per Stage 1.2)
+# Feature flags (NodeConfig extension fields per Stage 1.2)
 enable_check_quorum = true
 enable_leader_lease = false
 
-# Storage
+# Storage (NodeConfig extension fields per Stage 1.2)
 segment_max_bytes = 67_108_864       # 64 MiB per segment (per implementation-plan.md Stage 2.1)
 max_log_entries_before_compaction = 50_000
 snapshot_interval = 10_000           # snapshot every N committed entries
 
-# Snapshot transfer
+# Snapshot transfer (NodeConfig extension field per Stage 1.2)
 snapshot_max_chunk_bytes = 1_048_576 # 1 MiB per FetchSnapshot chunk
 
 # Network
