@@ -151,14 +151,14 @@ Feature: Log replication under normal conditions
     And node-0 is the leader in epoch 1
 
   Scenario: Client write is replicated via follower Fetch and committed
-    When a client sends command "SET x = 42" to node-0
+    When a client proposes an opaque command payload via `xraft-server`
     Then node-0 appends the entry at the next log index with epoch 1
     When node-1 sends a Fetch RPC with its current fetch_offset
     Then node-0 responds with the new entry and the current high watermark
     When node-2 also fetches and acknowledges the entry
     Then node-0 advances the high watermark (majority = 2 of 3 including leader)
     And on the next Fetch response, followers learn the new high watermark
-    And followers apply the committed entry to their state machines
+    And each node delivers the committed entry to the registered `StateMachine` trait callback
     And node-0 returns success to the client
 
   Scenario: Multiple entries are batched in a single Fetch response
@@ -601,7 +601,7 @@ Feature: Timing-sensitive behaviour and performance boundaries
     Given the Fetch interval is less than electionTimeout / 3
     When the leader is healthy
     Then no follower triggers an election due to missing Fetch responses
-    And the Fetch interval is recorded as a metric
+    And no unexpected elections are observed during a 10× electionTimeout window
 
   Scenario: Write commit latency under normal conditions
     When the leader appends a new entry to the log
@@ -658,7 +658,7 @@ Feature: Cluster metrics and health observability
   Scenario: Election event is logged and metered
     When a leader election occurs
     Then an event is emitted via `tracing` with: new_leader_id, epoch, election_latency_ms
-    And the `xraft_append_records_total` counter tracks total entries appended
+    And the `xraft_append_records_total` counter increments by 1 for the no-op entry the new leader appends on election
     And the `xraft_election_latency_seconds` histogram is updated
 
   Scenario: Metrics endpoint exposes canonical cluster gauges
