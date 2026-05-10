@@ -105,7 +105,7 @@ creation and loading. Provides file-backed implementations of the `LogStore`,
 | `LogStore` (trait) | `append(entries)`, `get(index)`, `get_range(start, end)`, `last_index()`, `last_term()`, `truncate_from(index)`, `term_at(index)`. |
 | `FileLogStore` | Implements `LogStore`. Splits the log into fixed-size segment files (`00000000000000000000.log`). Supports `fsync`-on-write for durability. Named `FileLogStore` per `implementation-plan.md` Stage 2.1. |
 | `SnapshotStore` (trait) | `save_snapshot(metadata, data)`, `load_latest_snapshot()`, `list_snapshots()`, `delete_snapshot(id)`. |
-| `FileSnapshotStore` | Implements `SnapshotStore`. Writes snapshots to `<data_dir>/snapshots/snapshot-<term>-<index>.bin` (naming convention follows `implementation-plan.md` Stage 2.3). |
+| `FileSnapshotStore` | Implements `SnapshotStore`. Writes snapshots to `<data_dir>/snapshots/snapshot-<term>-<index>.bin`. The base naming convention (`snapshot-{term}-{index}.bin`) follows `implementation-plan.md` Stage 2.3; on disk, term and index are zero-padded to fixed widths for lexicographic ordering (e.g., `snapshot-0000000003-00000000000000000512.bin`). |
 | `HardStateStore` (trait) | `persist(HardState)`, `load() -> Option<HardState>`. |
 | `FileHardStateStore` | Implements `HardStateStore`. Atomic write to `quorum-state` file (write-tmp + rename). |
 | `LogSegment` | One segment file. Tracks base offset, byte size, entry count. |
@@ -171,10 +171,10 @@ is internal-only; see §2.5).
 
 | Struct | Role |
 |---|---|
-| `XRaftServer` | Top-level server. Initialises `RaftNode`, `FileLogStore`, `GrpcTransport`, starts the event loop. Exposes `propose(command: Bytes) -> Result<LogIndex>` for library consumers to submit commands to the leader. The consumer-provided `StateMachine` (see §4.1) receives applied entries via its `apply` callback; reads against committed state are the consumer's responsibility (XRAFT does not prescribe application-level read semantics — `tech-spec.md` §3 and `implementation-plan.md` Stage 5.1). |
+| `XRaftServer` | Top-level server. Initialises `RaftNode`, `FileLogStore`, `GrpcTransport`, starts the event loop. Exposes an embedded API for library consumers: `propose(command: Bytes) -> Result<LogIndex>` submits commands to the leader, and `read(query: Bytes) -> Result<Bytes>` routes read queries to the consumer-provided `StateMachine`'s `query` method against committed state (see §4.1). This embedded API is the sanctioned entry point for application code — `xraft-client` is internal-only and exposes no `propose`/`read` surface (per `tech-spec.md` §2.6 and `e2e-scenarios.md` Feature 11). `implementation-plan.md` Stage 6.2 cross-references this API. |
 | `EventLoop` | Single-threaded async loop (Tokio). Processes `Input` from RPC handlers + timer ticks, feeds them to `RaftNode`, dispatches resulting `Action`s. |
 | `TickDriver` | Fires `Input::Tick` at `tick_interval` (default 50 ms). The core engine counts ticks to derive election and heartbeat timeouts. |
-| `NodeConfig` | TOML configuration with a flat field layout matching `ClusterConfig` from `implementation-plan.md` Stage 1.2: `node_id`, `cluster_id`, `data_dir`, `listen_addr`, `peers`, `bootstrap_voters`, `bootstrap_observers`, `election_timeout_min_ms`, `election_timeout_max_ms`, `tick_interval_ms`, `fetch_interval_ms`, `snapshot_interval`, `max_log_entries_before_compaction`, `enable_check_quorum`, `enable_leader_lease`, `segment_max_bytes` (see §8 for the full reference and mapping). |
+| `NodeConfig` | TOML configuration loaded at startup. Includes all `ClusterConfig` fields from `implementation-plan.md` Stage 1.2 (`node_id`, `cluster_id`, `data_dir`, `listen_addr`, `peers`, `election_timeout_min_ms`, `election_timeout_max_ms`, `tick_interval_ms`, `fetch_interval_ms`, `snapshot_interval`, `max_log_entries_before_compaction`) plus additional operational fields not in `ClusterConfig`: `bootstrap_voters`, `bootstrap_observers` (parsed into `VoterSet` at startup), `enable_check_quorum`, `enable_leader_lease`, `segment_max_bytes`, `snapshot_max_chunk_bytes`, `connect_timeout_ms`, `request_timeout_ms`, `admin_listen_addr`, and optional TLS fields (see §8 for the full reference). |
 | `MetricsRegistry` | Prometheus-compatible metrics: `current_leader`, `current_term`, `commit_latency_avg`, `append_records_rate`, `election_latency_avg`, `log_end_offset`, `replication_lag`. |
 | `AdminApi` | HTTP API for operational commands: cluster status, trigger snapshot, node health. |
 
@@ -340,7 +340,7 @@ Only entries at or below HW are considered committed.
 │       ├── 00000000000000001024.log           # segment 1
 │       ├── 00000000000000001024.index
 │       └── leader-epoch-checkpoint            # (epoch, start_offset) pairs
-├── snapshots/
+├── snapshots/                                # zero-padded term (10 digits) + index (20 digits) for sort order
 │   ├── snapshot-0000000003-00000000000000000512.bin  # snapshot at term 3, index 512
 │   └── snapshot-0000000005-00000000000000001024.bin
 └── node.toml                                 # node configuration
@@ -406,6 +406,7 @@ trait Transport: Send + Sync {
 
 trait StateMachine: Send + Sync {
     fn apply(&mut self, index: LogIndex, command: &[u8]) -> Result<Vec<u8>>;
+    fn query(&self, query: &[u8]) -> Result<Vec<u8>>;
     fn snapshot(&self) -> Result<Vec<u8>>;
     fn restore(&mut self, snapshot: &[u8]) -> Result<()>;
 }
@@ -706,26 +707,21 @@ Exposed via Prometheus endpoint (`/metrics`) on the admin HTTP port:
 ```toml
 # node.toml — per-node configuration
 #
-# The on-disk config surface maps directly to ClusterConfig fields
-# defined in implementation-plan.md Stage 1.2. The table below shows
-# the correspondence:
+# NodeConfig is a superset of ClusterConfig from implementation-plan.md
+# Stage 1.2. The core ClusterConfig fields are listed first; additional
+# operational fields (bootstrap sets, feature flags, storage tuning,
+# network timeouts, admin HTTP, TLS) extend the surface for production
+# deployment without changing the core config struct.
 #
-#   TOML field                  → ClusterConfig field
-#   node_id                     → node_id
-#   cluster_id                  → cluster_id
-#   data_dir                    → data_dir
-#   listen_addr                 → listen_addr
-#   peers                       → peers (Vec of peer addresses)
-#   bootstrap_voters            → (parsed into VoterSet at startup)
-#   bootstrap_observers         → (parsed into observer set at startup)
-#   election_timeout_min_ms     → election_timeout_min_ms
-#   election_timeout_max_ms     → election_timeout_max_ms
-#   tick_interval_ms            → tick_interval_ms
-#   fetch_interval_ms           → fetch_interval_ms
-#   snapshot_interval           → snapshot_interval
-#   max_log_entries_before_compaction → max_log_entries_before_compaction
-#   enable_check_quorum         → enable_check_quorum
-#   enable_leader_lease         → enable_leader_lease
+#   Core ClusterConfig fields (Stage 1.2):
+#   node_id, cluster_id, data_dir, listen_addr, peers,
+#   election_timeout_min_ms, election_timeout_max_ms, tick_interval_ms,
+#   fetch_interval_ms, snapshot_interval, max_log_entries_before_compaction
+#
+#   Additional NodeConfig fields (not in ClusterConfig):
+#   bootstrap_voters, bootstrap_observers, enable_check_quorum,
+#   enable_leader_lease, segment_max_bytes, snapshot_max_chunk_bytes,
+#   connect_timeout_ms, request_timeout_ms, tls_*, admin_listen_addr
 
 node_id = 1
 cluster_id = "xraft-cluster-001"
@@ -748,11 +744,13 @@ bootstrap_observers = [
   { node_id = 3, host = "observer0.example.com", port = 6003 },
 ]
 
-# Timing — all fields directly map to ClusterConfig
+# Timing — core ClusterConfig fields
 tick_interval_ms = 50
 election_timeout_min_ms = 150
 election_timeout_max_ms = 300
 fetch_interval_ms = 50
+
+# Feature flags (NodeConfig extensions, not in ClusterConfig)
 enable_check_quorum = true
 enable_leader_lease = false
 
@@ -795,5 +793,5 @@ admin_listen_addr = "0.0.0.0:9090"
 ## 10. Relationship to Sibling Documents
 
 - **`tech-spec.md`**: Defines the problem statement, scope boundaries (in-scope vs. out-of-scope), hard constraints (language, concurrency model, persistence, timing), identified risks, and key resolved decisions (gRPC transport, protobuf encoding, pull-based replication). This document describes *what* the components are and how they interact; tech-spec establishes *why* those choices were made and *what limits* they operate under. **Crate naming:** all sibling documents now use the same names — `xraft-storage`, `xraft-transport`, `xraft-test` — per `tech-spec.md` §5.6 and §7 decision 4. **`xraft-client` scope:** `xraft-client` is an **internal** crate providing (a) peer-to-peer RPC (Fetch, Vote, FetchSnapshot) for inter-node communication and (b) admin/operational queries via `AdminClient`. It is **not** an external consumer SDK — no `propose`/`read` API for outside callers is in scope for v1 (per `tech-spec.md` §2.6 and `e2e-scenarios.md` Feature 11). Library consumers submit proposals and reads through `xraft-server`'s embedded API (see §2.4). **Dynamic membership:** `AddVoter`/`RemoveVoter` is **out of scope for v1** and deferred to a future story entirely — it is not a stretch goal within XRAFT (per `tech-spec.md` §2.7/§3/§7 and `e2e-scenarios.md` Feature 12). The `ConfigChange(VoterSet)` variant is reserved in `EntryPayload` so the log format is forward-compatible, but the `RaftNode` rejects any `ConfigChange` proposal with `UNSUPPORTED`. The v1 baseline uses static membership (voter set fixed at bootstrap) with observer support.
-- **`implementation-plan.md`**: Breaks this architecture into ordered implementation phases with crate-level milestones. References component names from this document. Where `implementation-plan.md` uses the name `InstallSnapshot`, it refers to the same operation as `FetchSnapshot` defined here. **Proto ownership:** `proto/raft.proto`, `build.rs`, and the generated Protobuf types all live in `xraft-core` (per `implementation-plan.md` Stage 1.3); `xraft-core/src/message.rs` re-exports the generated types. `xraft-transport` imports these proto types from `xraft-core` and provides the runtime gRPC server/client implementation (see §2.3). **Trait locations:** `implementation-plan.md` Stage 2.1 and Stage 2.3 confirm that all trait definitions (`LogStore`, `SnapshotStore`) live in `xraft-core`; implementation crates import and implement them (see §4.1). **Trait signatures:** §4.1 method names and shapes are aligned with `implementation-plan.md` — `LogStore` uses `append`, `get`, `get_range`, `last_index`, `last_term`, `truncate_from`, `term_at` (Stage 2.1); `SnapshotStore` uses `save_snapshot`, `load_latest_snapshot`, `list_snapshots`, `delete_snapshot(id)` (Stage 2.3); `Transport` uses `send_vote`, `send_pre_vote`, `send_fetch`, `send_fetch_snapshot`, `start_server` (Stage 4.1). **HardState fields:** `HardState` contains three fields: `current_term: Term`, `voted_for: Option<NodeId>`, and `commit_index: LogIndex` (per `implementation-plan.md` Stage 2.2 and Stage 7.2). All three are persisted atomically to the `quorum-state` file alongside `VoterSet`. `last_applied` is volatile, rebuilt from the log on recovery by replaying committed entries from `commit_index`. **Log implementation naming:** the concrete log implementation is named `FileLogStore` (per `implementation-plan.md` Stage 2.1), backed by append-only segment files. **Segment default size:** 64 MiB (per `implementation-plan.md` Stage 2.1). **NodeId type:** `NodeId` is `u64` everywhere (per `implementation-plan.md` Stage 1.2). **Snapshot filename convention:** this document adopts the `snapshot-{term}-{index}.bin` naming from `implementation-plan.md` Stage 2.3.
+- **`implementation-plan.md`**: Breaks this architecture into ordered implementation phases with crate-level milestones. References component names from this document. Where `implementation-plan.md` uses the name `InstallSnapshot`, it refers to the same operation as `FetchSnapshot` defined here. **Proto ownership:** `proto/raft.proto`, `build.rs`, and the generated Protobuf types all live in `xraft-core` (per `implementation-plan.md` Stage 1.3); `xraft-core/src/message.rs` re-exports the generated types. `xraft-transport` imports these proto types from `xraft-core` and provides the runtime gRPC server/client implementation (see §2.3). **Trait locations:** `implementation-plan.md` Stage 2.1 and Stage 2.3 confirm that all trait definitions (`LogStore`, `SnapshotStore`) live in `xraft-core`; implementation crates import and implement them (see §4.1). **Trait signatures:** §4.1 method names and shapes are aligned with `implementation-plan.md` — `LogStore` uses `append`, `get`, `get_range`, `last_index`, `last_term`, `truncate_from`, `term_at` (Stage 2.1); `SnapshotStore` uses `save_snapshot`, `load_latest_snapshot`, `list_snapshots`, `delete_snapshot(id)` (Stage 2.3); `Transport` uses `send_vote`, `send_pre_vote`, `send_fetch`, `send_fetch_snapshot`, `start_server` (Stage 4.1). **HardState fields:** `HardState` contains three fields: `current_term: Term`, `voted_for: Option<NodeId>`, and `commit_index: LogIndex` (per `implementation-plan.md` Stage 2.2 and Stage 7.2). All three are persisted atomically to the `quorum-state` file alongside `VoterSet`. `last_applied` is volatile, rebuilt from the log on recovery by replaying committed entries from `commit_index`. **Log implementation naming:** the concrete log implementation is named `FileLogStore` (per `implementation-plan.md` Stage 2.1), backed by append-only segment files. **Segment default size:** 64 MiB (per `implementation-plan.md` Stage 2.1). **NodeId type:** `NodeId` is `u64` everywhere (per `implementation-plan.md` Stage 1.2). **Snapshot filename convention:** this document adopts the `snapshot-{term}-{index}.bin` naming from `implementation-plan.md` Stage 2.3, adding fixed-width zero-padding for lexicographic ordering on disk (see §2.2 and §3.3).
 - **`e2e-scenarios.md`**: Defines integration test scenarios (election under partition, snapshot catch-up, check-quorum step-down) against the sequence flows in Section 5.
