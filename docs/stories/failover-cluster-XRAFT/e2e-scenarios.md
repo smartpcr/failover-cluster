@@ -275,8 +275,13 @@ Feature: Pull-based metadata replication via Fetch RPCs
 
 ```gherkin
 Feature: Durable state survives crashes and restarts
-  The three pieces of durable state — currentEpoch, votedFor, and log —
-  must be persisted synchronously before responding to any RPC.
+  The `quorum-state` file (per architecture.md §3.1) persists: `HardState`
+  (currentEpoch, votedFor), `commit_index`, and `VoterSet` — all written
+  atomically (write-tmp + rename + fsync) before responding to any RPC.
+  The log itself is persisted via append-only segment files (per tech-spec
+  §5.3).  On recovery, `last_applied` is volatile and rebuilt by replaying
+  only *committed* log entries (those at or below the persisted
+  `commit_index`).
 
   Background:
     Given a cluster of 3 nodes [node-0, node-1, node-2]
@@ -284,18 +289,23 @@ Feature: Durable state survives crashes and restarts
   Scenario: Node restarts and recovers persisted state
     Given node-1 is a follower in epoch 3 and has voted for node-0
     And node-1's log contains entries up to index 20
+    And node-1's persisted commit_index is 18
     When node-1 crashes and restarts
-    Then node-1 reads currentEpoch=3 from stable storage
-    And node-1 reads votedFor=node-0 from stable storage
-    And node-1 replays its log from index 1 to 20 to rebuild state machine
+    Then node-1 reads currentEpoch=3 from the quorum-state file
+    And node-1 reads votedFor=node-0 from the quorum-state file
+    And node-1 reads commit_index=18 from the quorum-state file
+    And node-1 replays only committed log entries (index 1 through 18) to rebuild its state machine
+    And entries 19–20 remain in the log but are NOT applied until they are committed
     And node-1 resumes as a follower without triggering a new election
 
   Scenario: Node recovers from snapshot plus log tail
     Given node-1 has a snapshot at index 50 and log entries from 51 to 75
+    And node-1's persisted commit_index is 72
     When node-1 restarts
     Then node-1 loads the snapshot to restore state machine at index 50
-    And node-1 replays log entries 51 through 75
-    And node-1's state machine is identical to a full log replay
+    And node-1 replays only committed log entries 51 through 72
+    And entries 73–75 remain in the log but are NOT applied until committed
+    And node-1's state machine is identical to a full committed-entry replay
 
   Scenario: Crash before persisting vote does not double-vote
     Given node-2 receives RequestVote from node-0 for epoch 4
@@ -435,12 +445,16 @@ Feature: Check Quorum prevents split-brain
 
 ```gherkin
 Feature: Inter-node request routing and leader discovery
-  Per tech-spec §2.6 and architecture §2.5, `xraft-client` is an **internal**
-  crate providing peer-to-peer RPC (Fetch, Vote, FetchSnapshot) and
-  admin/operational queries (status, metrics, health, snapshot triggering).
-  It is **not** an external consumer SDK — no external `propose`/`read` API
-  for outside callers is in scope for v1.  Leader discovery occurs through
-  Fetch RPC responses that carry leader_id and epoch metadata.
+  Per tech-spec §2.6, `xraft-client` in v1 provides peer-to-peer RPC
+  (Fetch, Vote, FetchSnapshot) and admin/operational queries (status,
+  metrics, health, snapshot triggering).  It is **not** an external
+  consumer SDK — no external `propose`/`read` API for outside callers
+  is in scope for v1.  (Note: architecture.md §2.5 currently describes
+  `xraft-client` as dual-role with an external consumer API; this draft
+  follows tech-spec §2.6 which scopes v1 to internal/admin use only.
+  The sibling docs should be aligned in a future iteration.)
+  Leader discovery occurs through Fetch RPC responses that carry
+  leader_id and epoch metadata.
 
   Background:
     Given a cluster of 3 nodes
@@ -602,11 +616,17 @@ Feature: Timing-sensitive behaviour and performance boundaries
     # no specific p99 threshold is mandated.  This scenario validates that the
     # commit sequence completes correctly, not that it meets a latency target.
 
-  Scenario: Leader fsync runs concurrently with Fetch serving
+  Scenario: Leader fsync completes before serving entry via Fetch
+    # Per tech-spec §5.3 and §6.2, fsync MUST complete before the
+    # corresponding RPC response is sent.  The leader does NOT serve
+    # an entry to followers until its own fsync for that entry finishes.
     When the leader appends an entry to its local log
-    Then the leader initiates fsync for its own durability
-    And serves the new entry to followers via their next Fetch RPC concurrently
-    And commits as soon as a majority has acknowledged (including itself after fsync)
+    Then the leader fsyncs the entry to durable storage
+    And only after fsync completes does the leader make the entry available to Fetch responses
+    And followers retrieve the entry on their next Fetch RPC (after leader fsync)
+    And the leader commits once a majority (including itself) has durably stored the entry
+    # Parallelism is between fsync and *preparing* the next batch, not
+    # between fsync and responding (per tech-spec §6.2).
 ```
 
 ---
@@ -720,17 +740,26 @@ The following design decisions are resolved in sibling docs and reflected in the
    is rejected with `UNSUPPORTED`.  Feature 12 tests static membership, observer join,
    and the rejection of dynamic membership commands.
 
-4. **Internal-only client (`xraft-client`)** — per `tech-spec.md` §2.6 and
-   `architecture.md` §2.5, `xraft-client` is an **internal** crate providing
-   peer-to-peer RPC (Fetch, Vote, FetchSnapshot) and admin/operational queries
-   (status, metrics, health, snapshot triggering).  It is **not** an external consumer
-   SDK — no external `propose`/`read` API for outside callers is in scope for v1.
+4. **Internal-only client (`xraft-client`) for v1** — per `tech-spec.md` §2.6,
+   `xraft-client` in v1 provides peer-to-peer RPC (Fetch, Vote, FetchSnapshot) and
+   admin/operational queries (status, metrics, health, snapshot triggering).  It is
+   **not** an external consumer SDK — no external `propose`/`read` API for outside
+   callers is in scope for v1.  (Note: `architecture.md` §2.5 currently describes
+   `xraft-client` as dual-role with external `propose`/`read`; these scenarios follow
+   `tech-spec.md` §2.6 which scopes v1 to internal/admin use.  The sibling docs should
+   be aligned in a future iteration.)
    Feature 11 tests internal routing, leader discovery via Fetch responses, and
    AdminClient operational queries.
 
-5. **Observability endpoints**— `/health` (liveness/readiness) and `/metrics` (OpenTelemetry
-   format) per `tech-spec.md` §2.4.  Feature 15's canonical metric set is drawn from
-   `architecture.md` §7.  `implementation-plan.md` Stage 6.1 defines a smaller initial subset
+5. **Observability endpoints** — `/health` (liveness/readiness) and `/metrics`
+   per `tech-spec.md` §2.4.  **Metrics format:** the operator has resolved that
+   cluster metrics are exposed in **OpenTelemetry** format (OTLP).  (Note: sibling
+   docs `tech-spec.md` §5.6 and `implementation-plan.md` Stage 1.1 currently reference
+   `prometheus-client` for Prometheus exposition format; those docs should be updated
+   to align with the OpenTelemetry decision.  Until aligned, these scenarios specify
+   OpenTelemetry as authoritative per the operator answer.)
+   Feature 15's canonical metric set is drawn from `architecture.md` §7.
+   `implementation-plan.md` Stage 6.1 defines a smaller initial subset
    (`xraft_current_term`, `xraft_commit_index`, `xraft_role`, `xraft_election_count`,
    `xraft_append_latency_seconds`, `xraft_log_entries_total`); the full `architecture.md` §7
    set is the target and may be delivered incrementally across stages.  Feature 15 tests the
