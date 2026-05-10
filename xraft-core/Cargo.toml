@@ -1,13 +1,14 @@
 [package]
 name = "xraft-core"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-bytes = { workspace = true }
-tracing = { workspace = true }
-uuid = { workspace = true }
-rand = { workspace = true }
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+bytes = "1"
+tracing = "0.1"
