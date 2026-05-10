@@ -96,7 +96,7 @@ storyId: "failover-cluster:XRAFT"
 
 ### Implementation Steps
 - [ ] Define `HardStateStore` trait in `xraft-core/src/storage.rs` with methods: `persist(state: &HardState) -> Result<()>`, `load() -> Result<Option<HardState>>` — trait lives in `xraft-core` per `architecture.md` §4.1
-- [ ] Define `HardState` struct in `xraft-core/src/types.rs` with fields: `current_term: Term`, `voted_for: Option<NodeId>` — only safety-critical voting state is persisted (per `architecture.md` §2.1 which defines `HardState` as containing only `current_term` and `voted_for`); `commit_index` and `last_applied` are volatile, rebuilt from the log on recovery by scanning committed entries
+- [ ] Define `HardState` struct in `xraft-core/src/types.rs` with fields: `current_term: Term`, `voted_for: Option<NodeId>`, `commit_index: LogIndex` — all three fields are persisted atomically to the `quorum-state` file (per `architecture.md` §10 cross-ref and §3.1 which list `commit_index` as part of the durable quorum state); `last_applied` is volatile, rebuilt from the log on recovery by replaying committed entries from `commit_index`
 - [ ] Implement `FileHardStateStore` in `xraft-storage/src/state.rs` that persists `HardState` as JSON to a `quorum-state` file with atomic write (write to temp file then rename) for crash safety, consistent with KRaft's `quorum-state` pattern (per `tech-spec.md` §5.3)
 - [ ] Implement `load()` that reads state on startup with fallback to default initial state (term=0, voted_for=None)
 - [ ] Add validation in `persist()` that term never decreases and voted_for is only set once per term
@@ -290,15 +290,13 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Scenario: graceful-shutdown — Given a running server, When SIGTERM is received, Then state is persisted, connections are drained, and the process exits with code 0
 - [ ] Scenario: health-endpoint — Given a running server, When GET /health is called, Then it returns JSON with node_id, role, term, and leader_id fields
 
-## Stage 6.2: Dual-Role Client SDK
+## Stage 6.2: Internal Peer RPC and Admin Client
 
 ### Implementation Steps
 - [ ] Implement `PeerClient` in `xraft-client/src/peer.rs` wrapping a `tonic` gRPC channel to a specific peer, providing typed methods for `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` RPCs with connection lifecycle management
 - [ ] Implement `ConnectionPool` in `xraft-client/src/pool.rs` maintaining lazy-initialized `PeerClient` instances keyed by `NodeId`, with automatic reconnection on channel failure
-- [ ] Implement leader discovery: `PeerClient` tracks last-known leader via hints returned in `FetchResponse` and `VoteResponse` messages; on `NOT_LEADER` errors, transparently retries against the hinted leader
-- [ ] Implement `AdminClient` in `xraft-client/src/admin.rs` connecting to a node's HTTP admin endpoint for operational queries (cluster status, trigger snapshot, node health)
-- [ ] Implement `XRaftClient` external consumer API in `xraft-client/src/client.rs` exposing `propose(data: Bytes) -> Result<ProposalId>` and `read(key: &[u8]) -> Result<Vec<u8>>` for callers outside the cluster (per `architecture.md` §2.5 which defines `xraft-client` as dual-role and `e2e-scenarios.md` Feature 11 which tests both internal and external APIs); `propose` forwards to the current leader via gRPC and awaits commit confirmation; `read` is served from the leader (or locally if leader lease is active); **cross-doc note:** `tech-spec.md` §2.6 describes `xraft-client` as internal-only — this plan follows the dual-role model from `architecture.md` and `e2e-scenarios.md` which include external consumer APIs in v1 scope
-- [ ] Implement leader redirection in `XRaftClient`: on `NOT_LEADER` error with leader hint, transparently retry against the hinted leader; maintain a cached leader address for subsequent calls
+- [ ] Implement leader discovery: `PeerClient` tracks last-known leader via hints returned in `FetchResponse` and `VoteResponse` messages; followers cache the leader hint for internal routing decisions
+- [ ] Implement `AdminClient` in `xraft-client/src/admin.rs` connecting to a node's HTTP admin endpoint for operational queries (cluster status, trigger snapshot, node health) — per `architecture.md` §2.5 and `e2e-scenarios.md` Alignment Note 4, `xraft-client` is an **internal-only** crate for peer-to-peer RPC (Fetch, Vote, FetchSnapshot) and admin/operational queries; no external consumer SDK (`propose`/`read`) is in scope for v1; `tech-spec.md` §2.6 describes it as dual-role but `architecture.md` §2.5 and `e2e-scenarios.md` Alignment Note 4 take precedence as the corrected position
 - [ ] Add timeout and retry configuration with sensible defaults (connect: 5s, request: 30s, backoff with jitter)
 
 ### Dependencies
@@ -308,8 +306,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Scenario: peer-client-reconnect — Given a PeerClient connected to a peer that restarts, When the next RPC is sent, Then the client reconnects automatically and the RPC succeeds
 - [ ] Scenario: connection-pool-lazy-init — Given a ConnectionPool for a 5-node cluster, When a PeerClient for node 3 is requested twice, Then the same channel is reused without creating a new connection
 - [ ] Scenario: admin-client-status — Given a running node with admin HTTP endpoint, When AdminClient queries cluster status, Then it returns the current leader, term, and voter set
-- [ ] Scenario: external-propose-and-read — Given a running 3-node cluster with a leader, When `XRaftClient.propose(data)` is called followed by `XRaftClient.read(key)`, Then the proposal is committed and the read returns the committed data
-- [ ] Scenario: external-client-leader-redirect — Given an `XRaftClient` connected to a follower, When `propose()` is called, Then the client receives a `NOT_LEADER` redirect, retries against the leader, and the proposal succeeds
+- [ ] Scenario: leader-hint-tracking — Given a follower that receives a FetchResponse with leader_id=2, When subsequent RPCs need leader routing, Then the cached leader hint is used without additional discovery
 
 # Phase 7: Advanced Raft Features
 
@@ -335,12 +332,12 @@ storyId: "failover-cluster:XRAFT"
 ## Stage 7.2: Static Voter Set Bootstrap and Observer Support
 
 ### Implementation Steps
-- [ ] Implement cluster bootstrap from a fixed voter set defined in configuration: on first start with no persisted state, initialize `VoterSet` from config and persist it alongside `HardState` in the `quorum-state` file (as a separate top-level field — `HardState` itself contains only `current_term` and `voted_for` per `architecture.md` §2.1)
+- [ ] Implement cluster bootstrap from a fixed voter set defined in configuration: on first start with no persisted state, initialize `VoterSet` from config and persist it alongside `HardState` in the `quorum-state` file (as a separate top-level field — `HardState` itself contains `current_term`, `voted_for`, and `commit_index` per Stage 2.2)
 - [ ] Implement `VoterSet` validation at startup: require at least 1 voter; warn (but allow) even-numbered voter sets since they have lower fault tolerance per node; verify the local node is either in the voter set or registered as an observer
 - [ ] Implement `Observer` role: non-voting nodes that replicate the log via Fetch RPCs for read scaling or standby purposes, without participating in elections or quorum calculations
 - [ ] Implement observer registration: observers connect to the leader and send Fetch RPCs like voters, but the leader excludes them from high-watermark quorum computation
 - [ ] Persist the `VoterSet` in snapshots so that nodes restoring from a snapshot know the cluster membership without re-reading configuration
-- [ ] Implement `AddVoter`/`RemoveVoter` command rejection: any attempt to issue an `AddVoter` or `RemoveVoter` command must return an `UNSUPPORTED` error with a message indicating dynamic membership is not available in the core v1 deliverable (per `e2e-scenarios.md` Feature 12); the voter set remains unchanged
+- [ ] Implement `AddVoter`/`RemoveVoter` command rejection: any attempt to issue an `AddVoter` or `RemoveVoter` command must return an `UNSUPPORTED` error with a message indicating dynamic membership is **out of scope for v1** and deferred to a future story entirely — it is not a stretch goal within XRAFT (per `architecture.md` §10 and `e2e-scenarios.md` Alignment Note 3 which both state dynamic membership is deferred to a future story; `tech-spec.md` §2.7/§7 describes it as a stretch goal within this story — this plan follows the `architecture.md`/`e2e-scenarios.md` position as authoritative); the voter set remains unchanged
 
 ### Dependencies
 - phase-advanced-raft-features/stage-check-quorum-and-leader-lease
