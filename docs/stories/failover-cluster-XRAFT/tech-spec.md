@@ -58,7 +58,7 @@ The following capabilities are in scope for the XRAFT story:
 | Capability | Detail |
 |---|---|
 | **Leader election** | Term-based voting with randomised election timeouts, `RequestVote` RPC, majority quorum |
-| **Log replication** | Append-only log with high-watermark tracking and log consistency checks (`prevLogIndex` / `prevLogTerm`).  In our KRaft-inspired model, followers pull entries via `Fetch` RPCs rather than receiving leader-pushed `AppendEntries` (see §2.2); the consistency guarantees are identical to textbook Raft — only the initiator of the RPC changes. |
+| **Log replication** | Append-only log with high-watermark tracking and epoch-based consistency checks.  Followers include `fetch_offset` (the next log index they want) and `last_fetched_epoch` (the term/epoch of the last entry they hold) in each `Fetch` RPC.  The leader validates these against its own log; on mismatch it returns a `DivergingEpoch` response indicating the truncation point, after which the follower truncates and re-fetches.  This replaces textbook Raft's push-based `AppendEntries` with `prevLogIndex`/`prevLogTerm` — the safety guarantees are identical, only the initiator and field names change (see §2.2). |
 | **Safety invariants** | All five Raft safety properties (§1 table) enforced and tested |
 | **Persistent state** | `currentTerm`, `votedFor`, and log durably persisted (`fsync`) before RPC responses |
 | **Heartbeats** | In the pull-based model, the leader does **not** push standalone heartbeat messages.  Instead, followers send periodic `Fetch` RPCs; when no new entries exist, the leader returns an empty `Fetch` response carrying the current term and high watermark.  Followers treat any valid `Fetch` response (empty or not) as proof of leader liveness and reset their election timer accordingly.  This is functionally equivalent to textbook Raft heartbeats but initiated by the follower, consistent with the KRaft design.  **Terminology note:** `e2e-scenarios.md` Features 1, 10, 14, and 16 use the word "heartbeat" as a shorthand for this follower-initiated Fetch cycle.  When those scenarios say "heartbeat interval" or "heartbeat timeout," they mean the Fetch polling interval and the election timer, respectively — there is no separate leader-pushed heartbeat RPC. |
@@ -69,7 +69,7 @@ The following capabilities are in scope for the XRAFT story:
 
 | Capability | Detail |
 |---|---|
-| **Pull-based replication** | Followers and observers initiate `Fetch` RPCs to the leader instead of receiving leader-pushed RPCs.  This replaces the textbook `AppendEntries` push model: the leader responds to each `Fetch` with new log entries, consistency metadata (`prevLogIndex` / `prevLogTerm`), and the current high watermark.  All Raft safety invariants are preserved — only the direction of initiation changes.  **Proto alignment note:** `implementation-plan.md` §1.3 defines the `proto/raft.proto` file with messages: `VoteRequest`, `VoteResponse`, `PreVoteRequest`, `PreVoteResponse`, `FetchRequest`, `FetchResponse`, `FetchSnapshotRequest`, and `FetchSnapshotChunk`.  There are **no** `AppendEntriesRequest` or `AppendEntriesResponse` proto messages; `Action::AppendEntries` is an internal side-effect within `xraft-core` (the leader writing to its own log) and has **no proto representation**.  The gRPC `RaftService` (Stage 3.1) exposes only `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` as wire RPCs. |
+| **Pull-based replication** | Followers and observers initiate `Fetch` RPCs to the leader instead of receiving leader-pushed RPCs.  Each `FetchRequest` carries `fetch_offset` (next desired log index), `last_fetched_epoch` (term/epoch of the last entry the follower holds), and `replica_id`.  The leader responds with new log entries starting from `fetch_offset`, the current high watermark, and — if a log divergence is detected — a `DivergingEpoch` field indicating where the follower must truncate before re-fetching.  This replaces textbook Raft's push-based `AppendEntries` with `prevLogIndex`/`prevLogTerm`; all Raft safety invariants are preserved.  **Proto alignment note:** `implementation-plan.md` §1.3 defines the `proto/raft.proto` file with messages: `VoteRequest`, `VoteResponse`, `PreVoteRequest`, `PreVoteResponse`, `FetchRequest`, `FetchResponse`, `FetchSnapshotRequest`, and `FetchSnapshotChunk`.  There are **no** `AppendEntriesRequest` or `AppendEntriesResponse` proto messages; `Action::AppendEntries` is an internal side-effect within `xraft-core` (the leader writing to its own log) and has **no proto representation**.  The gRPC `RaftService` (Stage 4.1) exposes only `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` as wire RPCs. |
 | **Pre-Vote** | Candidate checks quorum reachability before incrementing term |
 | **Check Quorum** | Leader periodically verifies majority contact; steps down on quorum loss |
 | **Snapshot support** | Periodic snapshots of applied state; `FetchSnapshot` RPC (streamed chunks) for slow/new followers.  Both `architecture.md` and `implementation-plan.md` use `FetchSnapshot` as the wire RPC name; `implementation-plan.md` uses `install_snapshot()` only as the internal handler function name on the follower side that processes received snapshot chunks. |
@@ -89,7 +89,7 @@ The following capabilities are in scope for the XRAFT story:
 | Capability | Detail |
 |---|---|
 | **Structured logging** | `tracing` crate with span-per-RPC |
-| **Metrics** | `metrics` or `prometheus` crate — current leader, term, commit latency, append rate, election latency |
+| **Metrics** | `prometheus-client` crate (aligned with `implementation-plan.md` Stage 1.1 workspace dependencies and Stage 5.2 metrics endpoint) — current leader, term, commit latency, append rate, election latency |
 | **Health endpoint** | Liveness + readiness probes for orchestrators |
 
 ### 2.5  Testing
@@ -145,7 +145,7 @@ Feature 11 tests the inter-node routing, leader-discovery behaviour, and
 | **Multi-Raft / sharding** | Single Raft group only; partitioning across multiple groups is a future story |
 | **Dynamic quorum changes** | `AddVoter`/`RemoveVoter` RPCs are **out of scope for v1** and deferred to a future story entirely — they are not a stretch goal within XRAFT (per `architecture.md` §5.5, `e2e-scenarios.md` Feature 12, and `implementation-plan.md` Stage 7.2).  The v1 deliverable uses static membership (voter set fixed at bootstrap) and observer support only.  Any `AddVoter`/`RemoveVoter` command is rejected with `UNSUPPORTED`. |
 | **Kafka wire protocol compatibility** | We borrow KRaft *design*, not its binary protocol |
-| **Disk-based log storage engine** | v1 uses a simple file-per-segment approach; a production WAL engine (e.g., `sled`, `rocksdb`) is a future optimisation |
+| **Advanced embedded WAL / database storage engine** | v1 implements a durable file-backed segmented log (append-only segment files with CRC integrity, per §5.3 and `implementation-plan.md` Stage 2.1); adopting a third-party embedded storage engine (e.g., `sled`, `rocksdb`) or building an LSM-tree / B-tree WAL is a future optimisation |
 | **Benchmarking / performance tuning** | Functional correctness first; optimisation follows |
 
 ---
@@ -390,4 +390,4 @@ this spec to avoid cross-document dependency on files that may not yet exist:
 ---
 
 *Document: `docs/stories/failover-cluster-XRAFT/tech-spec.md`*
-*Story: failover-cluster:XRAFT · Status: Draft · Iteration 9*
+*Story: failover-cluster:XRAFT · Status: Draft · Iteration 11*

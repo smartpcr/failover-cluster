@@ -37,7 +37,7 @@ xraft-core/                      # Raft algorithm, pure logic, no I/O — define
 xraft-storage/                   # Durable segmented log, snapshots, hard-state persistence
 xraft-transport/                 # Network transport (gRPC via tonic)
 xraft-server/                    # Node binary, wiring, configuration
-xraft-client/                    # Dual-role: internal peer RPC + external consumer API (propose/read)
+xraft-client/                    # Internal peer RPC + admin client (no external consumer SDK in v1)
 xraft-test/                      # Deterministic test harness
 ```
 
@@ -54,8 +54,8 @@ step-down) is a pure function of inputs and current state.
 | `Term` | Newtype `u64`. Monotonically increasing logical clock. |
 | `LogIndex` | Newtype `u64`. 1-based position in the replicated log. |
 | `Entry` | `(LogIndex, Term, EntryPayload)` — a single log entry. |
-| `EntryPayload` | Enum: `Command(Bytes)`, `NoOp`, `Snapshot(SnapshotMeta)`. A `ConfigChange(VoterSet)` variant is **reserved** for dynamic membership as a stretch goal within this story (per `e2e-scenarios.md` Feature 12); until implemented, any `AddVoter`/`RemoveVoter` command is rejected with `UNSUPPORTED`. |
-| `HardState` | Persisted atomically before any RPC reply: `current_term: Term`, `voted_for: Option<NodeId>`. These two fields are written to the `quorum-state` file in a single atomic operation (per `implementation-plan.md` Stage 7.2). `commit_index` is persisted as a separate top-level field in the same `quorum-state` file alongside `HardState` and `VoterSet` (per `implementation-plan.md` Stage 7.2). `last_applied` is volatile, rebuilt from the log on recovery (see §3.3). |
+| `EntryPayload` | Enum: `Command(Bytes)`, `NoOp`, `Snapshot(SnapshotMeta)`. A `ConfigChange(VoterSet)` variant is **reserved** for dynamic membership in a future story (out of scope for v1 per `tech-spec.md` §7 decision 6); it is not emitted in the v1 static-membership baseline. |
+| `HardState` | Persisted atomically before any RPC reply: `current_term: Term`, `voted_for: Option<NodeId>`, `commit_index: LogIndex`. All three fields are written to the `quorum-state` file in a single atomic operation (per `implementation-plan.md` Stage 2.2). `last_applied` is volatile, rebuilt from the log on recovery (see §3.3). |
 | `VoterSet` | Set of `(NodeId, NodeDirectoryId, Vec<Endpoint>)` tuples — the current quorum configuration. |
 | `ElectionTimer` | Randomised election timeout (150–300 ms default). Reset on valid leader contact. |
 | `Input` | Enum of all inputs: `Tick`, `VoteRequest`, `VoteResponse`, `FetchRequest`, `FetchResponse`, `ClientPropose`. |
@@ -94,7 +94,7 @@ creation and loading. Provides file-backed implementations of the `LogStore`,
 |---|---|
 | `LogStore` (trait) | `append(entries)`, `get(index)`, `get_range(start, end)`, `last_index()`, `last_term()`, `truncate_from(index)`, `term_at(index)`. |
 | `FileLogStore` | Implements `LogStore`. Splits the log into fixed-size segment files (`00000000000000000000.log`). Supports `fsync`-on-write for durability. Named `FileLogStore` per `implementation-plan.md` Stage 2.1. |
-| `SnapshotStore` (trait) | `save_snapshot(metadata, data)`, `load_latest_snapshot()`, `list_snapshots()`, `delete_snapshot(id)`. |
+| `SnapshotStore` (trait) | `save_snapshot(metadata, data)`, `load_latest_snapshot()`, `list_snapshots()`, `delete_snapshot(index, term)`. |
 | `FileSnapshotStore` | Implements `SnapshotStore`. Writes snapshots to `<data_dir>/snapshots/snapshot-<term>-<index>.bin` (naming convention follows `implementation-plan.md` Stage 2.3). |
 | `HardStateStore` (trait) | `persist(HardState)`, `load() -> Option<HardState>`. |
 | `FileHardStateStore` | Implements `HardStateStore`. Atomic write to `quorum-state` file (write-tmp + rename). |
@@ -187,27 +187,25 @@ messages onto an async channel; the loop drains the channel, feeds inputs to
 any `SendMessage` actions in the same batch. This mirrors Raft's safety
 requirement that durable state is written before network acknowledgements.
 
-### 2.5 `xraft-client` — Dual-Role Client Library
+### 2.5 `xraft-client` — Peer & Admin Client
 
-**Responsibility:** Provides both an **internal** peer-to-peer RPC layer and an
-**external consumer API** for application callers. The crate serves two audiences:
-`xraft-server` uses it for inter-node Raft RPCs (Fetch, Vote, FetchSnapshot),
-and application code uses `XRaftClient.propose` / `XRaftClient.read` to submit
-commands and query committed state (per `e2e-scenarios.md` Feature 14).
+**Responsibility:** Internal peer RPC and admin client only — no external
+consumer SDK (`propose`/`read`) is in scope for v1 (per `tech-spec.md` §7
+decision 6 alignment note). `xraft-server` uses this crate for inter-node Raft
+RPCs, and admin tooling uses it for cluster-management commands.
 
 | Struct / Trait | Role |
 |---|---|
 | `PeerClient` | Wraps `tonic` gRPC channel to a specific peer. Sends `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` RPCs. Handles connection lifecycle and reconnection. |
 | `ConnectionPool` | Maintains a pool of `PeerClient` instances keyed by `NodeId`. Lazy-initialises connections on first use. |
-| `XRaftClient` | External consumer API: `propose(data) → Result<ProposalId>` submits a command to the leader's log; `read(key) → Result<Vec<u8>>` reads committed state from the generic key-value store state machine. Tracks last-known leader and transparently redirects on `NOT_LEADER` responses. |
 | `AdminClient` | Connects to a node's admin HTTP endpoint for operational queries (leader status, metrics, trigger snapshot). |
 | `ClientConfig` | Peer endpoint list, retry policy, connect/request timeouts. |
 
 **Leader discovery:**
-`PeerClient` and `XRaftClient` track the last-known leader via hints
+`PeerClient` tracks the last-known leader via hints
 returned in `FetchResponse` and `VoteResponse` messages. When a connection fails
-or returns a redirect (`NOT_LEADER` with `leader_hint`), the client transparently
-retries against the hinted leader endpoint.
+or returns a redirect, the client transparently retries against the hinted leader
+endpoint.
 
 ### 2.6 `xraft-test` — Deterministic Testing
 
@@ -233,15 +231,7 @@ engine without real I/O. Inspired by deterministic simulation testing (Jepsen-st
 │  ─────────────────────────────────────────────────── │
 │  current_term  : u64                                 │
 │  voted_for     : Option<NodeId>                      │
-└──────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────┐
-│  quorum-state file (top-level fields)                │
-│  ─────────────────────────────────────────────────── │
-│  hard_state    : HardState (current_term, voted_for) │
-│  commit_index  : u64  (persisted alongside, not      │
-│                         inside HardState)             │
-│  voter_set     : VoterSet                            │
+│  commit_index  : u64                                 │
 └──────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────┐
@@ -356,7 +346,7 @@ trait SnapshotStore: Send + Sync {
     fn save_snapshot(&mut self, metadata: SnapshotMeta, data: &[u8]) -> Result<()>;
     fn load_latest_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>>;
     fn list_snapshots(&self) -> Result<Vec<SnapshotMeta>>;
-    fn delete_snapshot(&mut self, id: &str) -> Result<()>;
+    fn delete_snapshot(&mut self, index: LogIndex, term: Term) -> Result<()>;
 }
 
 trait HardStateStore: Send + Sync {
@@ -583,12 +573,11 @@ writes), the leader detects the mismatch and responds with a `DivergingEpoch`:
 
 ### 5.5 Check-Quorum Leader Step-Down
 
-Dynamic quorum changes (`AddVoter` / `RemoveVoter`) are a **stretch goal within
-this story** — they may be delivered if schedule permits, but are not part of the
-core v1 deliverable (per `e2e-scenarios.md` Feature 12 and `implementation-plan.md`
-Stage 7.2). The v1 baseline uses **static membership** (voter set fixed at cluster
-bootstrap) and observer support only. Until the stretch goal is implemented, any
-`AddVoter`/`RemoveVoter` command is rejected with an `UNSUPPORTED` error.
+Dynamic quorum changes (`AddVoter` / `RemoveVoter`) are **out of scope for v1**
+and deferred to a future story entirely — they are not a stretch goal within
+XRAFT (per `tech-spec.md` §7 decision 6). The v1 deliverable uses **static
+membership** (voter set fixed at cluster bootstrap) and observer support only.
+Any `AddVoter`/`RemoveVoter` command is rejected with an `UNSUPPORTED` error.
 
 This section documents the Check-Quorum protocol that prevents stale leadership:
 
