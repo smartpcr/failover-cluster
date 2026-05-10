@@ -17,9 +17,11 @@ reusable consensus library and standalone cluster binary. The system provides:
 - **Static quorum membership** with a fixed voter set defined at cluster bootstrap.
   Dynamic membership (`AddVoter`/`RemoveVoter`) is **out of scope for v1** and
   deferred to a future story entirely (per `tech-spec.md` §2.7).
-- **A generic key-value state machine** that replays a deterministic log.
-  Library consumers submit proposals and reads through `xraft-server`'s
-  embedded API (see §2.4).
+- **A consumer-provided `StateMachine` trait** with `apply`, `snapshot`, and
+  `restore` methods (per `implementation-plan.md` Stage 5.1). XRAFT does not
+  prescribe application semantics — consumers implement their own state machine
+  (e.g., a key-value store) and inject it at server startup. Library consumers
+  submit proposals through `xraft-server`'s embedded `propose` API (see §2.4).
 
 The implementation accepts any voter count ≥ 1. Odd-numbered clusters (3, 5, 7)
 are recommended because they maximise fault tolerance per node; even-numbered
@@ -169,10 +171,10 @@ is internal-only; see §2.5).
 
 | Struct | Role |
 |---|---|
-| `XRaftServer` | Top-level server. Initialises `RaftNode`, `FileLogStore`, `GrpcTransport`, starts the event loop. Exposes `propose(command: Bytes) -> Result<LogIndex>` and `read(key: Bytes) -> Result<Bytes>` for library consumers to submit commands to the leader and query committed state. |
+| `XRaftServer` | Top-level server. Initialises `RaftNode`, `FileLogStore`, `GrpcTransport`, starts the event loop. Exposes `propose(command: Bytes) -> Result<LogIndex>` for library consumers to submit commands to the leader. The consumer-provided `StateMachine` (see §4.1) receives applied entries via its `apply` callback; reads against committed state are the consumer's responsibility (XRAFT does not prescribe application-level read semantics — `tech-spec.md` §3 and `implementation-plan.md` Stage 5.1). |
 | `EventLoop` | Single-threaded async loop (Tokio). Processes `Input` from RPC handlers + timer ticks, feeds them to `RaftNode`, dispatches resulting `Action`s. |
 | `TickDriver` | Fires `Input::Tick` at `tick_interval` (default 50 ms). The core engine counts ticks to derive election and heartbeat timeouts. |
-| `NodeConfig` | TOML configuration: `node_id`, `cluster_id`, `data_dir`, `cluster.bootstrap_voters`, `cluster.bootstrap_observers`, `timing.election_timeout_min_ms`, `timing.election_timeout_max_ms`, `timing.tick_interval_ms`, `timing.fetch_interval_ms`, `timing.enable_check_quorum`, `timing.enable_leader_lease`, `snapshot.interval_entries`, `log.segment_max_bytes` (see §8 for the full reference). |
+| `NodeConfig` | TOML configuration with a flat field layout matching `ClusterConfig` from `implementation-plan.md` Stage 1.2: `node_id`, `cluster_id`, `data_dir`, `listen_addr`, `peers`, `bootstrap_voters`, `bootstrap_observers`, `election_timeout_min_ms`, `election_timeout_max_ms`, `tick_interval_ms`, `fetch_interval_ms`, `snapshot_interval`, `max_log_entries_before_compaction`, `enable_check_quorum`, `enable_leader_lease`, `segment_max_bytes` (see §8 for the full reference and mapping). |
 | `MetricsRegistry` | Prometheus-compatible metrics: `current_leader`, `current_term`, `commit_latency_avg`, `append_records_rate`, `election_latency_avg`, `log_end_offset`, `replication_lag`. |
 | `AdminApi` | HTTP API for operational commands: cluster status, trigger snapshot, node health. |
 
@@ -318,9 +320,13 @@ The leader maintains per-follower replication tracking (in-memory only):
 └──────────────────────────────────────────────────────┘
 ```
 
-The leader uses `last_fetch_offset` across all voters to compute the **high-water
-mark (HW)**: the highest log index replicated to a majority. Only entries at or
-below HW are considered committed.
+The leader updates `last_fetch_offset` to the value carried in each incoming
+`FetchReq(fetch_offset=N)`. Because `fetch_offset` is the **next** index the
+follower wants, the highest index the follower has **already replicated** is
+`last_fetch_offset - 1`. The leader computes the **high-water mark (HW)** as
+the highest index `I` such that a strict majority of voters satisfy
+`last_fetch_offset - 1 >= I` (i.e., they have replicated index `I`).
+Only entries at or below HW are considered committed.
 
 ### 3.3 On-Disk Layout
 
@@ -508,31 +514,42 @@ The `EventLoop` in `xraft-server` connects the components:
     │                    │ index=5, term=2     │                     │
     │                    │ persist + fsync     │                     │
     │                    │                     │                     │
-    │                    │    ┌── Fetch round 1 ──┐                  │
-    │                    │◄───┤ FetchReq(off=5)   │                  │
-    │                    │    └────────────────────┘                  │
+    │                    │    ┌── Fetch round 1 (B) ──┐              │
+    │                    │◄───┤ FetchReq(off=5)       │              │
+    │                    │    └────────────────────────┘              │
+    │                    │                     │                     │
+    │                    │  update B.last_fetch_offset=5             │
+    │                    │  (B replicated up to 4)                   │
+    │                    │  HW check: majority at ≥5? no            │
     │                    │                     │                     │
     │                    │── FetchResp ────────►│                     │
     │                    │   entries=[5]        │                     │
-    │                    │   hw=4 (not yet)     │ append entry 5     │
+    │                    │   hw=4               │ append entry 5     │
     │                    │                     │ persist + fsync     │
     │                    │                     │                     │
-    │                    │    ┌── Fetch from C ──────────────────────┐
-    │                    │◄───────────────────────┤ FetchReq(off=5) │
-    │                    │    └──────────────────────────────────────┘
+    │                    │    ┌── Fetch round 1 (C) ──────────────────┐
+    │                    │◄───────────────────────┤ FetchReq(off=5)  │
+    │                    │    └───────────────────────────────────────┘
+    │                    │                     │                     │
+    │                    │  update C.last_fetch_offset=5             │
+    │                    │  (C replicated up to 4)                   │
+    │                    │  HW check: majority at ≥5? no            │
     │                    │                     │                     │
     │                    │── FetchResp ─────────────────────────────►│
     │                    │   entries=[5]        │                     │
     │                    │   hw=4               │   append entry 5   │
+    │                    │                     │   persist + fsync   │
     │                    │                     │                     │
-    │                    │ [B,C replicated 5]   │                     │
-    │                    │ advance hw to 5      │                     │
-    │                    │ apply entry 5        │                     │
-    │                    │ to state machine     │                     │
+    │                    │    ┌── Fetch round 2 (B) ──┐              │
+    │                    │◄───┤ FetchReq(off=6)       │              │
+    │                    │    └────────────────────────┘              │
     │                    │                     │                     │
-    │                    │    ┌── Fetch round 2 ──┐                  │
-    │                    │◄───┤ FetchReq(off=6)   │                  │
-    │                    │    └────────────────────┘                  │
+    │                    │  update B.last_fetch_offset=6             │
+    │                    │  (B replicated up to 5)                   │
+    │                    │  HW check: A(leader)=5, B=5              │
+    │                    │   → majority (2/3) at ≥5                 │
+    │                    │   → advance HW to 5                      │
+    │                    │   → apply entry 5 to state machine       │
     │                    │                     │                     │
     │                    │── FetchResp ────────►│                     │
     │                    │   entries=[]         │                     │
@@ -541,6 +558,12 @@ The `EventLoop` in `xraft-server` connects the components:
     │                    │                     │                     │
     │◄── Response(ok) ──┤                     │                     │
 ```
+
+**When does HW advance?** The leader can only learn that a follower has
+replicated entry `I` when it receives a `FetchReq(fetch_offset=I+1)` — the
+follower asking for the *next* entry proves it has persisted all entries up to
+`I`. In the flow above, the leader advances HW to 5 only when B's second fetch
+(`off=6`) proves B has replicated 5, giving a majority (A + B = 2 of 3 voters).
 
 **Two-round commit visibility:** Followers learn the updated high-water mark on
 their *next* fetch after the leader advances it. This is inherent to pull-based
@@ -682,12 +705,39 @@ Exposed via Prometheus endpoint (`/metrics`) on the admin HTTP port:
 
 ```toml
 # node.toml — per-node configuration
+#
+# The on-disk config surface maps directly to ClusterConfig fields
+# defined in implementation-plan.md Stage 1.2. The table below shows
+# the correspondence:
+#
+#   TOML field                  → ClusterConfig field
+#   node_id                     → node_id
+#   cluster_id                  → cluster_id
+#   data_dir                    → data_dir
+#   listen_addr                 → listen_addr
+#   peers                       → peers (Vec of peer addresses)
+#   bootstrap_voters            → (parsed into VoterSet at startup)
+#   bootstrap_observers         → (parsed into observer set at startup)
+#   election_timeout_min_ms     → election_timeout_min_ms
+#   election_timeout_max_ms     → election_timeout_max_ms
+#   tick_interval_ms            → tick_interval_ms
+#   fetch_interval_ms           → fetch_interval_ms
+#   snapshot_interval           → snapshot_interval
+#   max_log_entries_before_compaction → max_log_entries_before_compaction
+#   enable_check_quorum         → enable_check_quorum
+#   enable_leader_lease         → enable_leader_lease
 
 node_id = 1
 cluster_id = "xraft-cluster-001"
 data_dir = "/var/lib/xraft"
+listen_addr = "0.0.0.0:6001"
 
-[cluster]
+# Peer addresses for all other nodes in the cluster
+peers = [
+  "node0.example.com:6000",
+  "node2.example.com:6002",
+]
+
 # Voters participate in elections and quorum; observers replicate but do not vote.
 bootstrap_voters = [
   { node_id = 0, host = "node0.example.com", port = 6000 },
@@ -698,35 +748,33 @@ bootstrap_observers = [
   { node_id = 3, host = "observer0.example.com", port = 6003 },
 ]
 
-[timing]
+# Timing — all fields directly map to ClusterConfig
 tick_interval_ms = 50
 election_timeout_min_ms = 150
 election_timeout_max_ms = 300
-fetch_interval_ms = 50               # follower/observer Fetch RPC interval
-check_quorum_interval_ticks = 6      # 300 ms at 50 ms tick
-enable_check_quorum = true           # leader steps down if quorum lost
-enable_leader_lease = false          # lease-based reads (optional optimisation)
+fetch_interval_ms = 50
+enable_check_quorum = true
+enable_leader_lease = false
 
-[log]
-segment_max_bytes = 67_108_864     # 64 MiB (per implementation-plan.md Stage 2.1)
-retention_min_segments = 2
+# Storage
+segment_max_bytes = 67_108_864       # 64 MiB per segment (per implementation-plan.md Stage 2.1)
+max_log_entries_before_compaction = 50_000
+snapshot_interval = 10_000           # snapshot every N committed entries
 
-[snapshot]
-interval_entries = 10_000            # snapshot every N committed entries
-max_chunk_bytes = 1_048_576          # 1 MiB per FetchSnapshot chunk
+# Snapshot transfer
+snapshot_max_chunk_bytes = 1_048_576 # 1 MiB per FetchSnapshot chunk
 
-[network]
-listen_address = "0.0.0.0:6001"
+# Network
 connect_timeout_ms = 500
 request_timeout_ms = 2000
 
-[tls]
-enabled = false
-cert_path = ""
-key_path = ""
+# TLS (optional)
+tls_enabled = false
+tls_cert_path = ""
+tls_key_path = ""
 
-[admin]
-http_listen_address = "0.0.0.0:9090"
+# Admin HTTP
+admin_listen_addr = "0.0.0.0:9090"
 ```
 
 ---
