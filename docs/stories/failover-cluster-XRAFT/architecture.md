@@ -70,10 +70,10 @@ step-down) is a pure function of inputs and current state.
 | `Entry` | `(LogIndex, Term, EntryPayload)` — a single log entry. |
 | `EntryPayload` | Enum with four variants: `Command(Bytes)`, `NoOp`, `ConfigChange(VoterSet)`, `Snapshot(SnapshotMeta)`. The first three variants (`Command`, `NoOp`, `ConfigChange`) are the canonical serialisable wire-format variants that map 1:1 to the protobuf `LogEntry.entry_type` values (`Command`, `NoOp`, `Config`) per `implementation-plan.md` Stage 1.3. The fourth variant, `Snapshot(SnapshotMeta)`, is an **in-memory compaction marker only** — it is never serialised to the wire or written to segment files; the `From`/`Into` conversions in `message.rs` (Stage 1.3) exclude it from wire serialisation. Snapshot data is transferred via `FetchSnapshot` RPCs, not as log entries (see §2.3 and §5.3). `ConfigChange` is reserved for forward-compatible log format; the `RaftNode` rejects any `ConfigChange` proposal with `UNSUPPORTED` in v1. Dynamic membership (`AddVoter`/`RemoveVoter`) is **out of scope for v1** (per `tech-spec.md` §2.7/§3/§7). `SnapshotMeta` is defined as `{ last_included_index: LogIndex, last_included_term: Term }` and is also used standalone by `SnapshotStore`, `Action::TakeSnapshot`, `Action::InstallSnapshot`, and `FetchSnapshot` RPCs. This four-variant model matches `implementation-plan.md` Stage 1.2. |
 | `HardState` | Persisted atomically before any RPC reply. Contains three fields: `current_term: Term`, `voted_for: Option<NodeId>`, `commit_index: LogIndex` (per `implementation-plan.md` Stage 2.2 and Stage 7.2). All three fields are written to the `quorum-state` file in a single atomic operation. The concrete `FileHardStateStore` additionally persists `VoterSet` alongside `HardState` in the same file via non-trait methods (see §2.2 and §4.1). `last_applied` is volatile, rebuilt from the log on recovery by replaying committed entries from `commit_index` (see §3.3). |
-| `VoterSet` | Set of `(NodeId, NodeDirectoryId, Vec<Endpoint>)` tuples — the current quorum configuration. |
+| `VoterSet` | Set of `(NodeId, DirectoryId, Vec<Endpoint>)` tuples — the current quorum configuration. `DirectoryId` is a `Uuid` newtype (per `implementation-plan.md` Stage 1.2). |
 | `ElectionTimer` | Randomised election timeout (150–300 ms default). Reset on valid leader contact. |
-| `Input` | Enum of all inputs: `Tick`, `VoteRequest`, `VoteResponse`, `FetchRequest`, `FetchResponse`, `ClientPropose`. |
-| `Action` | Enum of all side-effects: `PersistHardState`, `AppendEntries`, `SendMessage`, `ApplyToStateMachine`, `TakeSnapshot`, `InstallSnapshot`, `BecomeLeader`, `StepDown`. |
+| `Input` | Enum of all inputs to `RaftNode::step()`: `Tick`, `VoteRequest(VoteRequest)`, `VoteResponse { from: NodeId, resp: VoteResponse }`, `PreVoteRequest(PreVoteRequest)`, `PreVoteResponse { from: NodeId, resp: PreVoteResponse }`, `FetchRequest(FetchRequest)`, `FetchResponse(FetchResponse)`, `ClientPropose { data: Bytes }`, `SnapshotComplete { metadata: SnapshotMeta }`, `SnapshotInstalled { metadata: SnapshotMeta }`. The Pre-Vote variants support the Pre-Vote protocol (§5.2). `SnapshotComplete` is fed back by the driver after `Action::TakeSnapshot` finishes (triggers `Action::TruncateLog`). `SnapshotInstalled` is fed back after `Action::InstallSnapshot` finishes (updates `last_applied` and `commit_index`). This matches `implementation-plan.md` Stage 1.2. |
+| `Action` | Enum of all side-effects emitted by `RaftNode::step()`: `PersistHardState(HardState)`, `AppendEntries(Vec<Entry>)`, `SendMessage { to: NodeId, message: OutboundMessage }`, `ApplyToStateMachine { index: LogIndex, data: Bytes }`, `TakeSnapshot { through_index: LogIndex }`, `InstallSnapshot { metadata: SnapshotMeta, data: Bytes }`, `BecomeLeader`, `StepDown { term: Term }`, `RedirectToSnapshot { follower_id: NodeId, snapshot_metadata: SnapshotMeta }`, `TruncateLog { before_index: LogIndex }`. `RedirectToSnapshot` is emitted when a follower's `last_fetch_offset` is before the log start (entries were compacted) — the driver initiates a `FetchSnapshot` stream via the transport layer. `TruncateLog` is emitted after `Input::SnapshotComplete` to compact the log up to the snapshot boundary. `OutboundMessage` is an enum wrapping `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` request/response types. This matches `implementation-plan.md` Stage 1.2. |
 
 **Key design choice — pull-based replication (KRaft-style):**
 Unlike canonical Raft where the leader pushes `AppendEntries`, XRAFT followers
@@ -279,13 +279,22 @@ engine without real I/O. Inspired by deterministic simulation testing (Jepsen-st
 └──────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────┐
-│  SnapshotMeta                                        │
+│  SnapshotMeta  (core — used by RaftNode, Actions,    │
+│                 EntryPayload::Snapshot, and traits)   │
 │  ─────────────────────────────────────────────────── │
 │  last_included_index : u64                           │
 │  last_included_term  : u64                           │
-│  voter_set           : VoterSet                      │
-│  size_bytes          : u64                           │
-│  checksum            : u64                           │
+└──────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────┐
+│  SnapshotFileHeader  (on-disk / wire — extends       │
+│                       SnapshotMeta for storage and   │
+│                       FetchSnapshot RPC metadata)    │
+│  ─────────────────────────────────────────────────── │
+│  meta              : SnapshotMeta                    │
+│  voter_set         : VoterSet                        │
+│  size_bytes        : u64                             │
+│  checksum          : u64                             │
 └──────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────┐
@@ -592,8 +601,9 @@ The `FetchSnapshot` RPC is defined as a **single request** returning a
 **server-streaming response** of `FetchSnapshotChunk` messages (per §2.3 and
 `implementation-plan.md` Stage 1.3). The follower sends one
 `FetchSnapshotRequest(replica_id, snapshot_id)` and receives a stream of
-chunks. The first chunk carries `SnapshotMetadata` (including
-`last_included_index`, `last_included_term`, and `voter_set`). Each subsequent
+chunks. The first chunk carries `SnapshotFileHeader` (including the embedded
+`SnapshotMeta` fields `last_included_index` and `last_included_term`, plus
+`voter_set`, `size_bytes`, and `checksum`). Each subsequent
 chunk carries a `data` segment and a `done` flag. The chunk size is bounded by
 `snapshot_max_chunk_bytes` (default 1 MiB, see §8).
 
