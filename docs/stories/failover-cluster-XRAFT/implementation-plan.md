@@ -52,7 +52,7 @@ storyId: "failover-cluster:XRAFT"
 ## Stage 1.3: RPC Message Definitions
 
 ### Implementation Steps
-- [ ] Create `proto/raft.proto` defining protobuf messages: `VoteRequest`, `VoteResponse`, `PreVoteRequest`, `PreVoteResponse`, `FetchRequest`, `FetchResponse`, `AppendEntriesRequest`, `AppendEntriesResponse` — the `AppendEntries*` types are internal-only proto types used for the `Action::AppendEntries` side-effect within `xraft-core` (leader writing to its own log); they are **not** exposed as a network RPC (per `tech-spec.md` §2.2)
+- [ ] Create `proto/raft.proto` defining protobuf messages: `VoteRequest`, `VoteResponse`, `PreVoteRequest`, `PreVoteResponse`, `FetchRequest`, `FetchResponse` — these are the only wire RPC messages; there are no `AppendEntriesRequest`/`AppendEntriesResponse` proto messages (per `tech-spec.md` §2.2); `Action::AppendEntries` is an internal side-effect in `xraft-core` for the leader writing to its own log and has no proto representation
 - [ ] Define `LogEntry` protobuf message with fields: `index`, `term`, `entry_type` (enum: Command, NoOp, Config), `data` (bytes)
 - [ ] Define `SnapshotMetadata` protobuf message with fields: `last_included_index`, `last_included_term`, `voter_set`
 - [ ] Define `FetchSnapshotRequest` and `FetchSnapshotChunk` protobuf messages for streamed snapshot transfer from leader to follower
@@ -96,7 +96,7 @@ storyId: "failover-cluster:XRAFT"
 
 ### Implementation Steps
 - [ ] Define `HardStateStore` trait in `xraft-core/src/storage.rs` with methods: `persist(state: &HardState) -> Result<()>`, `load() -> Result<Option<HardState>>` — trait lives in `xraft-core` per `architecture.md` §4.1
-- [ ] Define `HardState` struct in `xraft-core/src/types.rs` with fields: `current_term: Term`, `voted_for: Option<NodeId>` — only the safety-critical voting state is part of `HardState`; `commit_index` and `last_applied` are volatile and rebuilt from the log on recovery (per `architecture.md` §3.3)
+- [ ] Define `HardState` struct in `xraft-core/src/types.rs` with fields: `current_term: Term`, `voted_for: Option<NodeId>`, `commit_index: LogIndex` — all three fields are persisted atomically to the `quorum-state` file before any RPC reply (per `architecture.md` §3.1 which lists `commit_index` inside `HardState`); `last_applied` is volatile and rebuilt from the log on recovery
 - [ ] Implement `FileHardStateStore` in `xraft-storage/src/state.rs` that persists `HardState` as JSON to a `quorum-state` file with atomic write (write to temp file then rename) for crash safety, consistent with KRaft's `quorum-state` pattern (per `tech-spec.md` §5.3)
 - [ ] Implement `load()` that reads state on startup with fallback to default initial state (term=0, voted_for=None)
 - [ ] Add validation in `persist()` that term never decreases and voted_for is only set once per term
@@ -146,7 +146,7 @@ storyId: "failover-cluster:XRAFT"
 
 ### Test Scenarios
 - [ ] Scenario: initial-state — Given a new RaftNode, When created, Then role is Follower, term is 0, and election timer is running
-- [ ] Scenario: election-timeout-triggers-candidacy — Given a Follower node, When election timer expires via repeated Tick inputs, Then the node transitions to Candidate and increments term
+- [ ] Scenario: election-timeout-triggers-pre-candidacy — Given a Follower node, When election timer expires via repeated Tick inputs, Then the node transitions to PreCandidate and sends PreVoteRequest RPCs without incrementing its term (per Pre-Vote protocol design)
 - [ ] Scenario: become-leader-initializes-peers — Given a node becoming leader, When `become_leader()` is called, Then `last_fetch_offset` for each peer is initialized and a no-op `Action::AppendEntries` is emitted
 
 ## Stage 3.2: Leader Election
@@ -290,13 +290,15 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Scenario: graceful-shutdown — Given a running server, When SIGTERM is received, Then state is persisted, connections are drained, and the process exits with code 0
 - [ ] Scenario: health-endpoint — Given a running server, When GET /health is called, Then it returns JSON with node_id, role, term, and leader_id fields
 
-## Stage 6.2: Peer and Admin Client
+## Stage 6.2: Dual-Role Client SDK
 
 ### Implementation Steps
 - [ ] Implement `PeerClient` in `xraft-client/src/peer.rs` wrapping a `tonic` gRPC channel to a specific peer, providing typed methods for `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` RPCs with connection lifecycle management
 - [ ] Implement `ConnectionPool` in `xraft-client/src/pool.rs` maintaining lazy-initialized `PeerClient` instances keyed by `NodeId`, with automatic reconnection on channel failure
 - [ ] Implement leader discovery: `PeerClient` tracks last-known leader via hints returned in `FetchResponse` and `VoteResponse` messages; on `NOT_LEADER` errors, transparently retries against the hinted leader
 - [ ] Implement `AdminClient` in `xraft-client/src/admin.rs` connecting to a node's HTTP admin endpoint for operational queries (cluster status, trigger snapshot, node health)
+- [ ] Implement `XRaftClient` external consumer API in `xraft-client/src/client.rs` exposing `propose(data: Bytes) -> Result<ProposalId>` and `read(key: &[u8]) -> Result<Vec<u8>>` for callers outside the cluster (per `tech-spec.md` §2.6); `propose` forwards to the current leader via gRPC and awaits commit confirmation; `read` is served from the leader (or locally if leader lease is active)
+- [ ] Implement leader redirection in `XRaftClient`: on `NOT_LEADER` error with leader hint, transparently retry against the hinted leader; maintain a cached leader address for subsequent calls
 - [ ] Add timeout and retry configuration with sensible defaults (connect: 5s, request: 30s, backoff with jitter)
 
 ### Dependencies
@@ -306,6 +308,8 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Scenario: peer-client-reconnect — Given a PeerClient connected to a peer that restarts, When the next RPC is sent, Then the client reconnects automatically and the RPC succeeds
 - [ ] Scenario: connection-pool-lazy-init — Given a ConnectionPool for a 5-node cluster, When a PeerClient for node 3 is requested twice, Then the same channel is reused without creating a new connection
 - [ ] Scenario: admin-client-status — Given a running node with admin HTTP endpoint, When AdminClient queries cluster status, Then it returns the current leader, term, and voter set
+- [ ] Scenario: external-propose-and-read — Given a running 3-node cluster with a leader, When `XRaftClient.propose(data)` is called followed by `XRaftClient.read(key)`, Then the proposal is committed and the read returns the committed data
+- [ ] Scenario: external-client-leader-redirect — Given an `XRaftClient` connected to a follower, When `propose()` is called, Then the client receives a `NOT_LEADER` redirect, retries against the leader, and the proposal succeeds
 
 # Phase 7: Advanced Raft Features
 
@@ -315,7 +319,7 @@ storyId: "failover-cluster:XRAFT"
 ## Stage 7.1: Check Quorum and Leader Lease
 
 ### Implementation Steps
-- [ ] Implement Check Quorum mechanism in leader: track last successful communication time per follower, step down if a majority of followers have not responded within the election timeout
+- [ ] Implement Check Quorum mechanism in leader: track last successful communication time per voter peer; the leader counts itself as one voter and steps down if a majority of the full voter set (including self) has not responded within the election timeout — e.g. in a 5-node cluster, the leader needs at least 2 of the 4 other voters to have responded recently (since leader + 2 = 3 = majority of 5)
 - [ ] Implement leader lease optimization: if the leader has heard from a majority within the last election timeout period (via incoming Fetch RPCs), serve reads locally without an extra round-trip
 - [ ] Add configuration option `enable_check_quorum` (default true) and `enable_leader_lease` (default false) in `ClusterConfig`
 - [ ] Implement leader step-down on receiving a higher term from any RPC, ensuring no stale leader continues to serve
