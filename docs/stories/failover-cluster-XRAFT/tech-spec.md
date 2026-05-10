@@ -253,7 +253,7 @@ real networking and deterministic simulation.
 | Serialisation (wire) | `prost` | Protobuf encoding for gRPC RPCs |
 | Serialisation (disk) | Custom binary | On-disk log entries use `[length: u32][term: u64][index: u64][entry_type: u8][data: bytes][crc32: u32]` per `implementation-plan.md` Stage 2.1.  Protobuf is used on the wire; disk uses a compact binary format with CRC integrity checks for performance and simplicity. |
 | Logging | `tracing` | Structured, async-aware |
-| Metrics | `metrics` | Façade pattern; pluggable exporters |
+| Metrics | `prometheus-client` | Direct Prometheus exposition; aligned with `implementation-plan.md` Stage 1.1 and Stage 5.2 |
 | RPC | `tonic` + `prost` | Mature, HTTP/2-based gRPC framework (firm decision — see §2.3) |
 | CLI | `clap` | Argument parsing for `xraft-server` |
 | Testing | `tokio::test`, `proptest` | Async + property-based |
@@ -336,7 +336,7 @@ this spec to avoid cross-document dependency on files that may not yet exist:
    functional correctness but the configuration knobs exist per `architecture.md`.
    It is not "out of scope" but is not a gating requirement.
 
-> **Cross-doc alignment (iteration 10):** This spec now uses the same crate
+> **Cross-doc alignment (iteration 11):** This spec now uses the same crate
 > names as all sibling docs (`xraft-storage`, `xraft-transport`, `xraft-test`).
 > **`xraft-client`** is an **internal** peer RPC and admin client only — no
 > external consumer SDK (`propose`/`read`) is in scope for v1, aligned with
