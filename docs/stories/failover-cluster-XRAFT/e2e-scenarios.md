@@ -435,11 +435,12 @@ Feature: Check Quorum prevents split-brain
 
 ```gherkin
 Feature: Inter-node request routing and leader discovery
-  Per tech-spec §2.6, `xraft-client` is an **internal** crate used for peer-to-peer
-  RPC (Fetch, Vote, FetchSnapshot) and admin/operational queries (status, metrics,
-  health, snapshot triggering).  It is **not** an external consumer SDK — no external
-  `propose`/`read` API is in scope for v1.  Leader discovery occurs through Fetch
-  RPC responses that carry leader_id and epoch metadata.
+  Per tech-spec §2.6, `xraft-client` is a **dual-role** crate providing both an
+  **external consumer API** (`XRaftClient.propose`/`read`) and an **internal**
+  peer-to-peer RPC layer (Fetch, Vote, FetchSnapshot) plus admin/operational
+  queries (status, metrics, health, snapshot triggering).  Leader discovery
+  occurs through Fetch RPC responses that carry leader_id and epoch metadata.
+  Feature 14 exercises the external consumer API in dedicated scenarios.
 
   Background:
     Given a cluster of 3 nodes
@@ -479,8 +480,6 @@ Feature: Inter-node request routing and leader discovery
     Then the AdminClient returns leader identity, current epoch, and node roles
     And the AdminClient can query `/health` and `/metrics` endpoints
     And the AdminClient can trigger a snapshot
-    # Note: AdminClient is limited to operational queries — no external
-    # propose/read API exists in xraft-client for v1 (tech-spec §2.6)
 ```
 
 ---

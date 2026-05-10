@@ -37,7 +37,7 @@ xraft-core/                      # Raft algorithm, pure logic, no I/O — define
 xraft-storage/                   # Durable segmented log, snapshots, hard-state persistence
 xraft-transport/                 # Network transport (gRPC via tonic)
 xraft-server/                    # Node binary, wiring, configuration
-xraft-client/                    # Dual-role: external consumer API (propose/read) + internal peer RPC + admin client
+xraft-client/                    # Internal peer RPC + admin client (no external consumer SDK in v1)
 xraft-test/                      # Deterministic test harness
 ```
 
@@ -54,8 +54,8 @@ step-down) is a pure function of inputs and current state.
 | `Term` | Newtype `u64`. Monotonically increasing logical clock. |
 | `LogIndex` | Newtype `u64`. 1-based position in the replicated log. |
 | `Entry` | `(LogIndex, Term, EntryPayload)` — a single log entry. |
-| `EntryPayload` | Enum: `Command(Bytes)`, `NoOp`, `Snapshot(SnapshotMeta)`. A `ConfigChange(VoterSet)` variant is **reserved** for the dynamic-membership stretch goal (see §5.5); it is not emitted in the v1 static-membership baseline. |
-| `HardState` | Persisted before any RPC reply: `current_term: Term`, `voted_for: Option<NodeId>`. Only safety-critical voting state; `commit_index` and `last_applied` are volatile, rebuilt from the log on recovery (see §3.3). |
+| `EntryPayload` | Enum: `Command(Bytes)`, `NoOp`, `Snapshot(SnapshotMeta)`. A `ConfigChange(VoterSet)` variant is **reserved** for dynamic membership in a future story (out of scope for v1 per `tech-spec.md` §7 decision 6); it is not emitted in the v1 static-membership baseline. |
+| `HardState` | Persisted atomically before any RPC reply: `current_term: Term`, `voted_for: Option<NodeId>`, `commit_index: LogIndex`. All three fields are written to the `quorum-state` file in a single atomic operation (per `implementation-plan.md` Stage 2.2). `last_applied` is volatile, rebuilt from the log on recovery (see §3.3). |
 | `VoterSet` | Set of `(NodeId, NodeDirectoryId, Vec<Endpoint>)` tuples — the current quorum configuration. |
 | `ElectionTimer` | Randomised election timeout (150–300 ms default). Reset on valid leader contact. |
 | `Input` | Enum of all inputs: `Tick`, `VoteRequest`, `VoteResponse`, `FetchRequest`, `FetchResponse`, `ClientPropose`. |
@@ -93,7 +93,7 @@ creation and loading. Provides file-backed implementations of the `LogStore`,
 | Trait / Struct | Role |
 |---|---|
 | `LogStore` (trait) | `append(entries)`, `get(index)`, `get_range(start, end)`, `last_index()`, `last_term()`, `truncate_from(index)`, `term_at(index)`. |
-| `SegmentedLog` | Implements `LogStore`. Splits the log into fixed-size segment files (`00000000000000000000.log`). Supports `fsync`-on-write for durability. |
+| `FileLogStore` | Implements `LogStore`. Splits the log into fixed-size segment files (`00000000000000000000.log`). Supports `fsync`-on-write for durability. Named `FileLogStore` per `implementation-plan.md` Stage 2.1. |
 | `SnapshotStore` (trait) | `save_snapshot(metadata, data)`, `load_latest_snapshot()`, `list_snapshots()`, `delete_snapshot(index, term)`. |
 | `FileSnapshotStore` | Implements `SnapshotStore`. Writes snapshots to `<data_dir>/snapshots/snapshot-<term>-<index>.bin` (naming convention follows `implementation-plan.md` Stage 2.3). |
 | `HardStateStore` (trait) | `persist(HardState)`, `load() -> Option<HardState>`. |
@@ -151,7 +151,7 @@ Owns the event loop, tick scheduling, and configuration loading.
 
 | Struct | Role |
 |---|---|
-| `XRaftServer` | Top-level server. Initialises `RaftNode`, `SegmentedLog`, `GrpcTransport`, starts the event loop. |
+| `XRaftServer` | Top-level server. Initialises `RaftNode`, `FileLogStore`, `GrpcTransport`, starts the event loop. |
 | `EventLoop` | Single-threaded async loop (Tokio). Processes `Input` from RPC handlers + timer ticks, feeds them to `RaftNode`, dispatches resulting `Action`s. |
 | `TickDriver` | Fires `Input::Tick` at `tick_interval` (default 50 ms). The core engine counts ticks to derive election and heartbeat timeouts. |
 | `NodeConfig` | TOML configuration: `node_id`, `data_dir`, `cluster_peers`, `election_timeout_ms`, `tick_interval_ms`, `snapshot_interval_entries`, `log.segment_max_bytes`. |
@@ -174,11 +174,11 @@ messages onto an async channel; the loop drains the channel, feeds inputs to
                                    ┌──────────────────────────┐
                                    │   Action Dispatcher      │
                                    │  ┌─ PersistHardState ──► FileHardStateStore
-                                   │  ├─ AppendEntries ─────► SegmentedLog
+                                   │  ├─ AppendEntries ─────► FileLogStore
                                    │  ├─ SendMessage ───────► GrpcTransport
                                    │  ├─ ApplyToStateMachine ► StateMachineCallback
                                    │  ├─ TakeSnapshot ──────► FileSnapshotStore
-                                   │  └─ InstallSnapshot ───► SegmentedLog + FSS
+                                   │  └─ InstallSnapshot ───► FileLogStore + FSS
                                    └──────────────────────────┘
 ```
 
@@ -187,23 +187,15 @@ messages onto an async channel; the loop drains the channel, feeds inputs to
 any `SendMessage` actions in the same batch. This mirrors Raft's safety
 requirement that durable state is written before network acknowledgements.
 
-### 2.5 `xraft-client` — Consumer, Peer & Admin Client
+### 2.5 `xraft-client` — Peer & Admin Client
 
-**Responsibility:** A **dual-role** client crate (per `tech-spec.md` §2.6 and
-`e2e-scenarios.md` Features 11 and 14). It serves as both:
-
-1. **External consumer library** — `XRaftClient` exposes `propose(data) →
-   Result<ProposalId>` and `read(key) → Result<Vec<u8>>` for callers outside
-   the cluster to submit commands to and read from the XRAFT replicated log.
-2. **Internal peer and admin client** — used by `xraft-server` for inter-node
-   Raft RPCs and by admin tooling for cluster-management commands.
-
-`e2e-scenarios.md` Feature 11 tests the inter-node routing and leader-discovery
-behaviour; Feature 14 exercises the external consumer API (`propose`/`read`).
+**Responsibility:** Internal peer RPC and admin client only — no external
+consumer SDK (`propose`/`read`) is in scope for v1 (per `tech-spec.md` §7
+decision 6 alignment note). `xraft-server` uses this crate for inter-node Raft
+RPCs, and admin tooling uses it for cluster-management commands.
 
 | Struct / Trait | Role |
 |---|---|
-| `XRaftClient` | External consumer API: `propose(data) → Result<ProposalId>`, `read(key) → Result<Vec<u8>>`. Tracks last-known leader via response hints; transparently redirects to the current leader. |
 | `PeerClient` | Wraps `tonic` gRPC channel to a specific peer. Sends `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` RPCs. Handles connection lifecycle and reconnection. |
 | `ConnectionPool` | Maintains a pool of `PeerClient` instances keyed by `NodeId`. Lazy-initialises connections on first use. |
 | `AdminClient` | Connects to a node's admin HTTP endpoint for operational queries (leader status, metrics, trigger snapshot). |
@@ -239,6 +231,7 @@ engine without real I/O. Inspired by deterministic simulation testing (Jepsen-st
 │  ─────────────────────────────────────────────────── │
 │  current_term  : u64                                 │
 │  voted_for     : Option<NodeId>                      │
+│  commit_index  : u64                                 │
 └──────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────┐
@@ -580,14 +573,11 @@ writes), the leader detects the mismatch and responds with a `DivergingEpoch`:
 
 ### 5.5 Check-Quorum Leader Step-Down
 
-Dynamic quorum changes (`AddVoter` / `RemoveVoter`) are a **stretch goal**
-within this story — the core v1 deliverable uses **static membership** (voter
-set fixed at cluster bootstrap), but dynamic membership may be delivered if
-schedule permits (per `tech-spec.md` §2.7, §3, and §7 decision 6, and
-`e2e-scenarios.md` Feature 12). `implementation-plan.md` Stage 7.2 covers
-static voter set bootstrap and observer support as the baseline; any
-`AddVoter`/`RemoveVoter` command is rejected with an `UNSUPPORTED` error in
-the core v1 deliverable.
+Dynamic quorum changes (`AddVoter` / `RemoveVoter`) are **out of scope for v1**
+and deferred to a future story entirely — they are not a stretch goal within
+XRAFT (per `tech-spec.md` §7 decision 6). The v1 deliverable uses **static
+membership** (voter set fixed at cluster bootstrap) and observer support only.
+Any `AddVoter`/`RemoveVoter` command is rejected with an `UNSUPPORTED` error.
 
 This section documents the Check-Quorum protocol that prevents stale leadership:
 
@@ -722,6 +712,6 @@ http_listen_address = "0.0.0.0:9090"
 
 ## 10. Relationship to Sibling Documents
 
-- **`tech-spec.md`**: Defines the problem statement, scope boundaries (in-scope vs. out-of-scope), hard constraints (language, concurrency model, persistence, timing), identified risks, and key resolved decisions (gRPC transport, protobuf encoding, pull-based replication). This document describes *what* the components are and how they interact; tech-spec establishes *why* those choices were made and *what limits* they operate under. **Crate naming:** all sibling documents now use the same names — `xraft-storage`, `xraft-transport`, `xraft-test` — per `tech-spec.md` §5.6 and §7 decision 4. **`xraft-client` scope:** `tech-spec.md` §2.6 and §5.6 define `xraft-client` as a **dual-role** crate — both an external consumer API (`propose`/`read`) and an internal peer/admin client (see §2.5). `e2e-scenarios.md` Feature 11 tests the inter-node peer path; Feature 14 exercises the external consumer API. **Dynamic membership:** `AddVoter`/`RemoveVoter` is a **stretch goal** within this story — the core v1 deliverable uses static membership (voter set fixed at bootstrap), but dynamic membership may be delivered if schedule permits (per `tech-spec.md` §2.7, §3, and §7 decision 6, and `e2e-scenarios.md` Feature 12). `implementation-plan.md` Stage 7.2 covers static voter set bootstrap and observer support as the baseline.
-- **`implementation-plan.md`**: Breaks this architecture into ordered implementation phases with crate-level milestones. References component names from this document. Where `implementation-plan.md` uses the name `InstallSnapshot`, it refers to the same operation as `FetchSnapshot` defined here. **Trait locations:** `implementation-plan.md` Stage 2.1 and Stage 2.3 confirm that all trait definitions (`LogStore`, `SnapshotStore`) live in `xraft-core`; implementation crates import and implement them (see §4.1). **Trait signatures:** §4.1 method names and shapes are aligned with `implementation-plan.md` — `LogStore` uses `append`, `get`, `get_range`, `last_index`, `last_term`, `truncate_from`, `term_at` (Stage 2.1); `SnapshotStore` uses `save_snapshot`, `load_latest_snapshot`, `list_snapshots`, `delete_snapshot` (Stage 2.3); `Transport` uses `send_vote`, `send_pre_vote`, `send_fetch`, `send_fetch_snapshot`, `start_server` (Stage 4.1). **HardState fields:** `HardState` contains only `current_term: Term` and `voted_for: Option<NodeId>` (per `implementation-plan.md` Stage 2.2); `commit_index` and `last_applied` are volatile, rebuilt from the log on recovery. **NodeId type:** `NodeId` is `u64` everywhere (per `implementation-plan.md` Stage 1.2). **Snapshot filename convention:** this document adopts the `snapshot-{term}-{index}.bin` naming from `implementation-plan.md` Stage 2.3.
+- **`tech-spec.md`**: Defines the problem statement, scope boundaries (in-scope vs. out-of-scope), hard constraints (language, concurrency model, persistence, timing), identified risks, and key resolved decisions (gRPC transport, protobuf encoding, pull-based replication). This document describes *what* the components are and how they interact; tech-spec establishes *why* those choices were made and *what limits* they operate under. **Crate naming:** all sibling documents now use the same names — `xraft-storage`, `xraft-transport`, `xraft-test` — per `tech-spec.md` §5.6 and §7 decision 4. **`xraft-client` scope:** `xraft-client` is an **internal** peer RPC and admin client only — no external consumer SDK (`propose`/`read`) is in scope for v1 (per `tech-spec.md` §7 decision 6 alignment note). `e2e-scenarios.md` Feature 11 tests the inter-node peer path. **Dynamic membership:** `AddVoter`/`RemoveVoter` is **out of scope for v1** and deferred to a future story entirely — not a stretch goal within XRAFT (per `tech-spec.md` §7 decision 6). The v1 deliverable uses static membership (voter set fixed at bootstrap) and observer support only; any `AddVoter`/`RemoveVoter` command is rejected with `UNSUPPORTED`.
+- **`implementation-plan.md`**: Breaks this architecture into ordered implementation phases with crate-level milestones. References component names from this document. Where `implementation-plan.md` uses the name `InstallSnapshot`, it refers to the same operation as `FetchSnapshot` defined here. **Trait locations:** `implementation-plan.md` Stage 2.1 and Stage 2.3 confirm that all trait definitions (`LogStore`, `SnapshotStore`) live in `xraft-core`; implementation crates import and implement them (see §4.1). **Trait signatures:** §4.1 method names and shapes are aligned with `implementation-plan.md` — `LogStore` uses `append`, `get`, `get_range`, `last_index`, `last_term`, `truncate_from`, `term_at` (Stage 2.1); `SnapshotStore` uses `save_snapshot`, `load_latest_snapshot`, `list_snapshots`, `delete_snapshot` (Stage 2.3); `Transport` uses `send_vote`, `send_pre_vote`, `send_fetch`, `send_fetch_snapshot`, `start_server` (Stage 4.1). **HardState fields:** `HardState` contains `current_term: Term`, `voted_for: Option<NodeId>`, and `commit_index: LogIndex` — all three persisted atomically to the `quorum-state` file (per `implementation-plan.md` Stage 2.2). `last_applied` is volatile, rebuilt from the log on recovery. **Log implementation naming:** the concrete log implementation is named `FileLogStore` (per `implementation-plan.md` Stage 2.1), backed by append-only segment files. **NodeId type:** `NodeId` is `u64` everywhere (per `implementation-plan.md` Stage 1.2). **Snapshot filename convention:** this document adopts the `snapshot-{term}-{index}.bin` naming from `implementation-plan.md` Stage 2.3.
 - **`e2e-scenarios.md`**: Defines integration test scenarios (election under partition, snapshot catch-up, check-quorum step-down) against the sequence flows in Section 5.
