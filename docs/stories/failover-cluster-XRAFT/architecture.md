@@ -68,7 +68,7 @@ step-down) is a pure function of inputs and current state.
 | `Term` | Newtype `u64`. Monotonically increasing logical clock. |
 | `LogIndex` | Newtype `u64`. 1-based position in the replicated log. |
 | `Entry` | `(LogIndex, Term, EntryPayload)` — a single log entry. |
-| `EntryPayload` | Enum: `Command(Bytes)`, `NoOp`, `Snapshot(SnapshotMeta)`, `ConfigChange(VoterSet)`. Dynamic membership (`AddVoter`/`RemoveVoter`) is **out of scope for v1** and deferred to a future story entirely (per `tech-spec.md` §2.7/§3/§7). The `ConfigChange` variant is reserved in the enum so the log format is forward-compatible, but the `RaftNode` rejects any `ConfigChange` proposal with `UNSUPPORTED` in this story. |
+| `EntryPayload` | Enum: `Command(Bytes)`, `NoOp`, `ConfigChange(VoterSet)`. Dynamic membership (`AddVoter`/`RemoveVoter`) is **out of scope for v1** and deferred to a future story entirely (per `tech-spec.md` §2.7/§3/§7). The `ConfigChange` variant is reserved in the enum so the log format is forward-compatible, but the `RaftNode` rejects any `ConfigChange` proposal with `UNSUPPORTED` in this story. **Wire format alignment:** the protobuf `LogEntry` message (per `implementation-plan.md` Stage 1.3) defines `entry_type` as `Command`, `NoOp`, or `Config` — these map 1:1 to the three `EntryPayload` variants. Snapshots are **not** a log-entry payload; they are separate files transferred via `FetchSnapshot` RPCs (see §2.3 and §5.3). |
 | `HardState` | Persisted atomically before any RPC reply. Contains three fields: `current_term: Term`, `voted_for: Option<NodeId>`, `commit_index: LogIndex` (per `implementation-plan.md` Stage 2.2 and Stage 7.2). All three fields are written to the `quorum-state` file in a single atomic operation alongside `VoterSet`. `last_applied` is volatile, rebuilt from the log on recovery by replaying committed entries from `commit_index` (see §3.3). |
 | `VoterSet` | Set of `(NodeId, NodeDirectoryId, Vec<Endpoint>)` tuples — the current quorum configuration. |
 | `ElectionTimer` | Randomised election timeout (150–300 ms default). Reset on valid leader contact. |
@@ -110,8 +110,8 @@ creation and loading. Provides file-backed implementations of the `LogStore`,
 | `FileLogStore` | Implements `LogStore`. Splits the log into fixed-size segment files (`00000000000000000000.log`). Supports `fsync`-on-write for durability. Named `FileLogStore` per `implementation-plan.md` Stage 2.1. |
 | `SnapshotStore` (trait) | `save_snapshot(metadata, data)`, `load_latest_snapshot()`, `list_snapshots()`, `delete_snapshot(id)`. |
 | `FileSnapshotStore` | Implements `SnapshotStore`. Writes snapshots to `<data_dir>/snapshots/snapshot-<term>-<index>.bin`. The base naming convention (`snapshot-{term}-{index}.bin`) follows `implementation-plan.md` Stage 2.3; on disk, term and index are zero-padded to fixed widths for lexicographic ordering (e.g., `snapshot-0000000003-00000000000000000512.bin`). |
-| `HardStateStore` (trait) | `persist(HardState)`, `load() -> Option<HardState>`. |
-| `FileHardStateStore` | Implements `HardStateStore`. Atomic write to `quorum-state` file (write-tmp + rename). |
+| `HardStateStore` (trait) | `persist(state: &HardState, voters: &VoterSet)`, `load() -> Option<(HardState, VoterSet)>`. Atomically persists both `HardState` and `VoterSet` together so that the durable quorum state is always consistent (see §4.1). |
+| `FileHardStateStore` | Implements `HardStateStore`. Atomic write of `HardState` + `VoterSet` to `quorum-state` file (write-tmp + rename). |
 | `LogSegment` | One segment file. Tracks base offset, byte size, entry count. |
 | `SegmentIndex` | Memory-mapped sparse index for O(1) offset-to-position lookups within a segment. |
 
@@ -331,6 +331,18 @@ the highest index `I` such that a strict majority of voters satisfy
 `last_fetch_offset - 1 >= I` (i.e., they have replicated index `I`).
 Only entries at or below HW are considered committed.
 
+> **Reconciliation with `implementation-plan.md` Stage 3.3:** The implementation
+> plan states commit advancement checks "`last_fetch_offset >= N`" — this is
+> equivalent to this document's "`last_fetch_offset - 1 >= I`" because
+> `last_fetch_offset >= N` means the follower has replicated up to `N - 1`,
+> which is the same as saying `last_fetch_offset - 1 >= N - 1`. Both formulations
+> express the same safety property: the leader advances HW to the highest index
+> replicated by a majority. The implementation plan's wording uses `N` as the
+> commit candidate index (follower has `last_fetch_offset >= N` means it has
+> replicated at least entry `N - 1`); this document uses `I` as the replicated
+> index (follower has `last_fetch_offset - 1 >= I` means it has replicated at
+> least entry `I`). Setting `I = N - 1` shows equivalence.
+
 ### 3.3 On-Disk Layout
 
 ```
@@ -388,9 +400,13 @@ trait SnapshotStore: Send + Sync {
 }
 
 trait HardStateStore: Send + Sync {
-    fn persist(&mut self, state: &HardState) -> Result<()>;
-    fn load(&self) -> Result<Option<HardState>>;
+    fn persist(&mut self, state: &HardState, voters: &VoterSet) -> Result<()>;
+    fn load(&self) -> Result<Option<(HardState, VoterSet)>>;
 }
+// Note: persist() atomically writes both HardState and VoterSet to the
+// `quorum-state` file in a single write-tmp-then-rename operation.
+// This ensures the durable voter set is always consistent with the
+// term/vote/commit state, as required by §2.1, §3.1, and §3.3.
 
 // xraft-core also defines the network trait
 // (xraft-transport provides the gRPC implementation):
@@ -575,6 +591,15 @@ replication and is consistent with KRaft's design.
 
 ### 5.3 Snapshot Transfer (Slow Follower Catch-Up)
 
+The `FetchSnapshot` RPC is defined as a **single request** returning a
+**server-streaming response** of `FetchSnapshotChunk` messages (per §2.3 and
+`implementation-plan.md` Stage 1.3). The follower sends one
+`FetchSnapshotRequest(replica_id, snapshot_id)` and receives a stream of
+chunks. The first chunk carries `SnapshotMetadata` (including
+`last_included_index`, `last_included_term`, and `voter_set`). Each subsequent
+chunk carries a `data` segment and a `done` flag. The chunk size is bounded by
+`snapshot_max_chunk_bytes` (default 1 MiB, see §8).
+
 ```
   Leader (A)                               Slow Follower (D)
     │                                           │
@@ -585,11 +610,15 @@ replication and is consistent with KRaft's design.
     │── FetchResp(snapshot_hint) ──────────────►│
     │   snapshot_id=(index=500, term=4)         │
     │                                           │
-    │◄── FetchSnapshotReq(offset=0, max=1MB) ──┤
-    │── FetchSnapshotChunk(data, offset=0) ────►│
+    │◄── FetchSnapshotRequest ─────────────────┤
+    │    (replica_id=D, snapshot_id=...)        │
     │                                           │
-    │◄── FetchSnapshotReq(offset=1MB) ─────────┤
-    │── FetchSnapshotChunk(data, done=true) ───►│
+    │── stream FetchSnapshotChunk #1 ─────────►│
+    │   (metadata={idx=500,term=4}, data, done=false)
+    │── stream FetchSnapshotChunk #2 ─────────►│
+    │   (data, done=false)                      │
+    │── stream FetchSnapshotChunk #3 ─────────►│
+    │   (data, done=true)                       │
     │                                           │
     │                               install snapshot │
     │                               restore state    │
@@ -803,5 +832,5 @@ admin_listen_addr = "0.0.0.0:9090"
 ## 10. Relationship to Sibling Documents
 
 - **`tech-spec.md`**: Defines the problem statement, scope boundaries (in-scope vs. out-of-scope), hard constraints (language, concurrency model, persistence, timing), identified risks, and key resolved decisions (gRPC transport, protobuf encoding, pull-based replication). This document describes *what* the components are and how they interact; tech-spec establishes *why* those choices were made and *what limits* they operate under. **Crate naming:** all sibling documents now use the same names — `xraft-storage`, `xraft-transport`, `xraft-test` — per `tech-spec.md` §5.6 and §7 decision 4. **`xraft-client` scope:** `xraft-client` is an **internal** crate providing (a) peer-to-peer RPC (Fetch, Vote, FetchSnapshot) for inter-node communication and (b) admin/operational queries via `AdminClient`. It is **not** an external consumer SDK — no `propose`/`read` API for outside callers is in scope for v1 (per `tech-spec.md` §2.6 and `e2e-scenarios.md` Feature 11). Library consumers submit proposals and reads through `xraft-server`'s embedded API (see §2.4). **Dynamic membership:** `AddVoter`/`RemoveVoter` is **out of scope for v1** and deferred to a future story entirely — it is not a stretch goal within XRAFT (per `tech-spec.md` §2.7/§3/§7 and `e2e-scenarios.md` Feature 12). The `ConfigChange(VoterSet)` variant is reserved in `EntryPayload` so the log format is forward-compatible, but the `RaftNode` rejects any `ConfigChange` proposal with `UNSUPPORTED`. The v1 baseline uses static membership (voter set fixed at bootstrap) with observer support.
-- **`implementation-plan.md`**: Breaks this architecture into ordered implementation phases with crate-level milestones. References component names from this document. Where `implementation-plan.md` uses the name `InstallSnapshot`, it refers to the same operation as `FetchSnapshot` defined here. **Configuration boundary (Stage 1.2):** `ClusterConfig` contains all consensus-relevant fields including `bootstrap_voters`, `bootstrap_observers`, `enable_check_quorum`, `enable_leader_lease`, `segment_max_bytes`, `snapshot_max_chunk_bytes`, and TLS fields. `NodeConfig` embeds `ClusterConfig` via `#[serde(flatten)]` and adds only three deployment-specific extension fields: `connect_timeout_ms`, `request_timeout_ms`, and `admin_listen_addr`. This boundary is consistent between this document (§2.4 and §8) and `implementation-plan.md` Stage 1.2. **Proto ownership:** `proto/raft.proto`, `build.rs`, and the generated Protobuf types all live in `xraft-core` (per `implementation-plan.md` Stage 1.3); `xraft-core/src/message.rs` re-exports the generated types. `xraft-transport` imports these proto types from `xraft-core` and provides the runtime gRPC server/client implementation (see §2.3). **Trait locations:** `implementation-plan.md` Stage 2.1 and Stage 2.3 confirm that all trait definitions (`LogStore`, `SnapshotStore`) live in `xraft-core`; implementation crates import and implement them (see §4.1). **Trait signatures:** §4.1 method names and shapes are aligned with `implementation-plan.md` — `LogStore` uses `append`, `get`, `get_range`, `last_index`, `last_term`, `truncate_from`, `term_at` (Stage 2.1); `SnapshotStore` uses `save_snapshot`, `load_latest_snapshot`, `list_snapshots`, `delete_snapshot(id)` (Stage 2.3); `Transport` uses `send_vote`, `send_pre_vote`, `send_fetch`, `send_fetch_snapshot`, `start_server` (Stage 4.1). **HardState fields:** `HardState` contains three fields: `current_term: Term`, `voted_for: Option<NodeId>`, and `commit_index: LogIndex` (per `implementation-plan.md` Stage 2.2 and Stage 7.2). All three are persisted atomically to the `quorum-state` file alongside `VoterSet`. `last_applied` is volatile, rebuilt from the log on recovery by replaying committed entries from `commit_index`. **Log implementation naming:** the concrete log implementation is named `FileLogStore` (per `implementation-plan.md` Stage 2.1), backed by append-only segment files. **Segment default size:** 64 MiB (per `implementation-plan.md` Stage 2.1). **NodeId type:** `NodeId` is `u64` everywhere (per `implementation-plan.md` Stage 1.2). **Snapshot filename convention:** this document adopts the `snapshot-{term}-{index}.bin` naming from `implementation-plan.md` Stage 2.3, adding fixed-width zero-padding for lexicographic ordering on disk (see §2.2 and §3.3).
+- **`implementation-plan.md`**: Breaks this architecture into ordered implementation phases with crate-level milestones. References component names from this document. Where `implementation-plan.md` uses the name `InstallSnapshot`, it refers to the same operation as `FetchSnapshot` defined here. **Configuration boundary (Stage 1.2):** `ClusterConfig` contains all consensus-relevant fields including `bootstrap_voters`, `bootstrap_observers`, `enable_check_quorum`, `enable_leader_lease`, `segment_max_bytes`, `snapshot_max_chunk_bytes`, and TLS fields. `NodeConfig` embeds `ClusterConfig` via `#[serde(flatten)]` and adds only three deployment-specific extension fields: `connect_timeout_ms`, `request_timeout_ms`, and `admin_listen_addr`. This boundary is consistent between this document (§2.4 and §8) and `implementation-plan.md` Stage 1.2. **Proto ownership:** `proto/raft.proto`, `build.rs`, and the generated Protobuf types all live in `xraft-core` (per `implementation-plan.md` Stage 1.3); `xraft-core/src/message.rs` re-exports the generated types. `xraft-transport` imports these proto types from `xraft-core` and provides the runtime gRPC server/client implementation (see §2.3). **Trait locations:** `implementation-plan.md` Stage 2.1 and Stage 2.3 confirm that all trait definitions (`LogStore`, `SnapshotStore`) live in `xraft-core`; implementation crates import and implement them (see §4.1). **Trait signatures:** §4.1 method names and shapes are aligned with `implementation-plan.md` — `LogStore` uses `append`, `get`, `get_range`, `last_index`, `last_term`, `truncate_from`, `term_at` (Stage 2.1); `SnapshotStore` uses `save_snapshot`, `load_latest_snapshot`, `list_snapshots`, `delete_snapshot(id)` (Stage 2.3); `Transport` uses `send_vote`, `send_pre_vote`, `send_fetch`, `send_fetch_snapshot`, `start_server` (Stage 4.1). **HardStateStore signature:** `HardStateStore::persist(state, voters)` accepts both `HardState` and `VoterSet` and writes them atomically; `load()` returns `Option<(HardState, VoterSet)>`. This matches `implementation-plan.md` Stage 2.2 (trait definition) and Stage 7.2 (which persists `VoterSet` alongside `HardState` in the `quorum-state` file as a separate top-level field). **HardState fields:** `HardState` contains three fields: `current_term: Term`, `voted_for: Option<NodeId>`, and `commit_index: LogIndex` (per `implementation-plan.md` Stage 2.2 and Stage 7.2). All three are persisted atomically to the `quorum-state` file alongside `VoterSet`. `last_applied` is volatile, rebuilt from the log on recovery by replaying committed entries from `commit_index`. **EntryPayload alignment:** This document defines `EntryPayload` with three variants: `Command(Bytes)`, `NoOp`, `ConfigChange(VoterSet)`. The protobuf `LogEntry` message (per `implementation-plan.md` Stage 1.3) defines `entry_type` as `Command`, `NoOp`, or `Config` — these map 1:1 to the three Rust-side variants. Snapshots are not a log-entry payload; they are separate files transferred via `FetchSnapshot` RPCs. (The implementation plan's Stage 1.2 line for `EntryPayload` includes an in-memory `Snapshot(SnapshotMeta)` variant for compaction markers that is never serialised to the wire — this architecture document omits it from the canonical payload enum to avoid confusion with the `FetchSnapshot` RPC-based transfer mechanism.) **Commit advancement reconciliation (§3.2 vs Stage 3.3):** `implementation-plan.md` Stage 3.3 states commit advancement checks `last_fetch_offset >= N`; this document (§3.2) states the equivalent `last_fetch_offset - 1 >= I`. Both express the same safety property — see §3.2 for the detailed equivalence proof. **Log implementation naming:** the concrete log implementation is named `FileLogStore` (per `implementation-plan.md` Stage 2.1), backed by append-only segment files. **Segment default size:** 64 MiB (per `implementation-plan.md` Stage 2.1). **NodeId type:** `NodeId` is `u64` everywhere (per `implementation-plan.md` Stage 1.2). **Snapshot filename convention:** this document adopts the `snapshot-{term}-{index}.bin` naming from `implementation-plan.md` Stage 2.3, adding fixed-width zero-padding for lexicographic ordering on disk (see §2.2 and §3.3).
 - **`e2e-scenarios.md`**: Defines integration test scenarios (election under partition, snapshot catch-up, check-quorum step-down) against the sequence flows in Section 5.
