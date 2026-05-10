@@ -12,7 +12,7 @@ storyId: "failover-cluster:XRAFT"
 
 ### Implementation Steps
 - [ ] Initialize Cargo workspace at repo root with `Cargo.toml` defining members: `xraft-core`, `xraft-storage`, `xraft-transport`, `xraft-server`, `xraft-client`, `xraft-test`
-- [ ] Create `xraft-core` crate with `lib.rs` exporting top-level modules: `types`, `config`, `error`, `message`
+- [ ] Create `xraft-core` crate with `lib.rs` exporting top-level modules: `types`, `config`, `error`, `message`; add `#![forbid(unsafe_code)]` at the crate root per `tech-spec.md` §5.1 (consensus crate must forbid unsafe; `unsafe` allowed only in storage layer with documented safety invariants)
 - [ ] Create `xraft-storage` crate with `lib.rs` stub and dependency on `xraft-core`
 - [ ] Create `xraft-transport` crate with `lib.rs` stub and dependency on `xraft-core`
 - [ ] Create `xraft-server` crate (binary) with `main.rs` stub and dependencies on all library crates
@@ -35,7 +35,7 @@ storyId: "failover-cluster:XRAFT"
 ### Implementation Steps
 - [ ] Define `NodeId` (u64), `Term` (u64), `LogIndex` (u64), `DirectoryId` (Uuid) types in `xraft-core/src/types.rs` with `Serialize`, `Deserialize`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash`, `Debug` derives
 - [ ] Define `NodeRole` enum (`Leader`, `Follower`, `PreCandidate`, `Candidate`, `Observer`) in `xraft-core/src/types.rs` — `PreCandidate` is the state during the Pre-Vote phase before term is incremented (per `architecture.md` §2.1)
-- [ ] Define `ClusterConfig` struct in `xraft-core/src/config.rs` with fields: `node_id`, `cluster_id`, `listen_addr`, `peers` (Vec of peer addresses), `election_timeout_min_ms`, `election_timeout_max_ms`, `fetch_interval_ms`, `tick_interval_ms`, `snapshot_interval`, `max_log_entries_before_compaction`, `data_dir`
+- [ ] Define `ClusterConfig` struct in `xraft-core/src/config.rs` with fields: `node_id`, `cluster_id`, `listen_addr`, `peers` (Vec of peer addresses), `election_timeout_min_ms`, `election_timeout_max_ms`, `fetch_interval_ms`, `tick_interval_ms`, `snapshot_interval`, `max_log_entries_before_compaction`, `data_dir`, `tls` (optional `TlsConfig` with `cert_path` and `key_path` fields per `tech-spec.md` §2.7 / `architecture.md` §2.3 — not mandatory for v1 functional correctness but the configuration surface must exist)
 - [ ] Implement config loading from TOML file and environment variable overrides using `serde` and `toml` crate
 - [ ] Define `XRaftError` enum in `xraft-core/src/error.rs` using `thiserror` with variants: `Storage`, `Transport`, `NotLeader`, `ElectionTimeout`, `InvalidTerm`, `LogInconsistency`, `Shutdown`, `Config`
 - [ ] Define `Result<T>` type alias as `std::result::Result<T, XRaftError>`
@@ -102,7 +102,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Add validation in `persist()` that term never decreases and voted_for is only set once per term
 
 ### Dependencies
-- _none — start stage_
+- phase-persistent-storage/stage-write-ahead-log
 
 ### Test Scenarios
 - [ ] Scenario: state-persistence — Given a saved HardState with term=5 and voted_for=Some(3), When the FileHardStateStore is reloaded from the `quorum-state` file, Then the loaded state matches exactly
@@ -202,6 +202,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement connection pooling in `RaftGrpcClient`: maintain one persistent channel per peer, reconnect on failure with exponential backoff
 - [ ] Define `Transport` trait in `xraft-core/src/transport.rs` abstracting over network implementation with methods: `send_vote`, `send_pre_vote`, `send_fetch`, `send_fetch_snapshot`, `start_server` — trait lives in `xraft-core` per `architecture.md` §4.1; `xraft-transport` imports and implements it
 - [ ] Implement the `Transport` trait for the gRPC implementation in `xraft-transport/src/grpc.rs`
+- [ ] Implement optional TLS support in `RaftGrpcServer` and `RaftGrpcClient`: if `ClusterConfig.tls` is `Some`, configure `tonic` with `ServerTlsConfig` / `ClientTlsConfig` using the provided cert and key paths; if `None`, use plaintext — per `tech-spec.md` §2.7 the configuration surface must exist even though TLS is not mandatory for v1 functional correctness
 
 ### Dependencies
 - _none — start stage_
@@ -210,6 +211,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Scenario: grpc-vote-roundtrip — Given a running RaftGrpcServer, When a VoteRequest is sent via RaftGrpcClient, Then a VoteResponse is received with correct fields
 - [ ] Scenario: connection-retry — Given a peer that is temporarily unreachable, When send_vote is called, Then the client retries with backoff and eventually succeeds when the peer comes back
 - [ ] Scenario: concurrent-rpcs — Given a running server, When 50 concurrent Fetch RPCs arrive, Then all are processed without deadlock or data corruption
+- [ ] Scenario: tls-transport — Given a cluster configured with TLS cert and key paths, When a VoteRequest is sent over the TLS-enabled gRPC channel, Then the connection succeeds and the VoteResponse is received correctly
 
 ## Stage 4.2: Message Router and Driver Loop
 
@@ -296,7 +298,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement `PeerClient` in `xraft-client/src/peer.rs` wrapping a `tonic` gRPC channel to a specific peer, providing typed methods for `Vote`, `PreVote`, `Fetch`, and `FetchSnapshot` RPCs with connection lifecycle management
 - [ ] Implement `ConnectionPool` in `xraft-client/src/pool.rs` maintaining lazy-initialized `PeerClient` instances keyed by `NodeId`, with automatic reconnection on channel failure
 - [ ] Implement leader discovery: `PeerClient` tracks last-known leader via hints returned in `FetchResponse` and `VoteResponse` messages; followers cache the leader hint for internal routing decisions
-- [ ] Implement `AdminClient` in `xraft-client/src/admin.rs` connecting to a node's HTTP admin endpoint for operational queries (cluster status, trigger snapshot, node health) — per `architecture.md` §2.5 and `e2e-scenarios.md` Alignment Note 4, `xraft-client` is an **internal-only** crate for peer-to-peer RPC (Fetch, Vote, FetchSnapshot) and admin/operational queries; no external consumer SDK (`propose`/`read`) is in scope for v1; `tech-spec.md` §2.6 describes it as dual-role but `architecture.md` §2.5 and `e2e-scenarios.md` Alignment Note 4 take precedence as the corrected position
+- [ ] Implement `AdminClient` in `xraft-client/src/admin.rs` connecting to a node's HTTP admin endpoint for operational queries (cluster status, trigger snapshot, node health) — **cross-doc conflict on `xraft-client` scope:** `tech-spec.md` §2.6/§5.6/§7 consistently describes `xraft-client` as internal-only (peer RPC + admin, no external consumer SDK for v1); `architecture.md` §2.5/§10 and `e2e-scenarios.md` Feature 14 / Alignment Note 4 describe it as dual-role with an external consumer API (`propose`/`read`); `e2e-scenarios.md` Feature 11 aligns with the internal-only position; **this plan follows the `tech-spec.md` position** (internal peer RPC and admin only for v1) pending sibling-doc alignment on this conflict
 - [ ] Add timeout and retry configuration with sensible defaults (connect: 5s, request: 30s, backoff with jitter)
 
 ### Dependencies
@@ -317,7 +319,7 @@ storyId: "failover-cluster:XRAFT"
 
 ### Implementation Steps
 - [ ] Implement Check Quorum mechanism in leader: track last successful communication time per voter peer; the leader counts itself as one voter and steps down if a majority of the full voter set (including self) has not responded within the election timeout — e.g. in a 5-node cluster, the leader needs at least 2 of the 4 other voters to have responded recently (since leader + 2 = 3 = majority of 5)
-- [ ] Implement leader lease optimization: if the leader has heard from a majority within the last election timeout period (via incoming Fetch RPCs), serve reads locally without an extra round-trip
+- [ ] Implement leader lease optimization: if the leader has heard from a majority within the last election timeout period (via incoming Fetch RPCs), it may skip the extra commit-index confirmation round-trip when answering internal read queries (e.g. admin status queries or `StateMachineCallback`-based lookups); this is a leader-internal optimization and does not expose an external client read API
 - [ ] Add configuration option `enable_check_quorum` (default true) and `enable_leader_lease` (default false) in `ClusterConfig`
 - [ ] Implement leader step-down on receiving a higher term from any RPC, ensuring no stale leader continues to serve
 
@@ -327,7 +329,7 @@ storyId: "failover-cluster:XRAFT"
 ### Test Scenarios
 - [ ] Scenario: check-quorum-steps-down — Given a 3-node cluster where the leader is partitioned from both followers, When the election timeout elapses without majority contact, Then the leader steps down to Follower
 - [ ] Scenario: check-quorum-healthy — Given a 3-node cluster with normal communication, When the leader runs Check Quorum, Then it remains leader because a majority is reachable
-- [ ] Scenario: leader-lease-read — Given a leader with an active lease (majority heard from via recent Fetch RPCs), When a read request arrives, Then it is served without an extra round-trip
+- [ ] Scenario: leader-lease-read — Given a leader with an active lease (majority heard from via recent Fetch RPCs), When an internal read query arrives (e.g. admin status), Then it is answered without an extra commit-index confirmation round-trip
 
 ## Stage 7.2: Static Voter Set Bootstrap and Observer Support
 
@@ -337,7 +339,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement `Observer` role: non-voting nodes that replicate the log via Fetch RPCs for read scaling or standby purposes, without participating in elections or quorum calculations
 - [ ] Implement observer registration: observers connect to the leader and send Fetch RPCs like voters, but the leader excludes them from high-watermark quorum computation
 - [ ] Persist the `VoterSet` in snapshots so that nodes restoring from a snapshot know the cluster membership without re-reading configuration
-- [ ] Implement `AddVoter`/`RemoveVoter` command rejection: any attempt to issue an `AddVoter` or `RemoveVoter` command must return an `UNSUPPORTED` error with a message indicating dynamic membership is **out of scope for v1** and deferred to a future story entirely — it is not a stretch goal within XRAFT (per `architecture.md` §10 and `e2e-scenarios.md` Alignment Note 3 which both state dynamic membership is deferred to a future story; `tech-spec.md` §2.7/§7 describes it as a stretch goal within this story — this plan follows the `architecture.md`/`e2e-scenarios.md` position as authoritative); the voter set remains unchanged
+- [ ] Implement `AddVoter`/`RemoveVoter` command rejection: any attempt to issue an `AddVoter` or `RemoveVoter` command must return an `UNSUPPORTED` error with a message indicating dynamic membership is **out of scope for v1** — **cross-doc conflict on membership scope:** `e2e-scenarios.md` Alignment Note 3 and `architecture.md` §10 describe dynamic membership as a **stretch goal within this story** (may be delivered if schedule permits); `tech-spec.md` §7 describes it as **out of scope for v1 and deferred to a future story entirely**; **this plan follows the `tech-spec.md` position** (deferred to future story, not a stretch goal) pending sibling-doc alignment; the voter set remains static for v1
 
 ### Dependencies
 - phase-advanced-raft-features/stage-check-quorum-and-leader-lease
@@ -377,7 +379,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Create integration test infrastructure in the `xraft-test` crate with a `SimulatedCluster` harness that spins up 3-node and 5-node in-process clusters using `SimulatedNetwork` (no real network)
 - [ ] Implement `SimulatedNetwork` in `xraft-test` that simulates message passing with configurable latency, packet loss, and network partitions, plus `SimulatedClock` for deterministic tick advancement
 - [ ] Write integration test: cluster elects a leader within 2 election timeout periods after startup
-- [ ] Write integration test: client can propose and read back 1000 key-value entries through the leader
+- [ ] Write integration test: test harness submits 1000 opaque log entries as proposals through the leader's internal command channel; a test `StateMachineCallback` records applied entries; after commit, the callback's state contains all 1000 entries in order
 - [ ] Write integration test: killing the leader triggers re-election and the new leader has all committed entries
 - [ ] Write integration test: a partitioned follower rejoins and catches up via log replication or snapshot install
 
@@ -386,7 +388,7 @@ storyId: "failover-cluster:XRAFT"
 
 ### Test Scenarios
 - [ ] Scenario: three-node-election — Given a 3-node cluster started simultaneously, When election timeouts elapse, Then exactly one leader is elected and all nodes agree on the term
-- [ ] Scenario: data-consistency-after-failover — Given a 3-node cluster with 500 committed entries, When the leader is killed and a new leader elected, Then a client reading from the new leader sees all 500 entries
+- [ ] Scenario: data-consistency-after-failover — Given a 3-node cluster with 500 committed opaque log entries applied to a test `StateMachineCallback`, When the leader is killed and a new leader elected, Then the new leader's `StateMachineCallback` contains all 500 entries in order
 - [ ] Scenario: network-partition-recovery — Given a 5-node cluster split into groups of 3 and 2, When the partition heals, Then the minority group's nodes catch up and the cluster converges on one leader
 
 ## Stage 8.2: Chaos and Stress Testing
@@ -397,6 +399,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Write test: rapid leader churn (kill leader every 2 seconds for 30 seconds), verify cluster recovers each time and no committed entries are lost
 - [ ] Write test: simultaneous election (3 candidates start elections at same term), verify exactly one wins or a new election resolves the tie
 - [ ] Implement deterministic simulation mode in `xraft-test`: use `SimulatedClock` and `SimulatedNetwork` to replace real timers and network with controllable fakes for reproducible test runs using seed-based random
+- [ ] Implement linearisability validation using `stateright` or equivalent model checker per `tech-spec.md` §2.5: record a history of operations (proposals and their commit confirmations) during simulation runs and verify the history is linearisable; integrate as a post-hoc check in chaos test scenarios
 
 ### Dependencies
 - phase-integration-testing-and-hardening/stage-multi-node-integration-tests
@@ -405,4 +408,5 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Scenario: chaos-no-data-loss — Given a 5-node cluster under chaos (random kills, partitions, delays) for 60 seconds, When chaos stops and the cluster stabilizes, Then all committed entries are present on a majority of nodes
 - [ ] Scenario: rapid-leader-churn-recovery — Given leader killed every 2 seconds for 30 seconds, When the cluster stabilizes, Then a single leader is elected and all committed entries are intact
 - [ ] Scenario: deterministic-replay — Given a chaos test run with seed=42, When replayed with the same seed, Then the exact same sequence of events and outcomes occurs
+- [ ] Scenario: linearisability-check — Given a 5-node cluster under chaos for 30 seconds with concurrent proposals, When the operation history is validated by the linearisability checker, Then all committed operations form a linearisable history
 
