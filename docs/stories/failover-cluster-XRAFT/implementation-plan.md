@@ -52,7 +52,7 @@ storyId: "failover-cluster:XRAFT"
 ## Stage 1.3: RPC Message Definitions
 
 ### Implementation Steps
-- [ ] Create `proto/raft.proto` defining protobuf messages: `VoteRequest`, `VoteResponse`, `PreVoteRequest`, `PreVoteResponse`, `FetchRequest`, `FetchResponse` — these are the only wire RPC messages; there are no `AppendEntriesRequest`/`AppendEntriesResponse` proto messages (per `tech-spec.md` §2.2); `Action::AppendEntries` is an internal side-effect in `xraft-core` for the leader writing to its own log and has no proto representation
+- [ ] Create `proto/raft.proto` defining protobuf messages for wire RPCs only: `VoteRequest`, `VoteResponse`, `PreVoteRequest`, `PreVoteResponse`, `FetchRequest`, `FetchResponse` — these are the complete set of wire RPC messages; `Action::AppendEntries` is a pure Rust enum variant in `xraft-core` representing the internal side-effect of the leader appending to its own log and has no protobuf or gRPC representation (per `tech-spec.md` §2.2 and `architecture.md` §2.1)
 - [ ] Define `LogEntry` protobuf message with fields: `index`, `term`, `entry_type` (enum: Command, NoOp, Config), `data` (bytes)
 - [ ] Define `SnapshotMetadata` protobuf message with fields: `last_included_index`, `last_included_term`, `voter_set`
 - [ ] Define `FetchSnapshotRequest` and `FetchSnapshotChunk` protobuf messages for streamed snapshot transfer from leader to follower
@@ -96,7 +96,7 @@ storyId: "failover-cluster:XRAFT"
 
 ### Implementation Steps
 - [ ] Define `HardStateStore` trait in `xraft-core/src/storage.rs` with methods: `persist(state: &HardState) -> Result<()>`, `load() -> Result<Option<HardState>>` — trait lives in `xraft-core` per `architecture.md` §4.1
-- [ ] Define `HardState` struct in `xraft-core/src/types.rs` with fields: `current_term: Term`, `voted_for: Option<NodeId>`, `commit_index: LogIndex` — all three fields are persisted atomically to the `quorum-state` file before any RPC reply (per `architecture.md` §3.1 which lists `commit_index` inside `HardState`); `last_applied` is volatile and rebuilt from the log on recovery
+- [ ] Define `HardState` struct in `xraft-core/src/types.rs` with fields: `current_term: Term`, `voted_for: Option<NodeId>` — only safety-critical voting state is persisted (per `architecture.md` §2.1 which defines `HardState` as containing only `current_term` and `voted_for`); `commit_index` and `last_applied` are volatile, rebuilt from the log on recovery by scanning committed entries
 - [ ] Implement `FileHardStateStore` in `xraft-storage/src/state.rs` that persists `HardState` as JSON to a `quorum-state` file with atomic write (write to temp file then rename) for crash safety, consistent with KRaft's `quorum-state` pattern (per `tech-spec.md` §5.3)
 - [ ] Implement `load()` that reads state on startup with fallback to default initial state (term=0, voted_for=None)
 - [ ] Add validation in `persist()` that term never decreases and voted_for is only set once per term
@@ -280,7 +280,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement signal handling: `SIGTERM`/`SIGINT` trigger graceful shutdown, `SIGHUP` reloads configuration
 - [ ] Implement structured logging with `tracing`: JSON output format, configurable log level via `RUST_LOG` env var, span context for request tracing
 - [ ] Implement health check endpoint: simple HTTP endpoint at `/health` returning node role, term, commit_index, and leader_id using `axum`
-- [ ] Add Prometheus metrics endpoint at `/metrics` using `axum` and `prometheus-client`, exposing the canonical metrics from `e2e-scenarios.md` Feature 15: `xraft_current_leader` (gauge), `xraft_current_term` (gauge), `xraft_commit_index` (gauge), `xraft_log_end_offset` (gauge), `xraft_replication_lag` (gauge, per replica), `xraft_election_latency_seconds` (histogram), `xraft_commit_latency_seconds` (histogram), `xraft_append_records_total` (counter), `xraft_fetch_requests_total` (counter), `xraft_snapshot_installs_total` (counter)
+- [ ] Add Prometheus metrics endpoint at `/metrics` using `axum` and `prometheus-client`, exposing an MVP metrics subset for initial bootstrap (per `e2e-scenarios.md` Feature 15 phased delivery): `xraft_current_term` (gauge), `xraft_commit_index` (gauge), `xraft_role` (gauge, encoded as 0=Follower/1=PreCandidate/2=Candidate/3=Leader/4=Observer), `xraft_election_count` (counter), `xraft_append_latency_seconds` (histogram), `xraft_log_entries_total` (counter) — the full canonical metrics set from `architecture.md` §7 (including `xraft_current_leader`, `xraft_replication_lag`, `xraft_commit_latency_seconds`, etc.) will be extended incrementally in later stages
 
 ### Dependencies
 - _none — start stage_
@@ -297,7 +297,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement `ConnectionPool` in `xraft-client/src/pool.rs` maintaining lazy-initialized `PeerClient` instances keyed by `NodeId`, with automatic reconnection on channel failure
 - [ ] Implement leader discovery: `PeerClient` tracks last-known leader via hints returned in `FetchResponse` and `VoteResponse` messages; on `NOT_LEADER` errors, transparently retries against the hinted leader
 - [ ] Implement `AdminClient` in `xraft-client/src/admin.rs` connecting to a node's HTTP admin endpoint for operational queries (cluster status, trigger snapshot, node health)
-- [ ] Implement `XRaftClient` external consumer API in `xraft-client/src/client.rs` exposing `propose(data: Bytes) -> Result<ProposalId>` and `read(key: &[u8]) -> Result<Vec<u8>>` for callers outside the cluster (per `tech-spec.md` §2.6); `propose` forwards to the current leader via gRPC and awaits commit confirmation; `read` is served from the leader (or locally if leader lease is active)
+- [ ] Implement `XRaftClient` external consumer API in `xraft-client/src/client.rs` exposing `propose(data: Bytes) -> Result<ProposalId>` and `read(key: &[u8]) -> Result<Vec<u8>>` for callers outside the cluster (per `architecture.md` §2.5 which defines `xraft-client` as dual-role and `e2e-scenarios.md` Feature 11 which tests both internal and external APIs); `propose` forwards to the current leader via gRPC and awaits commit confirmation; `read` is served from the leader (or locally if leader lease is active); **cross-doc note:** `tech-spec.md` §2.6 describes `xraft-client` as internal-only — this plan follows the dual-role model from `architecture.md` and `e2e-scenarios.md` which include external consumer APIs in v1 scope
 - [ ] Implement leader redirection in `XRaftClient`: on `NOT_LEADER` error with leader hint, transparently retry against the hinted leader; maintain a cached leader address for subsequent calls
 - [ ] Add timeout and retry configuration with sensible defaults (connect: 5s, request: 30s, backoff with jitter)
 
@@ -335,7 +335,7 @@ storyId: "failover-cluster:XRAFT"
 ## Stage 7.2: Static Voter Set Bootstrap and Observer Support
 
 ### Implementation Steps
-- [ ] Implement cluster bootstrap from a fixed voter set defined in configuration: on first start with no persisted state, initialize `VoterSet` from config and persist it as part of `HardState` in the `quorum-state` file
+- [ ] Implement cluster bootstrap from a fixed voter set defined in configuration: on first start with no persisted state, initialize `VoterSet` from config and persist it alongside `HardState` in the `quorum-state` file (as a separate top-level field — `HardState` itself contains only `current_term` and `voted_for` per `architecture.md` §2.1)
 - [ ] Implement `VoterSet` validation at startup: require at least 1 voter; warn (but allow) even-numbered voter sets since they have lower fault tolerance per node; verify the local node is either in the voter set or registered as an observer
 - [ ] Implement `Observer` role: non-voting nodes that replicate the log via Fetch RPCs for read scaling or standby purposes, without participating in elections or quorum calculations
 - [ ] Implement observer registration: observers connect to the leader and send Fetch RPCs like voters, but the leader excludes them from high-watermark quorum computation
