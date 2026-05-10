@@ -1,0 +1,11 @@
+[package]
+name = "xraft-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+xraft-core = { path = "../xraft-core" }
+xraft-transport = { path = "../xraft-transport" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
