@@ -60,7 +60,7 @@ The following capabilities are in scope for the XRAFT story:
 | **Leader election** | Term-based voting with randomised election timeouts, `RequestVote` RPC, majority quorum |
 | **Log replication** | Append-only log with high-watermark tracking and epoch-based consistency checks.  Followers include `fetch_offset` (the next log index they want) and `last_fetched_epoch` (the term/epoch of the last entry they hold) in each `Fetch` RPC.  The leader validates these against its own log; on mismatch it returns a `DivergingEpoch` response indicating the truncation point, after which the follower truncates and re-fetches.  This replaces textbook Raft's push-based `AppendEntries` with `prevLogIndex`/`prevLogTerm` — the safety guarantees are identical, only the initiator and field names change (see §2.2). |
 | **Safety invariants** | All five Raft safety properties (§1 table) enforced and tested |
-| **Persistent state** | `currentTerm`, `votedFor`, and log durably persisted (`fsync`) before RPC responses |
+| **Persistent state** | `HardState` (`currentTerm`, `votedFor`, `commit_index`) and log durably persisted (`fsync`) before RPC responses.  `HardState` is persisted atomically to the `quorum-state` file alongside `VoterSet`, per `architecture.md` §2.1 and `implementation-plan.md` Stage 2.2. |
 | **Heartbeats** | In the pull-based model, the leader does **not** push standalone heartbeat messages.  Instead, followers send periodic `Fetch` RPCs; when no new entries exist, the leader returns an empty `Fetch` response carrying the current term and high watermark.  Followers treat any valid `Fetch` response (empty or not) as proof of leader liveness and reset their election timer accordingly.  This is functionally equivalent to textbook Raft heartbeats but initiated by the follower, consistent with the KRaft design.  **Terminology note:** `e2e-scenarios.md` Features 1, 10, 14, and 16 use the word "heartbeat" as a shorthand for this follower-initiated Fetch cycle.  When those scenarios say "heartbeat interval" or "heartbeat timeout," they mean the Fetch polling interval and the election timer, respectively — there is no separate leader-pushed heartbeat RPC. |
 | **Commit protocol** | Leader commits when majority acknowledges; followers apply on HW advance |
 | **No-op on election** | New leader appends a blank entry to commit pending entries from prior term |
@@ -122,10 +122,10 @@ callers is in scope for v1.  The crate provides:
 leader-discovery via Fetch responses, and `AdminClient` operational queries —
 the agreed v1 baseline.  Feature 11's preamble explicitly states that
 `xraft-client` is internal-only with no external `propose`/`read` API in scope
-for v1, matching this spec.  (*Cross-doc note:* `architecture.md` §2.5 still
-describes `xraft-client` as a "dual-role" crate with an external
-`XRaftClient.propose`/`read` API; `architecture.md` should be updated in a
-future iteration to match this spec and `e2e-scenarios.md`.)
+for v1, matching this spec.  `architecture.md` §2.5 is also aligned: it
+describes `xraft-client` as internal-only with no external consumer SDK, and
+notes that library consumers submit proposals and reads through
+`xraft-server`'s embedded API (§2.4).
 
 ### 2.7  Administrative Operations
 
@@ -144,10 +144,8 @@ future iteration to match this spec and `e2e-scenarios.md`.)
 > membership is "out of scope for v1 and deferred to a future story entirely,"
 > with the v1 baseline using static membership and observer support.
 > `implementation-plan.md` Stage 7.2 is also aligned (deferred).
-> (*Cross-doc note:* `architecture.md` §2.1 still describes dynamic membership
-> as a "stretch goal within this story"; `architecture.md` should be updated in
-> a future iteration to match this spec, `e2e-scenarios.md`, and
-> `implementation-plan.md`.)
+> `architecture.md` §2.1 is also aligned: it states dynamic membership is
+> "out of scope for v1" and "deferred to a future story entirely."
 
 ---
 
@@ -157,7 +155,7 @@ future iteration to match this spec and `e2e-scenarios.md`.)
 |---|---|
 | **Application-level state machine** | XRAFT provides the replicated log; what the consumer does with committed entries is outside this story |
 | **Multi-Raft / sharding** | Single Raft group only; partitioning across multiple groups is a future story |
-| **Dynamic quorum changes** | `AddVoter`/`RemoveVoter` is **out of scope for v1** and deferred to a future story entirely — it is not a stretch goal within XRAFT.  The v1 baseline uses static membership (voter set fixed at bootstrap) and observer support only.  Any `AddVoter`/`RemoveVoter` command is rejected with `UNSUPPORTED`.  `e2e-scenarios.md` Feature 12 and `implementation-plan.md` Stage 7.2 are aligned on this scope boundary.  (*Cross-doc note:* `architecture.md` §2.1 still describes dynamic membership as a "stretch goal within this story"; it should be updated to match.) |
+| **Dynamic quorum changes** | `AddVoter`/`RemoveVoter` is **out of scope for v1** and deferred to a future story entirely — it is not a stretch goal within XRAFT.  The v1 baseline uses static membership (voter set fixed at bootstrap) and observer support only.  Any `AddVoter`/`RemoveVoter` command is rejected with `UNSUPPORTED`.  All sibling docs are aligned: `e2e-scenarios.md` Feature 12, `implementation-plan.md` Stage 7.2, and `architecture.md` §2.1 all state dynamic membership is out of scope for v1 and deferred. |
 | **Kafka wire protocol compatibility** | We borrow KRaft *design*, not its binary protocol |
 | **Advanced embedded WAL / database storage engine** | v1 implements a durable file-backed segmented log (append-only segment files with CRC integrity, per §5.3 and `implementation-plan.md` Stage 2.1); adopting a third-party embedded storage engine (e.g., `sled`, `rocksdb`) or building an LSM-tree / B-tree WAL is a future optimisation |
 | **Benchmarking / performance tuning** | Functional correctness first; optimisation follows |
@@ -207,8 +205,14 @@ touch them:
 
 * **Durable state must be `fsync`'d before responding to any RPC** — this is a
   Raft safety requirement, not optional.
-* Voting state (`currentTerm`, `votedFor`) stored in a separate file from the
-  log, consistent with KRaft's `quorum-state` file pattern.
+* Voting state (`currentTerm`, `votedFor`) and `commit_index` stored together
+  in a `HardState` record in a separate file from the log, consistent with
+  KRaft's `quorum-state` file pattern.  This aligns with `architecture.md` §2.1
+  and `implementation-plan.md` Stage 2.2, which define `HardState` as containing
+  three fields: `current_term`, `voted_for`, and `commit_index`.  All three are
+  persisted atomically (write-tmp + rename) alongside the `VoterSet`.
+  `last_applied` is **volatile** — rebuilt on recovery by replaying committed
+  entries from `commit_index`.
 * Log segments stored as append-only files with an index for offset lookup.
 
 ### 5.4  Timing
@@ -341,42 +345,37 @@ this spec to avoid cross-document dependency on files that may not yet exist:
 6. **Dynamic membership scope → out of scope for v1, deferred.**
    `AddVoter`/`RemoveVoter` is **out of scope for v1** and deferred to a
    future story entirely — it is not a stretch goal within XRAFT.
-   `e2e-scenarios.md` Feature 12 is aligned: it states dynamic membership is
-   "out of scope for v1 and deferred to a future story entirely."
-   `implementation-plan.md` Stage 7.2 is also aligned (deferred).
+   All sibling docs are aligned: `e2e-scenarios.md` Feature 12 states dynamic
+   membership is "out of scope for v1 and deferred to a future story entirely";
+   `implementation-plan.md` Stage 7.2 is also aligned (deferred);
+   `architecture.md` §2.1 states dynamic membership is "out of scope for v1"
+   and "deferred to a future story entirely."
    Any `AddVoter`/`RemoveVoter` command is rejected with `UNSUPPORTED`.
-   (*Cross-doc note:* `architecture.md` §2.1 still describes dynamic
-   membership as a "stretch goal within this story"; it should be updated
-   to match this spec, `e2e-scenarios.md`, and `implementation-plan.md`.)
-   **`xraft-client` scope:** `xraft-client` is an **internal** crate
-   providing peer-to-peer RPC (Fetch, Vote, FetchSnapshot) and
-   admin/operational queries only — no external consumer SDK
-   (`propose`/`read`) is in scope for v1.
-   `e2e-scenarios.md` Feature 11 is aligned: it states `xraft-client` is
-   "an **internal** crate" with "no `propose`/`read` API for outside callers
-   in scope for v1."  (*Cross-doc note:* `architecture.md` §2.5 still
-   describes `xraft-client` as a "dual-role" crate with an external
-   `XRaftClient.propose`/`read` API; it should be updated to match this
-   spec and `e2e-scenarios.md`.)
-7. **TLS → optional configuration surface.**  TLS is not mandatory for v1
+7. **`xraft-client` scope → internal-only, no external SDK.**
+   `xraft-client` is an **internal** crate providing peer-to-peer RPC
+   (Fetch, Vote, FetchSnapshot) and admin/operational queries only — no
+   external consumer SDK (`propose`/`read`) is in scope for v1.
+   All sibling docs are aligned: `e2e-scenarios.md` Feature 11 states
+   `xraft-client` is "an **internal** crate" with "no `propose`/`read` API
+   for outside callers in scope for v1"; `architecture.md` §2.5 describes
+   `xraft-client` as internal-only with no external consumer SDK.
+8. **TLS → optional configuration surface.**  TLS is not mandatory for v1
    functional correctness but the configuration knobs exist per `architecture.md`.
    It is not "out of scope" but is not a gating requirement.
 
-> **Cross-doc alignment (iteration 14):** This spec now uses the same crate
+> **Cross-doc alignment (iteration 15):** This spec uses the same crate
 > names as all sibling docs (`xraft-storage`, `xraft-transport`, `xraft-test`).
 > **`xraft-client`** is an **internal** crate providing peer-to-peer RPC
 > (Fetch, Vote, FetchSnapshot) and admin/operational queries only — no
 > external consumer SDK (`propose`/`read`) is in scope for v1.
-> `e2e-scenarios.md` Feature 11 is aligned (internal-only scope, no
-> `propose`/`read`).  (*Cross-doc note:* `architecture.md` §2.5 still
-> describes `xraft-client` as "dual-role" with an external
-> `XRaftClient.propose`/`read` API; it should be updated to match.)
+> All sibling docs are aligned: `e2e-scenarios.md` Feature 11 (internal-only
+> scope, no `propose`/`read`); `architecture.md` §2.5 (internal-only, no
+> external consumer SDK).
 > **Dynamic membership** (`AddVoter`/`RemoveVoter`) is **out of scope for v1**
 > and deferred to a future story entirely — it is not a stretch goal within
-> XRAFT.  `e2e-scenarios.md` Feature 12 is aligned (out of scope, deferred).
-> `implementation-plan.md` Stage 7.2 is aligned (deferred).
-> (*Cross-doc note:* `architecture.md` §2.1 still describes dynamic membership
-> as a "stretch goal within this story"; it should be updated to match.)
+> XRAFT.  All sibling docs are aligned: `e2e-scenarios.md` Feature 12 (out of
+> scope, deferred); `implementation-plan.md` Stage 7.2 (deferred);
+> `architecture.md` §2.1 (out of scope for v1, deferred to a future story).
 > The **workspace layout** in §5.6 is described as planned (the repository
 > currently contains only `README.md` and `docs/`; crates will be created
 > during implementation per `implementation-plan.md` Stage 1.1).
@@ -391,7 +390,11 @@ this spec to avoid cross-document dependency on files that may not yet exist:
 > `implementation-plan.md` Stage 7.2).  Windows is a supported compilation
 > target (the repository uses a Windows worktree).  TLS configuration surface
 > exists and is optional (§2.7); it is implemented but not mandatory for v1
-> functional correctness.
+> functional correctness.  **`HardState` fields:** `HardState` contains three
+> fields — `current_term`, `voted_for`, and `commit_index` — persisted
+> atomically to the `quorum-state` file alongside `VoterSet` (per
+> `architecture.md` §2.1 and `implementation-plan.md` Stage 2.2).
+> `last_applied` is volatile, rebuilt on recovery.
 
 ---
 
