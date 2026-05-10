@@ -21,7 +21,10 @@ reusable consensus library and standalone cluster binary. The system provides:
   `restore` methods (per `implementation-plan.md` Stage 5.1). XRAFT does not
   prescribe application semantics — consumers implement their own state machine
   (e.g., a key-value store) and inject it at server startup. Library consumers
-  submit proposals through `xraft-server`'s embedded `propose` API (see §2.4).
+  submit proposals through `xraft-server`'s embedded `propose` API (see §2.4);
+  reads against committed state are performed directly on the consumer-owned
+  `StateMachine` instance, or via linearizable reads by proposing a read-type
+  command and inspecting the `apply` return value.
 
 The implementation accepts any voter count ≥ 1. Odd-numbered clusters (3, 5, 7)
 are recommended because they maximise fault tolerance per node; even-numbered
@@ -166,15 +169,15 @@ service RaftService {
 
 **Responsibility:** Wires together core, log, and RPC into a running node.
 Owns the event loop, tick scheduling, and configuration loading. Also exposes
-the **embedded propose/read API** for library consumers (since `xraft-client`
+the **embedded propose API** for library consumers (since `xraft-client`
 is internal-only; see §2.5).
 
 | Struct | Role |
 |---|---|
-| `XRaftServer` | Top-level server. Initialises `RaftNode`, `FileLogStore`, `GrpcTransport`, starts the event loop. Exposes an embedded API for library consumers: `propose(command: Bytes) -> Result<LogIndex>` submits commands to the leader, and `read(query: Bytes) -> Result<Bytes>` routes read queries to the consumer-provided `StateMachine`'s `query` method against committed state (see §4.1). This embedded API is the sanctioned entry point for application code — `xraft-client` is internal-only and exposes no `propose`/`read` surface (per `tech-spec.md` §2.6 and `e2e-scenarios.md` Feature 11). `implementation-plan.md` Stage 6.2 cross-references this API. |
+| `XRaftServer` | Top-level server. Initialises `RaftNode`, `FileLogStore`, `GrpcTransport`, starts the event loop. Exposes an embedded `propose(command: Bytes) -> Result<LogIndex>` API for library consumers to submit commands to the leader. Reads against committed state are performed by consumers directly on their `StateMachine` instance (which they own and inject at startup); alternatively, consumers can achieve linearizable reads by proposing a read-type command through `propose` and inspecting the `apply` return value. This embedded API is the sanctioned entry point for application code — `xraft-client` is internal-only and exposes no `propose` surface (per `tech-spec.md` §2.6 and `e2e-scenarios.md` Feature 11). `implementation-plan.md` Stage 6.2 cross-references this API. |
 | `EventLoop` | Single-threaded async loop (Tokio). Processes `Input` from RPC handlers + timer ticks, feeds them to `RaftNode`, dispatches resulting `Action`s. |
 | `TickDriver` | Fires `Input::Tick` at `tick_interval` (default 50 ms). The core engine counts ticks to derive election and heartbeat timeouts. |
-| `NodeConfig` | TOML configuration loaded at startup. Includes all `ClusterConfig` fields from `implementation-plan.md` Stage 1.2 (`node_id`, `cluster_id`, `data_dir`, `listen_addr`, `peers`, `election_timeout_min_ms`, `election_timeout_max_ms`, `tick_interval_ms`, `fetch_interval_ms`, `snapshot_interval`, `max_log_entries_before_compaction`) plus additional operational fields not in `ClusterConfig`: `bootstrap_voters`, `bootstrap_observers` (parsed into `VoterSet` at startup), `enable_check_quorum`, `enable_leader_lease`, `segment_max_bytes`, `snapshot_max_chunk_bytes`, `connect_timeout_ms`, `request_timeout_ms`, `admin_listen_addr`, and optional TLS fields (see §8 for the full reference). |
+| `NodeConfig` | TOML configuration loaded at startup. Maps directly to the `ClusterConfig` struct from `implementation-plan.md` Stage 1.2, which defines all of these fields: `node_id`, `cluster_id`, `data_dir`, `listen_addr`, `peers`, `bootstrap_voters`, `bootstrap_observers` (parsed into `VoterSet` at startup), `election_timeout_min_ms`, `election_timeout_max_ms`, `tick_interval_ms`, `fetch_interval_ms`, `snapshot_interval`, `max_log_entries_before_compaction`, `enable_check_quorum`, `enable_leader_lease`, `segment_max_bytes`, `snapshot_max_chunk_bytes`, and optional TLS fields. `NodeConfig` additionally includes deployment-specific fields not in `ClusterConfig`: `connect_timeout_ms`, `request_timeout_ms`, and `admin_listen_addr` (see §8 for the full reference). |
 | `MetricsRegistry` | Prometheus-compatible metrics: `current_leader`, `current_term`, `commit_latency_avg`, `append_records_rate`, `election_latency_avg`, `log_end_offset`, `replication_lag`. |
 | `AdminApi` | HTTP API for operational commands: cluster status, trigger snapshot, node health. |
 
@@ -271,7 +274,6 @@ engine without real I/O. Inspired by deterministic simulation testing (Jepsen-st
 │  index         : u64       (1-based, monotonic)      │
 │  term          : u64                                 │
 │  payload       : EntryPayload                        │
-│  timestamp     : i64       (milliseconds)            │
 │  crc32         : u32       (integrity check)         │
 └──────────────────────────────────────────────────────┘
 
@@ -406,7 +408,6 @@ trait Transport: Send + Sync {
 
 trait StateMachine: Send + Sync {
     fn apply(&mut self, index: LogIndex, command: &[u8]) -> Result<Vec<u8>>;
-    fn query(&self, query: &[u8]) -> Result<Vec<u8>>;
     fn snapshot(&self) -> Result<Vec<u8>>;
     fn restore(&mut self, snapshot: &[u8]) -> Result<()>;
 }
@@ -707,21 +708,22 @@ Exposed via Prometheus endpoint (`/metrics`) on the admin HTTP port:
 ```toml
 # node.toml — per-node configuration
 #
-# NodeConfig is a superset of ClusterConfig from implementation-plan.md
-# Stage 1.2. The core ClusterConfig fields are listed first; additional
-# operational fields (bootstrap sets, feature flags, storage tuning,
-# network timeouts, admin HTTP, TLS) extend the surface for production
-# deployment without changing the core config struct.
+# NodeConfig maps directly to ClusterConfig from implementation-plan.md
+# Stage 1.2. All fields below are part of ClusterConfig unless noted.
+# The only NodeConfig-specific extensions (not in ClusterConfig) are
+# deployment-specific fields: connect_timeout_ms, request_timeout_ms,
+# and admin_listen_addr.
 #
-#   Core ClusterConfig fields (Stage 1.2):
+#   ClusterConfig fields (Stage 1.2):
 #   node_id, cluster_id, data_dir, listen_addr, peers,
+#   bootstrap_voters, bootstrap_observers,
 #   election_timeout_min_ms, election_timeout_max_ms, tick_interval_ms,
-#   fetch_interval_ms, snapshot_interval, max_log_entries_before_compaction
+#   fetch_interval_ms, snapshot_interval, max_log_entries_before_compaction,
+#   enable_check_quorum, enable_leader_lease, segment_max_bytes,
+#   snapshot_max_chunk_bytes, tls
 #
 #   Additional NodeConfig fields (not in ClusterConfig):
-#   bootstrap_voters, bootstrap_observers, enable_check_quorum,
-#   enable_leader_lease, segment_max_bytes, snapshot_max_chunk_bytes,
-#   connect_timeout_ms, request_timeout_ms, tls_*, admin_listen_addr
+#   connect_timeout_ms, request_timeout_ms, admin_listen_addr
 
 node_id = 1
 cluster_id = "xraft-cluster-001"
@@ -750,7 +752,7 @@ election_timeout_min_ms = 150
 election_timeout_max_ms = 300
 fetch_interval_ms = 50
 
-# Feature flags (NodeConfig extensions, not in ClusterConfig)
+# Feature flags (ClusterConfig fields per Stage 1.2)
 enable_check_quorum = true
 enable_leader_lease = false
 
