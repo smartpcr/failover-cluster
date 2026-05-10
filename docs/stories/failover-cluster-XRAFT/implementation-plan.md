@@ -39,7 +39,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Define `NodeConfig` struct in `xraft-core/src/config.rs` as a superset of `ClusterConfig` (per `architecture.md` §2.4/§8), embedding `ClusterConfig` via a `#[serde(flatten)]` field and adding only the three deployment-specific extension fields that `architecture.md` §8 designates as NodeConfig-only (not in `ClusterConfig`): `connect_timeout_ms` (default 500), `request_timeout_ms` (default 2000), `admin_listen_addr` (default "0.0.0.0:9090"); `xraft-server` loads `NodeConfig` from TOML at startup, while `xraft-core`'s `RaftNode` accepts `ClusterConfig` to keep the consensus engine independent of deployment concerns
 - [ ] Implement `NodeConfig` loading from TOML file and environment variable overrides using `serde` and `toml` crate; provide `NodeConfig::into_cluster_config(&self) -> ClusterConfig` extraction method that returns the embedded `ClusterConfig` (which already contains all consensus-relevant fields including `bootstrap_voters`, `enable_check_quorum`, `segment_max_bytes`, `snapshot_max_chunk_bytes`, and TLS) for passing to `RaftNode`
 - [ ] Define `Entry` struct in `xraft-core/src/types.rs` as `{ index: LogIndex, term: Term, payload: EntryPayload }` — a single log entry (per `architecture.md` §2.1)
-- [ ] Define `EntryPayload` enum in `xraft-core/src/types.rs` with canonical variants: `Command(Bytes)`, `NoOp`, `ConfigChange(VoterSet)` — these are the only serializable, wire-format entry payload variants (per `architecture.md` §2.1 which lists exactly `Command`, `NoOp`, and `ConfigChange`); `ConfigChange` is reserved for forward-compatible log format but `RaftNode` rejects any `ConfigChange` proposal with `UNSUPPORTED` in v1 (dynamic membership is out of scope); snapshots are **not** a log-entry payload — they are separate files transferred via `FetchSnapshot` RPCs (per `architecture.md` §2.1); define `SnapshotMeta` as `{ last_included_index: LogIndex, last_included_term: Term }` in `xraft-core/src/types.rs` as a standalone struct used by `SnapshotStore`, `Action::TakeSnapshot`, `Action::InstallSnapshot`, and `FetchSnapshot` RPCs
+- [ ] Define `EntryPayload` enum in `xraft-core/src/types.rs` with four variants: `Command(Bytes)`, `NoOp`, `ConfigChange(VoterSet)`, `Snapshot(SnapshotMeta)` — this four-variant model matches `architecture.md` §2.1 exactly; the first three variants (`Command`, `NoOp`, `ConfigChange`) are the canonical serializable wire-format variants that map 1:1 to protobuf `LogEntry.entry_type` values per Stage 1.3; the fourth variant, `Snapshot(SnapshotMeta)`, is an **in-memory compaction marker only** — it is never serialised to the wire or written to segment files (the `From`/`Into` conversions in Stage 1.3 `message.rs` exclude it from wire serialisation); snapshot data is transferred via `FetchSnapshot` RPCs, not as log entries; `ConfigChange` is reserved for forward-compatible log format but `RaftNode` rejects any `ConfigChange` proposal with `UNSUPPORTED` in v1 (dynamic membership is out of scope); define `SnapshotMeta` as `{ last_included_index: LogIndex, last_included_term: Term }` in `xraft-core/src/types.rs` as a standalone struct used by `EntryPayload::Snapshot`, `SnapshotStore`, `Action::TakeSnapshot`, `Action::InstallSnapshot`, and `FetchSnapshot` RPCs
 - [ ] Define `VoterSet` struct in `xraft-core/src/types.rs` as a set of `(NodeId, DirectoryId, Vec<Endpoint>)` tuples representing the current quorum configuration (per `architecture.md` §2.1); implement `contains(node_id)`, `len()`, `quorum_size()`, `iter()`, and `is_majority(count)` methods; derive `Serialize`, `Deserialize`, `Clone`, `Debug`, `PartialEq`
 - [ ] Define `Input` enum in `xraft-core/src/types.rs` with variants: `Tick`, `VoteRequest(VoteRequest)`, `VoteResponse { from: NodeId, resp: VoteResponse }`, `PreVoteRequest(PreVoteRequest)`, `PreVoteResponse { from: NodeId, resp: PreVoteResponse }`, `FetchRequest(FetchRequest)`, `FetchResponse(FetchResponse)`, `ClientPropose { data: Bytes }`, `SnapshotComplete { metadata: SnapshotMeta }`, `SnapshotInstalled { metadata: SnapshotMeta }` — all inputs to the pure `RaftNode::step()` function (per `architecture.md` §2.1)
 - [ ] Define `Action` enum in `xraft-core/src/types.rs` with variants: `PersistHardState(HardState)`, `AppendEntries(Vec<Entry>)`, `SendMessage { to: NodeId, message: OutboundMessage }`, `ApplyToStateMachine { index: LogIndex, data: Bytes }`, `TakeSnapshot { through_index: LogIndex }`, `InstallSnapshot { metadata: SnapshotMeta, data: Bytes }`, `BecomeLeader`, `StepDown { term: Term }`, `RedirectToSnapshot { follower_id: NodeId, snapshot_metadata: SnapshotMeta }`, `TruncateLog { before_index: LogIndex }` — all side-effects emitted by `RaftNode::step()` (per `architecture.md` §2.1); define `OutboundMessage` enum with variants `Vote`, `PreVote`, `Fetch`, `FetchSnapshot` wrapping the respective request/response types
@@ -56,7 +56,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Scenario: node-config-to-cluster-config — Given a fully populated `NodeConfig`, When `into_cluster_config()` is called, Then the resulting `ClusterConfig` contains all consensus fields (`node_id`, `cluster_id`, `data_dir`, `listen_addr`, `peers`, timing, `bootstrap_voters`, `bootstrap_observers`, `enable_check_quorum`, `enable_leader_lease`, `segment_max_bytes`, `snapshot_max_chunk_bytes`, `tls_*`, snapshot/compaction) and the `NodeConfig`-only fields (`connect_timeout_ms`, `request_timeout_ms`, `admin_listen_addr`) are not present in `ClusterConfig`
 - [ ] Scenario: error-display — Given each `XRaftError` variant, When formatted with Display, Then a human-readable message is produced
 - [ ] Scenario: voter-set-quorum — Given a `VoterSet` with 5 voters, When `quorum_size()` is called, Then it returns 3; when `is_majority(3)` is called, Then it returns true; when `is_majority(2)` is called, Then it returns false
-- [ ] Scenario: entry-payload-variants — Given `Entry` values constructed with each canonical `EntryPayload` variant (`Command`, `NoOp`, `ConfigChange`), When pattern-matched, Then each variant is correctly identified and inner data is accessible; confirm that `SnapshotMeta` is a standalone struct (not an `EntryPayload` variant) with `last_included_index` and `last_included_term` fields
+- [ ] Scenario: entry-payload-variants — Given `Entry` values constructed with each `EntryPayload` variant (`Command`, `NoOp`, `ConfigChange`, `Snapshot`), When pattern-matched, Then each variant is correctly identified and inner data is accessible; confirm that `Snapshot(SnapshotMeta)` is an in-memory compaction marker only (never serialised to wire — verified by Stage 1.3 conversion tests) and that `SnapshotMeta` has `last_included_index` and `last_included_term` fields
 
 ## Stage 1.3: RPC Message Definitions
 
@@ -69,7 +69,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Define `SnapshotMetadata` protobuf message with fields: `last_included_index`, `last_included_term`, `voter_set`
 - [ ] Define `FetchSnapshotRequest` protobuf message with fields: `cluster_id`, `leader_epoch`, `replica_id`, `snapshot_id` (identifies which snapshot to fetch); define `FetchSnapshotChunk` protobuf message with fields: `cluster_id`, `leader_epoch`, `chunk_index`, `data` (bytes), `done` (bool), `metadata` (SnapshotMetadata, present only in first chunk) — these are streamed from leader to follower for snapshot transfer
 - [ ] Add `build.rs` in `xraft-core` using `tonic-build` to compile proto files
-- [ ] Create `xraft-core/src/message.rs` re-exporting generated protobuf types and implementing bidirectional conversion traits (`From`/`Into`) between protobuf wire types and the canonical Rust-side types defined in Stage 1.2: map protobuf `LogEntry { entry_type: Command, data }` ↔ `Entry { payload: EntryPayload::Command(Bytes) }`, `LogEntry { entry_type: NoOp }` ↔ `Entry { payload: EntryPayload::NoOp }`, `LogEntry { entry_type: Config, data }` ↔ `Entry { payload: EntryPayload::ConfigChange(VoterSet) }` (deserialise `VoterSet` from `data` bytes); map protobuf `SnapshotMetadata` ↔ Rust `SnapshotMeta` (standalone struct, not an `EntryPayload` variant — snapshots are transferred via `FetchSnapshot` RPCs, not as log entries, per `architecture.md` §2.1) — this ensures storage, consensus, snapshots, and dynamic-membership rejection all share one canonical model
+- [ ] Create `xraft-core/src/message.rs` re-exporting generated protobuf types and implementing bidirectional conversion traits (`From`/`Into`) between protobuf wire types and the canonical Rust-side types defined in Stage 1.2: map protobuf `LogEntry { entry_type: Command, data }` ↔ `Entry { payload: EntryPayload::Command(Bytes) }`, `LogEntry { entry_type: NoOp }` ↔ `Entry { payload: EntryPayload::NoOp }`, `LogEntry { entry_type: Config, data }` ↔ `Entry { payload: EntryPayload::ConfigChange(VoterSet) }` (deserialise `VoterSet` from `data` bytes); the fourth Rust variant `EntryPayload::Snapshot(SnapshotMeta)` is an in-memory compaction marker only and has **no** protobuf wire representation — the conversion code must exclude it (panic or error on attempt to serialise); map protobuf `SnapshotMetadata` ↔ Rust `SnapshotMeta` (standalone struct also used by `EntryPayload::Snapshot`) — this ensures storage, consensus, snapshots, and dynamic-membership rejection all share one canonical model
 - [ ] Verify `cargo build --workspace` compiles protobuf definitions without errors
 
 ### Dependencies
@@ -88,6 +88,7 @@ storyId: "failover-cluster:XRAFT"
 
 ### Implementation Steps
 - [ ] Define `LogStore` trait in `xraft-core/src/storage.rs` with methods: `append`, `get(index)`, `get_range(start, end)`, `last_index`, `last_term`, `truncate_from(index)`, `term_at(index)` — all trait definitions live in `xraft-core` to avoid circular dependencies (per `architecture.md` §4.1); `xraft-storage` imports and implements them
+- [ ] Update `xraft-core/src/lib.rs` to export the new `storage` module (alongside existing `types`, `config`, `error`, `message`) so downstream crates can import trait definitions
 - [ ] Implement `FileLogStore` in `xraft-storage/src/log.rs` backed by append-only segment files in configurable data directory, each segment containing a header (magic bytes, version) and sequential log entries
 - [ ] Implement segment rotation when a segment exceeds configurable size threshold (default 64 MB)
 - [ ] Implement binary encoding for log entries: `[length: u32][term: u64][index: u64][entry_type: u8][data: bytes][crc32: u32]`
@@ -107,20 +108,21 @@ storyId: "failover-cluster:XRAFT"
 ## Stage 2.2: Persistent Raft State
 
 ### Implementation Steps
-- [ ] Define `HardStateStore` trait in `xraft-core/src/storage.rs` with methods: `persist(state: &HardState, voters: &VoterSet) -> Result<()>`, `load() -> Result<Option<(HardState, VoterSet)>>` — the trait atomically persists both `HardState` and `VoterSet` together so the durable quorum state is always consistent (per `architecture.md` §2.2 and §4.1 which define this exact two-parameter `persist` / tuple-returning `load` contract); trait lives in `xraft-core` per `architecture.md` §4.1
-- [ ] Define `HardState` struct in `xraft-core/src/types.rs` with fields: `current_term: Term`, `voted_for: Option<NodeId>`, `commit_index: LogIndex` — all three fields are persisted atomically alongside `VoterSet` to the `quorum-state` file (per `architecture.md` §2.1 and §3.1); `last_applied` is volatile, rebuilt from the log on recovery by replaying committed entries from `commit_index`
-- [ ] Implement `FileHardStateStore` in `xraft-storage/src/state.rs` that persists `HardState` + `VoterSet` together as JSON to a `quorum-state` file with atomic write (write to temp file then rename) for crash safety, consistent with KRaft's `quorum-state` pattern (per `tech-spec.md` §5.3); the file contains a single JSON object with top-level keys for `HardState` fields and a `voter_set` field
-- [ ] Implement `load()` that reads both `HardState` and `VoterSet` from the `quorum-state` file on startup, returning `Option<(HardState, VoterSet)>` with fallback to `None` on first start (caller initializes from config)
+- [ ] Define `HardStateStore` trait in `xraft-core/src/storage.rs` with methods: `persist(state: &HardState) -> Result<()>`, `load() -> Result<Option<HardState>>` — the trait operates on `HardState` only, matching `architecture.md` §4.1 exactly; `VoterSet` persistence is a concern of the concrete `FileHardStateStore` implementation (see below and Stage 7.2), not the trait boundary; trait lives in `xraft-core` per `architecture.md` §4.1
+- [ ] Define `HardState` struct in `xraft-core/src/types.rs` with fields: `current_term: Term`, `voted_for: Option<NodeId>`, `commit_index: LogIndex` — all three fields are persisted atomically to the `quorum-state` file (per `architecture.md` §2.1 and §3.1); `last_applied` is volatile, rebuilt from the log on recovery by replaying committed entries from `commit_index`
+- [ ] Implement `FileHardStateStore` in `xraft-storage/src/state.rs` that implements `HardStateStore` (HardState-only trait) and **additionally** persists `VoterSet` as a separate top-level field in the same `quorum-state` file (per `architecture.md` §2.2 and `implementation-plan.md` Stage 7.2); the file contains a single JSON object with top-level keys for `HardState` fields and a `voter_set` field; `FileHardStateStore` exposes concrete (non-trait) methods `persist_with_voters(state: &HardState, voters: &VoterSet) -> Result<()>` and `load_with_voters() -> Result<Option<(HardState, VoterSet)>>` for bootstrap and recovery paths that need both; atomic write (write to temp file then rename) for crash safety, consistent with KRaft's `quorum-state` pattern (per `tech-spec.md` §5.3)
+- [ ] Implement trait method `load()` on `FileHardStateStore` that reads the `quorum-state` file and returns `Option<HardState>` (discarding the VoterSet); provide a separate concrete `load_with_voters()` method that returns `Option<(HardState, VoterSet)>` for startup recovery
 - [ ] Add validation in `persist()` that term never decreases and voted_for is only set once per term
 
 ### Dependencies
 - phase-persistent-storage/stage-write-ahead-log
 
 ### Test Scenarios
-- [ ] Scenario: state-and-voter-set-persistence — Given a saved HardState with term=5, voted_for=Some(3), commit_index=10 and a VoterSet with 3 voters, When the FileHardStateStore is reloaded from the `quorum-state` file, Then both the loaded HardState and VoterSet match exactly (all HardState fields and all voter entries round-trip correctly)
+- [ ] Scenario: hardstate-trait-persistence — Given a saved HardState with term=5, voted_for=Some(3), commit_index=10, When `HardStateStore::persist()` and `HardStateStore::load()` are called (trait methods), Then the loaded HardState matches exactly (all three fields round-trip correctly)
+- [ ] Scenario: concrete-hardstate-with-voters — Given a `FileHardStateStore`, When `persist_with_voters()` is called with HardState (term=5, voted_for=Some(3), commit_index=10) and a VoterSet with 3 voters, Then `load_with_voters()` returns both the HardState and VoterSet matching exactly; and `HardStateStore::load()` (trait method) returns the same HardState without VoterSet
 - [ ] Scenario: atomic-write-safety — Given a state persist in progress, When the process crashes mid-write (simulated by checking temp file), Then the previous valid `quorum-state` (containing both HardState and VoterSet) is still loadable
 - [ ] Scenario: term-monotonicity — Given a HardState with term=5, When persist() is called with term=3, Then an error is returned
-- [ ] Scenario: voter-set-update-persisted — Given an initial VoterSet with voters {1, 2, 3} persisted alongside HardState, When persist() is called again with the same HardState but an updated VoterSet {1, 2, 3, 4, 5}, Then load() returns the new VoterSet alongside the unchanged HardState
+- [ ] Scenario: voter-set-update-persisted — Given an initial VoterSet with voters {1, 2, 3} persisted alongside HardState via `persist_with_voters()`, When `persist_with_voters()` is called again with the same HardState but an updated VoterSet {1, 2, 3, 4, 5}, Then `load_with_voters()` returns the new VoterSet alongside the unchanged HardState
 
 ## Stage 2.3: Snapshot Store
 
@@ -148,6 +150,7 @@ storyId: "failover-cluster:XRAFT"
 
 ### Implementation Steps
 - [ ] Create `xraft-core/src/node.rs` defining `RaftNode` struct holding: `id: NodeId`, `role: NodeRole`, `current_term: Term`, `voted_for: Option<NodeId>`, `log: Vec<Entry>`, `commit_index: LogIndex`, `last_applied: LogIndex`, `config: ClusterConfig`, `election_timer: ElectionTimer`, `peers: HashMap<NodeId, PeerState>`, `voter_set: VoterSet` — the node is I/O-free and accepts `Input` enums, returning `Vec<Action>` side-effects; all referenced types (`Entry`, `Input`, `Action`, `VoterSet`, `NodeRole`, `Term`, `LogIndex`) are defined in Stage 1.2
+- [ ] Update `xraft-core/src/lib.rs` to export the new `node` module (alongside existing `types`, `config`, `error`, `message`, `storage`) so downstream crates can import `RaftNode`
 - [ ] Define `PeerState` struct tracking per-peer replication state: `last_fetch_offset`, `last_fetch_time`, `last_caught_up_time`, `is_voter: bool`
 - [ ] Implement `ElectionTimer` with randomized timeout in range `[election_timeout_min, election_timeout_max]` using `rand` crate, with `reset()`, `is_expired()`, `remaining()` methods
 - [ ] Implement role transition methods: `become_follower(term, leader_id)`, `become_pre_candidate()`, `become_candidate()`, `become_leader()` with appropriate state updates (reset timers, initialize peer state, emit `Action::AppendEntries` for no-op entry) — the `PreCandidate` role is used during the Pre-Vote phase before term is incremented
@@ -214,6 +217,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement `RaftGrpcClient` in `xraft-transport/src/grpc_client.rs` using `tonic` for sending RPCs to peers with configurable connection timeout and retry logic
 - [ ] Implement connection pooling in `RaftGrpcClient`: maintain one persistent channel per peer, reconnect on failure with exponential backoff
 - [ ] Define `Transport` trait in `xraft-core/src/transport.rs` abstracting over network implementation with methods: `send_vote`, `send_pre_vote`, `send_fetch`, `send_fetch_snapshot`, `start_server` — trait lives in `xraft-core` per `architecture.md` §4.1; `xraft-transport` imports and implements it
+- [ ] Update `xraft-core/src/lib.rs` to export the new `transport` module (alongside existing `types`, `config`, `error`, `message`, `storage`, `node`) so downstream crates can import the `Transport` trait
 - [ ] Implement the `Transport` trait for the gRPC implementation in `xraft-transport/src/grpc.rs`
 - [ ] Implement optional TLS support in `RaftGrpcServer` and `RaftGrpcClient`: if `ClusterConfig.tls_enabled` is true, configure `tonic` with `ServerTlsConfig` / `ClientTlsConfig` using the `tls_cert_path` and `tls_key_path` from `ClusterConfig`; if false, use plaintext — per `tech-spec.md` §2.7 the configuration surface must exist even though TLS is not mandatory for v1 functional correctness
 
@@ -248,24 +252,38 @@ storyId: "failover-cluster:XRAFT"
 
 ## Dependencies
 - phase-raft-consensus-engine
+- phase-network-transport
 
 ## Stage 5.1: State Machine Callback Trait
 
 ### Implementation Steps
 - [ ] Define `StateMachine` trait in `xraft-core/src/state_machine.rs` with methods: `apply(&mut self, index: LogIndex, command: &[u8]) -> Result<Vec<u8>>`, `query(&self, query: &[u8]) -> Result<Vec<u8>>`, `snapshot(&self) -> Result<Vec<u8>>`, `restore(&mut self, snapshot: &[u8]) -> Result<()>` — trait name and signatures follow `architecture.md` §4.1 which is authoritative for trait definitions; `apply` returns `Result<Vec<u8>>` (the serialized result of the applied command) rather than `Result<()>` to support read-after-write patterns; `query` provides a read-only path against committed state used by `xraft-server`'s embedded `read` API (per `architecture.md` §2.4); this is the extension point for consumers — XRAFT provides the replicated log, not application logic
+- [ ] Update `xraft-core/src/lib.rs` to export the new `state_machine` module (alongside existing `types`, `config`, `error`, `message`, `storage` modules) so downstream crates can import the `StateMachine` trait
 - [ ] Implement `NoOpStateMachine` as a minimal default in `xraft-core/src/state_machine.rs` that logs applied entries via `tracing` and returns an empty `Vec<u8>` for both `apply` and `query` — used for testing and as a baseline
-- [ ] Wire `StateMachine` into the `Action::ApplyToStateMachine` dispatch path in the event loop, so committed entries are forwarded to the trait implementation
-- [ ] Implement `snapshot()` and `restore()` integration: the event loop calls `snapshot()` when a snapshot is triggered and `restore()` when a snapshot is installed from a leader
 
 ### Dependencies
-- _none — start stage_
+- phase-raft-consensus-engine/stage-raft-node-state-machine
 
 ### Test Scenarios
 - [ ] Scenario: noop-apply — Given a `NoOpStateMachine`, When `apply()` is called with 10 entries, Then no error is returned and each call returns an empty `Vec<u8>`
 - [ ] Scenario: noop-query — Given a `NoOpStateMachine`, When `query()` is called with any query bytes, Then no error is returned and an empty `Vec<u8>` is returned
 - [ ] Scenario: snapshot-restore-roundtrip — Given a `StateMachine` implementation, When `snapshot()` is called and the result passed to `restore()` on a fresh instance, Then the restored state is equivalent to the original and `query()` returns the same results
 
-## Stage 5.2: Snapshot Coordination
+## Stage 5.2: State Machine Wiring and Snapshot Coordination
+
+### Implementation Steps
+- [ ] Wire `StateMachine` into the `Action::ApplyToStateMachine` dispatch path in the event loop (Stage 4.2's `DriverLoop`), so committed entries are forwarded to the trait implementation
+- [ ] Implement `snapshot()` and `restore()` integration: the event loop calls `snapshot()` when a snapshot is triggered and `restore()` when a snapshot is installed from a leader
+
+### Dependencies
+- phase-state-machine-interface/stage-state-machine-callback-trait
+- phase-network-transport/stage-message-router-and-driver-loop
+
+### Test Scenarios
+- [ ] Scenario: driver-dispatches-apply— Given a `DriverLoop` with a `NoOpStateMachine` wired in, When `Action::ApplyToStateMachine` is emitted by `RaftNode`, Then the driver calls `StateMachine::apply()` with the correct index and data
+- [ ] Scenario: driver-snapshot-restore-cycle — Given a `DriverLoop` with a test `StateMachine`, When `Action::TakeSnapshot` is emitted, Then the driver calls `snapshot()` and `SnapshotStore::save_snapshot()`, feeds `Input::SnapshotComplete` back, and `Action::TruncateLog` is emitted
+
+## Stage 5.3: Snapshot Coordination
 
 ### Implementation Steps
 - [ ] Implement snapshot trigger logic in `RaftNode`: initiate snapshot when `commit_index - last_snapshot_index > max_log_entries_before_compaction`
@@ -275,7 +293,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Add snapshot progress tracking: log percentage complete for large snapshot transfers
 
 ### Dependencies
-- phase-state-machine-interface/stage-state-machine-callback-trait
+- phase-state-machine-interface/stage-state-machine-wiring-and-snapshot-coordination
 
 ### Test Scenarios
 - [ ] Scenario: auto-snapshot-trigger — Given max_log_entries_before_compaction=100, When 150 entries are committed, Then a snapshot is automatically taken at index >= 100 and log entries before the snapshot are truncated
@@ -300,7 +318,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement signal handling: `SIGTERM`/`SIGINT` trigger graceful shutdown, `SIGHUP` reloads configuration
 - [ ] Implement structured logging with `tracing`: JSON output format, configurable log level via `RUST_LOG` env var, span context for request tracing
 - [ ] Implement health check endpoint: simple HTTP endpoint at `/health` returning node role, term, commit_index, and leader_id using `axum`
-- [ ] Add Prometheus metrics endpoint at `/metrics` using `axum` and `prometheus-client`, exposing an MVP metrics subset: `xraft_current_term` (gauge), `xraft_commit_index` (gauge), `xraft_current_leader` (gauge — node ID of current leader, -1 if unknown), `xraft_role` (gauge — numeric encoding of the node's current `NodeRole`: 0=Follower, 1=Candidate, 2=PreCandidate, 3=Leader, 4=Observer), `xraft_election_latency_seconds` (histogram — time from candidacy to leader election), `xraft_append_records_total` (counter — total entries appended) — `xraft_role` is included in the MVP subset per `e2e-scenarios.md` Feature 15 / Alignment Notes (lines 667, 766) even though it does not appear in `architecture.md` §7's canonical table; this plan reconciles the sibling-doc discrepancy by implementing it here and noting that `architecture.md` §7 should add `xraft_role` to its canonical table in a future iteration; the remaining canonical metrics from `architecture.md` §7 are added in Stage 7.1 (`xraft_replication_lag`, `xraft_commit_latency_seconds`, `xraft_fetch_requests_total`) and Stage 7.3 (`xraft_snapshot_installs_total`, `xraft_log_end_offset`)
+- [ ] Add Prometheus metrics endpoint at `/metrics` using `axum` and `prometheus-client`, exposing an MVP metrics subset: `xraft_current_term` (gauge), `xraft_commit_index` (gauge), `xraft_current_leader` (gauge — node ID of current leader, -1 if unknown), `xraft_role` (gauge — numeric encoding of the node's current `NodeRole`: 0=Follower, 1=Candidate, 2=PreCandidate, 3=Leader, 4=Observer, per `architecture.md` §7 and `e2e-scenarios.md` Feature 15), `xraft_election_latency_seconds` (histogram — time from candidacy to leader election), `xraft_append_records_total` (counter — total entries appended) — the remaining canonical metrics from `architecture.md` §7 are added in Stage 7.1 (`xraft_replication_lag`, `xraft_commit_latency_seconds`, `xraft_fetch_requests_total`) and Stage 7.3 (`xraft_snapshot_installs_total`, `xraft_log_end_offset`)
 
 ### Dependencies
 - _none — start stage_
