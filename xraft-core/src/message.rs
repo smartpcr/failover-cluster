@@ -210,6 +210,61 @@ pub struct FetchSnapshotChunk {
 }
 
 // ---------------------------------------------------------------------------
+// VoterSet ↔ proto::VoterSet helpers (used by both LogEntry and SnapshotMetadata)
+// ---------------------------------------------------------------------------
+
+fn voter_set_to_proto(vs: &crate::types::VoterSet) -> proto::VoterSet {
+    proto::VoterSet {
+        voters: vs
+            .voters()
+            .iter()
+            .map(|vr| proto::VoterRecord {
+                node_id: vr.node_id.0,
+                directory_id: vr.directory_id.0.to_string(),
+                endpoints: vr
+                    .endpoints
+                    .iter()
+                    .map(|ep| proto::Endpoint {
+                        host: ep.host.clone(),
+                        port: ep.port as u32,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn voter_set_from_proto(vs: proto::VoterSet) -> Result<crate::types::VoterSet, String> {
+    let records: Result<Vec<crate::types::VoterRecord>, String> = vs
+        .voters
+        .into_iter()
+        .map(|vr| {
+            let directory_id = uuid::Uuid::parse_str(&vr.directory_id)
+                .map_err(|e| format!("invalid directory_id UUID: {e}"))?;
+            let endpoints: Result<Vec<crate::types::Endpoint>, String> = vr
+                .endpoints
+                .into_iter()
+                .map(|ep| {
+                    let port = u16::try_from(ep.port)
+                        .map_err(|_| format!("port {} out of range", ep.port))?;
+                    Ok(crate::types::Endpoint {
+                        host: ep.host,
+                        port,
+                    })
+                })
+                .collect();
+            Ok(crate::types::VoterRecord {
+                node_id: NodeId(vr.node_id),
+                directory_id: crate::types::DirectoryId(directory_id),
+                endpoints: endpoints?,
+            })
+        })
+        .collect();
+    let records = records?;
+    crate::types::VoterSet::try_new(records).map_err(|e| format!("invalid voter set: {e}"))
+}
+
+// ---------------------------------------------------------------------------
 // Protobuf ↔ Rust conversion traits
 // ---------------------------------------------------------------------------
 
@@ -377,8 +432,8 @@ impl TryFrom<&Entry> for proto::LogEntry {
             EntryPayload::Command(bytes) => (proto::EntryType::Command as i32, bytes.to_vec()),
             EntryPayload::NoOp => (proto::EntryType::NoOp as i32, Vec::new()),
             EntryPayload::ConfigChange(voter_set) => {
-                let data = bincode::serialize(voter_set)
-                    .expect("VoterSet bincode serialisation must not fail");
+                let proto_vs = voter_set_to_proto(voter_set);
+                let data = prost::Message::encode_to_vec(&proto_vs);
                 (proto::EntryType::Config as i32, data)
             }
             EntryPayload::Snapshot(_) => {
@@ -408,8 +463,9 @@ impl TryFrom<proto::LogEntry> for Entry {
             proto::EntryType::Command => EntryPayload::Command(Bytes::from(p.data)),
             proto::EntryType::NoOp => EntryPayload::NoOp,
             proto::EntryType::Config => {
-                let voter_set: crate::types::VoterSet = bincode::deserialize(&p.data)
-                    .map_err(|e| format!("failed to deserialise VoterSet: {e}"))?;
+                let proto_vs = <proto::VoterSet as prost::Message>::decode(p.data.as_slice())
+                    .map_err(|e| format!("failed to decode VoterSet: {e}"))?;
+                let voter_set = voter_set_from_proto(proto_vs)?;
                 EntryPayload::ConfigChange(voter_set)
             }
         };
@@ -461,26 +517,7 @@ impl TryFrom<proto::FetchResponse> for FetchResponse {
 
 impl From<&SnapshotMeta> for proto::SnapshotMetadata {
     fn from(m: &SnapshotMeta) -> Self {
-        let voter_set = m.voter_set.as_ref().map(|vs| {
-            proto::VoterSet {
-                voters: vs
-                    .voters()
-                    .iter()
-                    .map(|vr| proto::VoterRecord {
-                        node_id: vr.node_id.0,
-                        directory_id: vr.directory_id.0.to_string(),
-                        endpoints: vr
-                            .endpoints
-                            .iter()
-                            .map(|ep| proto::Endpoint {
-                                host: ep.host.clone(),
-                                port: ep.port as u32,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            }
-        });
+        let voter_set = m.voter_set.as_ref().map(voter_set_to_proto);
         Self {
             last_included_index: m.last_included_index.0,
             last_included_term: m.last_included_term.0,
@@ -497,35 +534,8 @@ impl TryFrom<proto::SnapshotMetadata> for SnapshotMeta {
         let voter_set = match p.voter_set {
             None => None,
             Some(vs) => {
-                let records: Result<Vec<crate::types::VoterRecord>, String> = vs
-                    .voters
-                    .into_iter()
-                    .map(|vr| {
-                        let directory_id = uuid::Uuid::parse_str(&vr.directory_id)
-                            .map_err(|e| format!("invalid directory_id UUID: {e}"))?;
-                        Ok(crate::types::VoterRecord {
-                            node_id: NodeId(vr.node_id),
-                            directory_id: crate::types::DirectoryId(directory_id),
-                            endpoints: vr
-                                .endpoints
-                                .into_iter()
-                                .map(|ep| crate::types::Endpoint {
-                                    host: ep.host,
-                                    port: ep.port as u16,
-                                })
-                                .collect(),
-                        })
-                    })
-                    .collect();
-                let records = records?;
-                if records.is_empty() {
-                    None
-                } else {
-                    Some(
-                        crate::types::VoterSet::try_new(records)
-                            .map_err(|e| format!("invalid voter set: {e}"))?,
-                    )
-                }
+                let vs = voter_set_from_proto(vs)?;
+                Some(vs)
             }
         };
         Ok(Self {
@@ -1046,10 +1056,10 @@ mod tests {
             index: 1,
             term: 1,
             entry_type: proto::EntryType::Config as i32,
-            data: vec![0xFF, 0xFE, 0xFD], // not valid bincode-encoded VoterSet
+            data: vec![0xFF, 0xFE, 0xFD], // not valid protobuf-encoded VoterSet
         };
         let result = Entry::try_from(bad_config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("failed to deserialise VoterSet"));
+        assert!(result.unwrap_err().contains("failed to decode VoterSet"));
     }
 }
