@@ -1,5 +1,3 @@
-//! `xraft-storage` — Durable log, snapshots, and hard-state persistence.
+mod snapshot_store;
 
-pub mod log;
-pub mod snapshot;
-pub mod state;
+pub use snapshot_store::SnapshotStore;
