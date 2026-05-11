@@ -263,12 +263,38 @@ impl ClusterConfig {
             }
         }
 
-        // Self-membership: listen_addr should not appear in peers
-        if self.peers.iter().any(|p| p == &self.listen_addr) {
-            return Err(XRaftError::Config(format!(
-                "listen_addr '{}' must not appear in peers (a node should not peer with itself)",
-                self.listen_addr
-            )));
+        // Self-membership: listen_addr should not appear in peers.
+        // Compare parsed (host, port) tuples so that wildcard listen hosts
+        // (0.0.0.0, [::], ::) are recognised as matching any peer host on the
+        // same port. For non-wildcard hosts we fall back to exact string
+        // comparison since DNS resolution is out of scope at config time.
+        if let Some((listen_host, listen_port)) = Self::parse_host_port(&self.listen_addr) {
+            let listen_is_wildcard = matches!(
+                listen_host.as_str(),
+                "0.0.0.0" | "::" | "[::]"
+            );
+            for peer in &self.peers {
+                let is_self = if let Some((peer_host, peer_port)) = Self::parse_host_port(peer) {
+                    if listen_port != peer_port {
+                        false
+                    } else if listen_is_wildcard {
+                        // A wildcard listen address matches any peer on the same port
+                        true
+                    } else {
+                        listen_host == peer_host
+                    }
+                } else {
+                    // Unparseable peer — fall back to exact string match
+                    peer == &self.listen_addr
+                };
+                if is_self {
+                    return Err(XRaftError::Config(format!(
+                        "listen_addr '{}' must not appear in peers (a node should not peer \
+                         with itself); peer '{}' resolves to the same endpoint",
+                        self.listen_addr, peer
+                    )));
+                }
+            }
         }
 
         // Validate structured voters if provided
@@ -375,6 +401,22 @@ impl ClusterConfig {
             XRaftError::Config(format!("invalid voter set: {e}"))
         })?;
         Ok(Some(vs))
+    }
+
+    /// Split an address string into `(host, port)`.
+    ///
+    /// Returns `None` if the address is not in a recognisable `host:port`
+    /// format. Used by the self-membership check to compare listen and peer
+    /// addresses at the (host, port) level rather than raw strings.
+    fn parse_host_port(addr: &str) -> Option<(String, u16)> {
+        let colon_pos = addr.rfind(':')?;
+        let host = &addr[..colon_pos];
+        let port_str = &addr[colon_pos + 1..];
+        if host.is_empty() || port_str.is_empty() {
+            return None;
+        }
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_lowercase(), port))
     }
 
     /// Validate that an address string is in `host:port` format with a
@@ -987,6 +1029,75 @@ peers = ["node1:6001", "0.0.0.0:6000"]
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("must not appear in peers"), "got: {msg}");
+    }
+
+    #[test]
+    fn config_validate_self_in_peers_wildcard_catches_localhost() {
+        // 0.0.0.0 is a wildcard — a peer on 127.0.0.1 with the same port is self.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["127.0.0.1:6000"]
+"#;
+        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("must not appear in peers"), "got: {msg}");
+        assert!(msg.contains("127.0.0.1:6000"), "got: {msg}");
+    }
+
+    #[test]
+    fn config_validate_self_in_peers_wildcard_catches_hostname() {
+        // 0.0.0.0 wildcard — any host on the same port is self.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["myhost:6000"]
+"#;
+        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("must not appear in peers"), "got: {msg}");
+    }
+
+    #[test]
+    fn config_validate_self_in_peers_wildcard_different_port_ok() {
+        // Same wildcard host but different port — should be fine.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["127.0.0.1:6001"]
+"#;
+        let cfg = ClusterConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.peers, vec!["127.0.0.1:6001"]);
+    }
+
+    #[test]
+    fn config_validate_self_in_peers_non_wildcard_exact_match() {
+        // Non-wildcard listen addr — only exact host match is rejected.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "10.0.0.5:6000"
+peers = ["10.0.0.5:6000"]
+"#;
+        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("must not appear in peers"), "got: {msg}");
+    }
+
+    #[test]
+    fn config_validate_self_in_peers_non_wildcard_different_host_ok() {
+        // Non-wildcard listen addr with different host — should pass.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "10.0.0.5:6000"
+peers = ["10.0.0.6:6000"]
+"#;
+        let cfg = ClusterConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.peers, vec!["10.0.0.6:6000"]);
     }
 
     // --- Structured voters tests ---
