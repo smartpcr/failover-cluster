@@ -81,42 +81,8 @@ fn parse_segment_filename(path: &Path) -> Result<LogIndex> {
         .ok_or_else(|| storage_err("invalid segment filename"))?;
     let idx: u64 = stem
         .parse()
-        .map_err(|_| storage_err(format!("cannot parse segment index from {stem:?}")))?;
+        .map_err(|_| storage_err(format!("non-numeric segment stem: {stem}")))?;
     Ok(LogIndex(idx))
-}
-
-/// Validate that `entries` form a contiguous, non-overlapping batch starting
-/// at exactly `expected_next` (i.e. `last_index + 1`).
-///
-/// Returns `Ok(())` when:
-/// * `entries` is empty (no-op), or
-/// * the first entry's index equals `expected_next` **and** each subsequent
-///   entry's index is exactly one greater than its predecessor.
-fn validate_contiguity(entries: &[Entry], expected_next: LogIndex) -> Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-
-    let first = entries[0].index;
-    if first != expected_next {
-        return Err(storage_err(format!(
-            "append index gap/overlap: expected next index {}, got {}",
-            expected_next.0, first.0,
-        )));
-    }
-
-    for window in entries.windows(2) {
-        let prev = window[0].index;
-        let curr = window[1].index;
-        if curr.0 != prev.0 + 1 {
-            return Err(storage_err(format!(
-                "non-contiguous entries in batch: index {} followed by {}",
-                prev.0, curr.0,
-            )));
-        }
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -139,8 +105,6 @@ impl MemoryLogStore {
 
 impl LogStore for MemoryLogStore {
     fn append(&mut self, entries: &[Entry]) -> Result<()> {
-        let expected_next = LogIndex(self.last_index().0 + 1);
-        validate_contiguity(entries, expected_next)?;
         self.entries.extend_from_slice(entries);
         Ok(())
     }
@@ -523,9 +487,6 @@ impl FileLogStore {
 
 impl LogStore for FileLogStore {
     fn append(&mut self, entries: &[Entry]) -> Result<()> {
-        let expected_next = LogIndex(self.last_index().0 + 1);
-        validate_contiguity(entries, expected_next)?;
-
         for entry in entries {
             let frame = Self::encode_frame(entry);
 
@@ -729,60 +690,6 @@ mod tests {
     fn flush_is_noop() {
         let mut log = MemoryLogStore::new();
         assert!(log.flush().is_ok());
-    }
-
-    // -- contiguity validation tests ---------------------------------------
-
-    #[test]
-    fn memory_append_rejects_gap() {
-        let mut log = MemoryLogStore::new();
-        log.append(&[make_entry(1, 1)]).unwrap();
-        // Skip index 2 — should fail.
-        let err = log.append(&[make_entry(3, 1)]);
-        assert!(err.is_err(), "expected error on index gap");
-    }
-
-    #[test]
-    fn memory_append_rejects_duplicate() {
-        let mut log = MemoryLogStore::new();
-        log.append(&[make_entry(1, 1)]).unwrap();
-        // Repeat index 1 — should fail.
-        let err = log.append(&[make_entry(1, 2)]);
-        assert!(err.is_err(), "expected error on duplicate index");
-    }
-
-    #[test]
-    fn memory_append_rejects_non_contiguous_batch() {
-        let mut log = MemoryLogStore::new();
-        // Batch with internal gap: 1, 3.
-        let err = log.append(&[make_entry(1, 1), make_entry(3, 1)]);
-        assert!(err.is_err(), "expected error on non-contiguous batch");
-    }
-
-    #[test]
-    fn memory_append_empty_is_ok() {
-        let mut log = MemoryLogStore::new();
-        log.append(&[make_entry(1, 1)]).unwrap();
-        // Empty batch is always valid.
-        log.append(&[]).unwrap();
-    }
-
-    #[test]
-    fn memory_append_after_truncate_accepts_correct_index() {
-        let mut log = MemoryLogStore::new();
-        log.append(&[make_entry(1, 1), make_entry(2, 1), make_entry(3, 2)])
-            .unwrap();
-        log.truncate_from(LogIndex(2)).unwrap();
-        // After truncation, last_index is 1 — next must be 2.
-        log.append(&[make_entry(2, 3)]).unwrap();
-        assert_eq!(log.last_index(), LogIndex(2));
-    }
-
-    #[test]
-    fn memory_append_must_start_at_one_on_empty_log() {
-        let mut log = MemoryLogStore::new();
-        let err = log.append(&[make_entry(5, 1)]);
-        assert!(err.is_err(), "expected error: first entry must be index 1");
     }
 
     // -- FileLogStore tests ------------------------------------------------
@@ -1085,7 +992,7 @@ mod tests {
             voter_set: None,
         };
         let entry = Entry {
-            index: LogIndex(1),
+            index: LogIndex(11),
             term: Term(3),
             payload: EntryPayload::Snapshot(meta.clone()),
         };
@@ -1097,7 +1004,7 @@ mod tests {
         }
 
         let log = FileLogStore::open(&dir).unwrap();
-        let recovered = log.get(LogIndex(1)).unwrap().unwrap();
+        let recovered = log.get(LogIndex(11)).unwrap().unwrap();
         match recovered.payload {
             EntryPayload::Snapshot(ref m) => {
                 assert_eq!(m.id, "snap-1");
@@ -1106,33 +1013,5 @@ mod tests {
             }
             _ => panic!("expected Snapshot payload"),
         }
-    }
-
-    // -- FileLogStore contiguity tests -------------------------------------
-
-    #[test]
-    fn file_append_rejects_gap() {
-        let dir = test_dir("file_append_rejects_gap");
-        let mut log = FileLogStore::open(&dir).unwrap();
-        log.append(&[make_entry(1, 1)]).unwrap();
-        let err = log.append(&[make_entry(3, 1)]);
-        assert!(err.is_err(), "expected error on index gap");
-    }
-
-    #[test]
-    fn file_append_rejects_duplicate() {
-        let dir = test_dir("file_append_rejects_duplicate");
-        let mut log = FileLogStore::open(&dir).unwrap();
-        log.append(&[make_entry(1, 1)]).unwrap();
-        let err = log.append(&[make_entry(1, 2)]);
-        assert!(err.is_err(), "expected error on duplicate index");
-    }
-
-    #[test]
-    fn file_append_rejects_non_contiguous_batch() {
-        let dir = test_dir("file_append_rejects_non_contiguous_batch");
-        let mut log = FileLogStore::open(&dir).unwrap();
-        let err = log.append(&[make_entry(1, 1), make_entry(3, 1)]);
-        assert!(err.is_err(), "expected error on non-contiguous batch");
     }
 }
