@@ -25,11 +25,18 @@ impl SnapshotStore for MemorySnapshotStore {
     }
 
     fn load_latest_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>> {
-        Ok(self.snapshots.last().cloned())
+        Ok(self
+            .snapshots
+            .iter()
+            .max_by_key(|(m, _)| m.last_included_index)
+            .cloned())
     }
 
     fn list_snapshots(&self) -> Result<Vec<SnapshotMeta>> {
-        Ok(self.snapshots.iter().rev().map(|(m, _)| m.clone()).collect())
+        let mut metas: Vec<SnapshotMeta> =
+            self.snapshots.iter().map(|(m, _)| m.clone()).collect();
+        metas.sort_by(|a, b| b.last_included_index.cmp(&a.last_included_index));
+        Ok(metas)
     }
 
     fn delete_snapshot(&mut self, id: &str) -> Result<()> {
@@ -86,6 +93,20 @@ mod tests {
     }
 
     #[test]
+    fn latest_selects_by_index_not_insertion_order() {
+        let mut store = MemorySnapshotStore::new();
+        store
+            .save_snapshot(test_meta("snap-2", 20, 3), b"v2")
+            .unwrap();
+        store
+            .save_snapshot(test_meta("snap-1", 10, 2), b"v1")
+            .unwrap();
+        let (meta, _) = store.load_latest_snapshot().unwrap().unwrap();
+        assert_eq!(meta.id, "snap-2");
+        assert_eq!(meta.last_included_index, LogIndex(20));
+    }
+
+    #[test]
     fn list_newest_first() {
         let mut store = MemorySnapshotStore::new();
         store.save_snapshot(test_meta("a", 1, 1), b"").unwrap();
@@ -94,6 +115,18 @@ mod tests {
         let list = store.list_snapshots().unwrap();
         assert_eq!(list.len(), 3);
         assert_eq!(list[0].id, "c");
+        assert_eq!(list[2].id, "a");
+    }
+
+    #[test]
+    fn list_sorts_by_index_not_insertion_order() {
+        let mut store = MemorySnapshotStore::new();
+        store.save_snapshot(test_meta("b", 2, 1), b"").unwrap();
+        store.save_snapshot(test_meta("a", 1, 1), b"").unwrap();
+        store.save_snapshot(test_meta("c", 3, 2), b"").unwrap();
+        let list = store.list_snapshots().unwrap();
+        assert_eq!(list[0].id, "c");
+        assert_eq!(list[1].id, "b");
         assert_eq!(list[2].id, "a");
     }
 
