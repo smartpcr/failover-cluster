@@ -6,8 +6,8 @@
 
 use crate::error::Result;
 use crate::message::{
-    FetchRequest, FetchResponse, FetchSnapshotChunk, FetchSnapshotRequest,
-    PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse,
+    FetchRequest, FetchResponse, FetchSnapshotChunk, FetchSnapshotRequest, PreVoteRequest,
+    PreVoteResponse, VoteRequest, VoteResponse,
 };
 use crate::types::NodeId;
 
