@@ -17,6 +17,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -32,6 +33,9 @@ pub enum HardStateError {
 
     #[error("serialization error: {0}")]
     Serialize(#[from] serde_json::Error),
+
+    #[error("data directory is locked by another process: {0}")]
+    Locked(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, HardStateError>;
@@ -126,11 +130,22 @@ impl HardStateStore for MemoryHardStateStore {
 /// File name used inside the state directory.
 const STATE_FILE_NAME: &str = "quorum-state";
 
+/// Lock file name used to guarantee single-process access.
+const LOCK_FILE_NAME: &str = "lock";
+
 /// Durable, file-backed implementation of [`HardStateStore`].
 ///
 /// State is serialised as JSON and written atomically (write-to-temp then
 /// rename).  An in-memory cache avoids repeated disk reads on every
 /// `load()` call.
+///
+/// # Exclusive access
+///
+/// `open()` acquires an exclusive advisory lock on a `lock` file inside the
+/// data directory.  The lock is held for the lifetime of the store, ensuring
+/// that at most one process can operate on the same directory at a time.
+/// This prevents silent state corruption that would violate term
+/// monotonicity and the single-vote-per-term invariant.
 ///
 /// # First-boot vs crash-recovery
 ///
@@ -150,6 +165,10 @@ pub struct FileHardStateStore {
     ///
     /// When `false`, `load()` returns `None` to signal first-boot.
     has_persisted: RwLock<bool>,
+
+    /// Exclusive lock on the data directory.  Held for the lifetime of the
+    /// store; the OS releases the advisory lock when this handle is dropped.
+    _lock_file: fs::File,
 }
 
 impl std::fmt::Debug for FileHardStateStore {
@@ -164,6 +183,10 @@ impl std::fmt::Debug for FileHardStateStore {
 impl FileHardStateStore {
     /// Open (or create) a hard-state store rooted at `dir`.
     ///
+    /// Acquires an exclusive lock on `dir/lock` to prevent concurrent access
+    /// by another process.  Returns [`HardStateError::Locked`] if the
+    /// directory is already locked.
+    ///
     /// If a `quorum-state` file already exists in `dir`, its contents are
     /// loaded into the in-memory cache and subsequent `load()` calls will
     /// return `Some`.  Otherwise the cache is seeded with a default
@@ -171,6 +194,19 @@ impl FileHardStateStore {
     pub fn open<P: AsRef<Path>>(dir: P) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
+
+        // Acquire exclusive lock before touching any data files.
+        let lock_path = dir.join(LOCK_FILE_NAME);
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+
+        lock_file.try_lock_exclusive().map_err(|_| {
+            HardStateError::Locked(dir.clone())
+        })?;
 
         let path = dir.join(STATE_FILE_NAME);
 
@@ -186,6 +222,7 @@ impl FileHardStateStore {
             dir,
             cached: RwLock::new(cached),
             has_persisted: RwLock::new(has_persisted),
+            _lock_file: lock_file,
         })
     }
 
@@ -362,6 +399,45 @@ mod tests {
         let loaded = store.load().unwrap();
         assert!(loaded.is_some(), "existing file ⇒ Some on reload");
         assert_eq!(loaded.unwrap(), state);
+    }
+
+    #[test]
+    fn file_store_rejects_concurrent_open() {
+        let tmp = TempDir::new().unwrap();
+
+        // First open succeeds and holds the lock.
+        let _store1 = FileHardStateStore::open(tmp.path()).unwrap();
+
+        // Second open on the same directory must fail.
+        let result = FileHardStateStore::open(tmp.path());
+        assert!(result.is_err(), "concurrent open must be rejected");
+        match result.unwrap_err() {
+            HardStateError::Locked(path) => {
+                assert_eq!(path, tmp.path().to_path_buf());
+            }
+            other => panic!("expected Locked error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn file_store_lock_released_on_drop() {
+        let tmp = TempDir::new().unwrap();
+
+        let state = HardState {
+            term: 42,
+            voted_for: Some(1),
+            commit: 10,
+        };
+
+        // Open, persist, drop — lock must be released.
+        {
+            let store = FileHardStateStore::open(tmp.path()).unwrap();
+            store.persist(&state).unwrap();
+        }
+
+        // Re-opening must succeed now that the first store is dropped.
+        let store = FileHardStateStore::open(tmp.path()).unwrap();
+        assert_eq!(store.load().unwrap(), Some(state));
     }
 
     // -- SharedHardStateStore -----------------------------------------------
