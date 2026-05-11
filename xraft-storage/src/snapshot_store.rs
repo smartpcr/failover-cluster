@@ -1114,11 +1114,11 @@ impl FileSnapshotStore {
         // transfer is complete).
         if offset_usize >= data_len_usize && data_len_usize > 0 {
             // Compute the logical chunk index that the offset corresponds to.
-            let logical_chunk_index = if chunk_size > 0 {
-                (offset_usize / chunk_size) as u64
-            } else {
-                0
-            };
+            // Use `checked_div` to satisfy clippy's `manual_checked_ops` lint
+            // (new in Rust 1.95, promoted to error by the workspace's
+            // `-D warnings` policy).
+            let logical_chunk_index =
+                (offset_usize.checked_div(chunk_size).unwrap_or(0)) as u64;
             return Ok(SnapshotChunkReader {
                 reader,
                 meta: Some(file_meta),
@@ -1182,11 +1182,9 @@ impl FileSnapshotStore {
                 .ok_or_else(|| storage_err("overflow computing chunk count"))?
         };
 
-        let base_chunk_index = if chunk_size > 0 {
-            (offset_usize / chunk_size) as u64
-        } else {
-            0
-        };
+        // Use `checked_div` to satisfy clippy's `manual_checked_ops` lint
+        // (new in Rust 1.95). Same shape as `logical_chunk_index` above.
+        let base_chunk_index = (offset_usize.checked_div(chunk_size).unwrap_or(0)) as u64;
 
         // Partial reads (offset > 0 or max_bytes < data_len) skip CRC since
         // the hasher only covers the streamed window, not the full payload.
