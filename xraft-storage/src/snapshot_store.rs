@@ -416,7 +416,10 @@ impl SnapshotStore for MemorySnapshotStore {
 
     fn list_snapshots(&self) -> Result<Vec<SnapshotMeta>> {
         let mut metas: Vec<SnapshotMeta> = self.snapshots.iter().map(|(m, _)| m.clone()).collect();
-        metas.sort_by(|a, b| b.last_included_index.cmp(&a.last_included_index));
+        // Sort descending by last_included_index. Use `sort_by_key` with
+        // `Reverse` so Rust 1.95's `clippy::unnecessary_sort_by` lint is
+        // satisfied under `-D warnings`.
+        metas.sort_by_key(|m| std::cmp::Reverse(m.last_included_index));
         Ok(metas)
     }
 
