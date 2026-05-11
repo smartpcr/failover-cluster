@@ -2,7 +2,9 @@
 //!
 //! These are the in-memory representations used by the consensus engine.
 //! The `proto` submodule re-exports generated protobuf types; conversion
-//! traits (`From`/`Into`) bridge the wire format and the canonical Rust types.
+//! traits (`From`/`TryFrom`) bridge the wire format and the canonical Rust
+//! types. Conversions that can fail (e.g. `Entry` → `proto::LogEntry`,
+//! which rejects the in-memory-only `Snapshot` variant) use `TryFrom`.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -367,8 +369,10 @@ impl From<proto::DivergingEpoch> for DivergingEpoch {
 
 // --- LogEntry / Entry ---
 
-impl From<&Entry> for proto::LogEntry {
-    fn from(e: &Entry) -> Self {
+impl TryFrom<&Entry> for proto::LogEntry {
+    type Error = String;
+
+    fn try_from(e: &Entry) -> Result<Self, Self::Error> {
         let (entry_type, data) = match &e.payload {
             EntryPayload::Command(bytes) => (proto::EntryType::Command as i32, bytes.to_vec()),
             EntryPayload::NoOp => (proto::EntryType::NoOp as i32, Vec::new()),
@@ -378,18 +382,19 @@ impl From<&Entry> for proto::LogEntry {
                 (proto::EntryType::Config as i32, data)
             }
             EntryPayload::Snapshot(_) => {
-                panic!(
+                return Err(
                     "EntryPayload::Snapshot is an in-memory compaction marker \
                      and must not be serialised to the wire"
+                        .to_string(),
                 );
             }
         };
-        Self {
+        Ok(Self {
             index: e.index.0,
             term: e.term.0,
             entry_type,
             data,
-        }
+        })
     }
 }
 
@@ -418,16 +423,20 @@ impl TryFrom<proto::LogEntry> for Entry {
 
 // --- FetchResponse ---
 
-impl From<&FetchResponse> for proto::FetchResponse {
-    fn from(r: &FetchResponse) -> Self {
-        Self {
+impl TryFrom<&FetchResponse> for proto::FetchResponse {
+    type Error = String;
+
+    fn try_from(r: &FetchResponse) -> Result<Self, Self::Error> {
+        let entries: Result<Vec<proto::LogEntry>, String> =
+            r.entries.iter().map(proto::LogEntry::try_from).collect();
+        Ok(Self {
             cluster_id: r.cluster_id.clone(),
             leader_epoch: r.leader_epoch,
             leader_id: r.leader_id.0,
             high_watermark: r.high_watermark.0,
-            entries: r.entries.iter().map(proto::LogEntry::from).collect(),
+            entries: entries?,
             diverging_epoch: r.diverging_epoch.as_ref().map(proto::DivergingEpoch::from),
-        }
+        })
     }
 }
 
@@ -738,7 +747,7 @@ mod tests {
             term: Term(3),
             payload: EntryPayload::Command(Bytes::from_static(b"hello")),
         };
-        let proto_entry = proto::LogEntry::from(&entry);
+        let proto_entry = proto::LogEntry::try_from(&entry).unwrap();
         let mut buf = Vec::new();
         proto_entry.encode(&mut buf).unwrap();
         let decoded = proto::LogEntry::decode(buf.as_slice()).unwrap();
@@ -755,7 +764,7 @@ mod tests {
             term: Term(1),
             payload: EntryPayload::NoOp,
         };
-        let proto_entry = proto::LogEntry::from(&entry);
+        let proto_entry = proto::LogEntry::try_from(&entry).unwrap();
         let mut buf = Vec::new();
         proto_entry.encode(&mut buf).unwrap();
         let decoded = proto::LogEntry::decode(buf.as_slice()).unwrap();
@@ -771,7 +780,7 @@ mod tests {
             term: Term(2),
             payload: EntryPayload::ConfigChange(vs.clone()),
         };
-        let proto_entry = proto::LogEntry::from(&entry);
+        let proto_entry = proto::LogEntry::try_from(&entry).unwrap();
         assert_eq!(proto_entry.entry_type, proto::EntryType::Config as i32);
 
         let mut buf = Vec::new();
@@ -785,8 +794,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "in-memory compaction marker")]
-    fn log_entry_snapshot_panics_on_serialise() {
+    fn log_entry_snapshot_returns_error_on_serialise() {
         let entry = Entry {
             index: LogIndex(1),
             term: Term(1),
@@ -797,7 +805,9 @@ mod tests {
                 voter_set: None,
             }),
         };
-        let _ = proto::LogEntry::from(&entry);
+        let result = proto::LogEntry::try_from(&entry);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("in-memory compaction marker"));
     }
 
     #[test]
@@ -846,7 +856,7 @@ mod tests {
                 end_offset: LogIndex(8),
             }),
         };
-        let proto_resp = proto::FetchResponse::from(&resp);
+        let proto_resp = proto::FetchResponse::try_from(&resp).unwrap();
         let mut buf = Vec::new();
         proto_resp.encode(&mut buf).unwrap();
         let decoded = proto::FetchResponse::decode(buf.as_slice()).unwrap();
@@ -873,7 +883,7 @@ mod tests {
             entries: vec![],
             diverging_epoch: None,
         };
-        let proto_resp = proto::FetchResponse::from(&resp);
+        let proto_resp = proto::FetchResponse::try_from(&resp).unwrap();
         let mut buf = Vec::new();
         proto_resp.encode(&mut buf).unwrap();
         let decoded = proto::FetchResponse::decode(buf.as_slice()).unwrap();
@@ -1004,7 +1014,7 @@ mod tests {
                 term: Term(1),
                 payload,
             };
-            let proto_entry = proto::LogEntry::from(&entry);
+            let proto_entry = proto::LogEntry::try_from(&entry).unwrap();
             assert_eq!(proto_entry.entry_type, expected_type as i32);
             let mut buf = Vec::new();
             proto_entry.encode(&mut buf).unwrap();
