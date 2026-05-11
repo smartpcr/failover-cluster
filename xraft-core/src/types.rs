@@ -135,9 +135,13 @@ pub struct VoterRecord {
 /// A voter set must contain at least one voter and all `(NodeId, DirectoryId)`
 /// pairs must be unique. Static for v1 — defined at bootstrap and immutable
 /// for the cluster lifetime. Dynamic membership is deferred to a future story.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The `voters` field is private to enforce invariants established by
+/// [`VoterSet::try_new`]. Use [`VoterSet::voters`] for read access and
+/// [`VoterSet::into_voters`] for consuming access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VoterSet {
-    pub voters: Vec<VoterRecord>,
+    voters: Vec<VoterRecord>,
 }
 
 /// Errors that occur when constructing an invalid `VoterSet`.
@@ -173,17 +177,13 @@ impl std::fmt::Display for VoterSetError {
 impl std::error::Error for VoterSetError {}
 
 impl VoterSet {
-    /// Create a new `VoterSet`, validating that:
-    /// - The set is non-empty.
-    /// - No duplicate `(NodeId, DirectoryId)` pairs exist.
-    /// - Every voter has a non-nil `DirectoryId`.
-    /// - Every voter has at least one endpoint.
-    pub fn try_new(voters: Vec<VoterRecord>) -> std::result::Result<Self, VoterSetError> {
+    /// Validate that a slice of voters satisfies all VoterSet invariants.
+    fn validate(voters: &[VoterRecord]) -> std::result::Result<(), VoterSetError> {
         if voters.is_empty() {
             return Err(VoterSetError::Empty);
         }
         let mut seen = std::collections::HashSet::new();
-        for v in &voters {
+        for v in voters {
             if v.directory_id.0.is_nil() {
                 return Err(VoterSetError::NilDirectoryId { node_id: v.node_id });
             }
@@ -197,7 +197,27 @@ impl VoterSet {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Create a new `VoterSet`, validating that:
+    /// - The set is non-empty.
+    /// - No duplicate `(NodeId, DirectoryId)` pairs exist.
+    /// - Every voter has a non-nil `DirectoryId`.
+    /// - Every voter has at least one endpoint.
+    pub fn try_new(voters: Vec<VoterRecord>) -> std::result::Result<Self, VoterSetError> {
+        Self::validate(&voters)?;
         Ok(Self { voters })
+    }
+
+    /// Borrow the voter records.
+    pub fn voters(&self) -> &[VoterRecord] {
+        &self.voters
+    }
+
+    /// Consume the `VoterSet` and return the underlying `Vec<VoterRecord>`.
+    pub fn into_voters(self) -> Vec<VoterRecord> {
+        self.voters
     }
 
     /// Number of voters in the set.
@@ -236,6 +256,24 @@ impl VoterSet {
         let nodes: std::collections::HashSet<NodeId> =
             self.voters.iter().map(|v| v.node_id).collect();
         nodes.len()
+    }
+}
+
+/// Custom `Deserialize` for `VoterSet` that enforces validation on
+/// deserialized data, preventing construction of invalid voter sets
+/// from untrusted input (network, config files, snapshots).
+impl<'de> Deserialize<'de> for VoterSet {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct VoterSetRaw {
+            voters: Vec<VoterRecord>,
+        }
+
+        let raw = VoterSetRaw::deserialize(deserializer)?;
+        VoterSet::try_new(raw.voters).map_err(serde::de::Error::custom)
     }
 }
 
@@ -619,6 +657,60 @@ mod tests {
         let json = serde_json::to_string(&vs).unwrap();
         let vs2: VoterSet = serde_json::from_str(&json).unwrap();
         assert_eq!(vs, vs2);
+    }
+
+    #[test]
+    fn voter_set_deserialize_rejects_empty() {
+        let json = r#"{"voters":[]}"#;
+        let result: Result<VoterSet, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("at least one voter"), "expected validation error, got: {err}");
+    }
+
+    #[test]
+    fn voter_set_deserialize_rejects_nil_directory_id() {
+        let json = r#"{"voters":[{"node_id":1,"directory_id":"00000000-0000-0000-0000-000000000000","endpoints":[{"host":"h","port":6000}]}]}"#;
+        let result: Result<VoterSet, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("nil directory_id"), "expected validation error, got: {err}");
+    }
+
+    #[test]
+    fn voter_set_deserialize_rejects_missing_endpoints() {
+        let json = r#"{"voters":[{"node_id":1,"directory_id":"550e8400-e29b-41d4-a716-446655440000","endpoints":[]}]}"#;
+        let result: Result<VoterSet, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("no endpoints"), "expected validation error, got: {err}");
+    }
+
+    #[test]
+    fn voter_set_voters_accessor() {
+        let make_voter = |id: u64| VoterRecord {
+            node_id: NodeId(id),
+            directory_id: DirectoryId::new_random(),
+            endpoints: vec![Endpoint::new("host", 6000)],
+        };
+        let vs = VoterSet::try_new(vec![make_voter(1), make_voter(2)]).unwrap();
+        let slice = vs.voters();
+        assert_eq!(slice.len(), 2);
+        assert_eq!(slice[0].node_id, NodeId(1));
+        assert_eq!(slice[1].node_id, NodeId(2));
+    }
+
+    #[test]
+    fn voter_set_into_voters() {
+        let make_voter = |id: u64| VoterRecord {
+            node_id: NodeId(id),
+            directory_id: DirectoryId::new_random(),
+            endpoints: vec![Endpoint::new("host", 6000)],
+        };
+        let vs = VoterSet::try_new(vec![make_voter(1), make_voter(2)]).unwrap();
+        let vec = vs.into_voters();
+        assert_eq!(vec.len(), 2);
+        assert_eq!(vec[0].node_id, NodeId(1));
     }
 
     #[test]
