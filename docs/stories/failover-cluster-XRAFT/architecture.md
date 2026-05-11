@@ -24,15 +24,13 @@ non-voting observer nodes for read scale-out.
 
 ## 2. Component Architecture
 
-The system is planned as six crates within a Cargo workspace at the
-repository root. (The worktree currently contains only `README.md` and `docs/`;
-these crates will be created during implementation per `implementation-plan.md`
-Stage 1.1.) Crate names are aligned across all sibling documents
+The system is organised as six crates within a Cargo workspace at the
+repository root. Crate names are aligned across all sibling documents
 (`tech-spec.md` §5.6, `implementation-plan.md` Stage 1.1, and
 `e2e-scenarios.md`):
 
 ```
-Cargo.toml                       # workspace root (planned)
+Cargo.toml                       # workspace root
 xraft-core/                      # Raft algorithm, pure logic, no I/O — defines all traits
 xraft-storage/                   # Durable segmented log, snapshots, hard-state persistence
 xraft-transport/                 # Network transport (gRPC via tonic)
@@ -55,7 +53,7 @@ step-down) is a pure function of inputs and current state.
 | `LogIndex` | Newtype `u64`. 1-based position in the replicated log. |
 | `Entry` | `(LogIndex, Term, EntryPayload)` — a single log entry. |
 | `EntryPayload` | Enum: `Command(Bytes)`, `NoOp`, `Snapshot(SnapshotMeta)`. A `ConfigChange(VoterSet)` variant is **reserved for future use** if dynamic membership is added in a future story (see §5.5); it is not emitted in the v1 static-membership baseline. |
-| `HardState` | Persisted before any RPC reply: `current_term`, `voted_for`, `commit_index`. |
+| `HardState` | Persisted before any RPC reply: `current_term`, `voted_for`. (`commit_index` and `last_applied` are volatile, rebuilt from the log on recovery — see §3.3.) |
 | `VoterSet` | Set of `(NodeId, NodeDirectoryId, Vec<Endpoint>)` tuples — the current quorum configuration. |
 | `ElectionTimer` | Randomised election timeout (150–300 ms default). Reset on valid leader contact. |
 | `Input` | Enum of all inputs: `Tick`, `VoteRequest`, `VoteResponse`, `FetchRequest`, `FetchResponse`, `ClientPropose`. |
@@ -233,11 +231,11 @@ engine without real I/O. Inspired by deterministic simulation testing (Jepsen-st
 ┌──────────────────────────────────────────────────────┐
 │  HardState (persisted atomically, quorum-state file) │
 │  ─────────────────────────────────────────────────── │
-│  current_term  : u64                                 │
+│  current_term  : Term                                │
 │  voted_for     : Option<NodeId>                      │
-│  voted_for_dir : Option<NodeDirectoryId>             │
-│  commit_index  : u64                                 │
 └──────────────────────────────────────────────────────┘
+│  (commit_index and last_applied are volatile,        │
+│   rebuilt from the log on recovery — see §3.3)       │
 
 ┌──────────────────────────────────────────────────────┐
 │  LogEntry (persisted in segment files)               │
@@ -656,46 +654,42 @@ Exposed via Prometheus endpoint (`/metrics`) on the admin HTTP port:
 ## 8. Configuration Reference
 
 ```toml
-# node.toml — per-node configuration
+# node.toml — per-node configuration (flat layout matching ClusterConfig struct)
 
 node_id = 1
 cluster_id = "xraft-cluster-001"
-data_dir = "/var/lib/xraft"
+listen_addr = "0.0.0.0:6001"
+peers = ["node0.example.com:6000", "node2.example.com:6002"]
 
-[cluster]
-bootstrap_peers = [
-  { node_id = 0, host = "node0.example.com", port = 6000 },
-  { node_id = 1, host = "node1.example.com", port = 6001 },
-  { node_id = 2, host = "node2.example.com", port = 6002 },
-]
-
-[timing]
-tick_interval_ms = 50
+# Timing (all have defaults if omitted)
 election_timeout_min_ms = 150
 election_timeout_max_ms = 300
-check_quorum_interval_ticks = 6      # 300 ms at 50 ms tick
+fetch_interval_ms = 50
+tick_interval_ms = 10
 
-[log]
-segment_max_bytes = 1_073_741_824    # 1 GiB
-retention_min_segments = 2
+# Snapshots
+snapshot_interval = 10000
+max_log_entries_before_compaction = 100000
 
-[snapshot]
-interval_entries = 10_000            # snapshot every N committed entries
-max_chunk_bytes = 1_048_576          # 1 MiB per FetchSnapshot chunk
-
-[network]
-listen_address = "0.0.0.0:6001"
-connect_timeout_ms = 500
-request_timeout_ms = 2000
-
-[tls]
-enabled = false
-cert_path = ""
-key_path = ""
-
-[admin]
-http_listen_address = "0.0.0.0:9090"
+# Storage
+data_dir = "/var/lib/xraft"
 ```
+
+Environment variable overrides (applied after TOML parsing, before validation):
+
+| Variable | Overrides |
+|---|---|
+| `XRAFT_NODE_ID` | `node_id` |
+| `XRAFT_CLUSTER_ID` | `cluster_id` |
+| `XRAFT_LISTEN_ADDR` | `listen_addr` |
+| `XRAFT_PEERS` | `peers` (comma-separated, empty entries filtered) |
+| `XRAFT_ELECTION_TIMEOUT_MIN_MS` | `election_timeout_min_ms` |
+| `XRAFT_ELECTION_TIMEOUT_MAX_MS` | `election_timeout_max_ms` |
+| `XRAFT_FETCH_INTERVAL_MS` | `fetch_interval_ms` |
+| `XRAFT_TICK_INTERVAL_MS` | `tick_interval_ms` |
+| `XRAFT_SNAPSHOT_INTERVAL` | `snapshot_interval` |
+| `XRAFT_MAX_LOG_ENTRIES` | `max_log_entries_before_compaction` |
+| `XRAFT_DATA_DIR` | `data_dir` |
 
 ---
 

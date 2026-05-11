@@ -7,6 +7,9 @@ use crate::error::Result;
 use crate::message::Entry;
 use crate::types::{LogIndex, Term};
 
+// Re-export HardState from types (canonical location per implementation-plan).
+pub use crate::types::HardState;
+
 /// Durable, append-only log storage.
 pub trait LogStore: Send + Sync {
     /// Append entries to the log.
@@ -47,17 +50,12 @@ pub trait SnapshotStore: Send + Sync {
     fn delete_snapshot(&mut self, id: &str) -> Result<()>;
 }
 
-/// Safety-critical voting state persisted before any RPC reply.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct HardState {
-    pub current_term: Term,
-    pub voted_for: Option<crate::types::NodeId>,
-}
-
 /// Metadata associated with a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotMeta {
     pub last_included_index: LogIndex,
     pub last_included_term: Term,
     pub id: String,
+    /// The voter set at the time of the snapshot.
+    pub voter_set: Option<crate::types::VoterSet>,
 }
