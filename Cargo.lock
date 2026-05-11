@@ -1837,6 +1837,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "bytes",
+ "futures-core",
  "prost",
  "serde",
  "serde_json",
@@ -1875,11 +1876,9 @@ dependencies = [
  "bincode",
  "bytes",
  "crc32fast",
- "serde",
- "serde_json",
  "tempfile",
- "tokio",
  "tracing",
+ "uuid",
  "xraft-core",
 ]
 

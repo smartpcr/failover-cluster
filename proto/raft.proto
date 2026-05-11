@@ -111,6 +111,10 @@ message SnapshotMetadata {
   uint64   last_included_term  = 2;
   VoterSet voter_set           = 3;
   string   snapshot_id         = 4;
+  // Size of the snapshot payload data in bytes (populated by store on save/load).
+  optional uint64 size_bytes   = 5;
+  // CRC32 checksum of the snapshot payload, zero-extended to u64.
+  optional uint64 checksum     = 6;
 }
 
 message FetchSnapshotRequest {
@@ -118,13 +122,30 @@ message FetchSnapshotRequest {
   uint64 leader_epoch = 2;
   uint64 replica_id   = 3;
   string snapshot_id  = 4;
+  // Byte offset into the snapshot payload for resumable transfer.
+  // 0 means start from the beginning.
+  uint64 offset       = 5;
+  // Maximum bytes to return in this response. 0 means no limit.
+  uint64 max_bytes    = 6;
 }
 
 message FetchSnapshotChunk {
   string cluster_id            = 1;
   uint64 leader_epoch          = 2;
-  uint32 chunk_index           = 3;
+  uint64 chunk_index           = 3;
   bytes  data                  = 4;
   bool   done                  = 5;
   optional SnapshotMetadata metadata = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Raft gRPC service
+// ---------------------------------------------------------------------------
+
+service RaftService {
+  rpc Vote(VoteRequest)                       returns (VoteResponse);
+  rpc PreVote(PreVoteRequest)                 returns (PreVoteResponse);
+  rpc Fetch(FetchRequest)                     returns (FetchResponse);
+  // Server-streaming: leader streams snapshot chunks to the requesting follower.
+  rpc FetchSnapshot(FetchSnapshotRequest)     returns (stream FetchSnapshotChunk);
 }

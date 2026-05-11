@@ -150,7 +150,10 @@ pub enum VoterSetError {
     /// The voter set must contain at least one voter.
     Empty,
     /// Duplicate `(NodeId, DirectoryId)` pair found.
-    DuplicateVoter { node_id: NodeId, directory_id: DirectoryId },
+    DuplicateVoter {
+        node_id: NodeId,
+        directory_id: DirectoryId,
+    },
     /// A voter record has no endpoints.
     MissingEndpoints { node_id: NodeId },
     /// A voter record has a nil DirectoryId.
@@ -161,8 +164,14 @@ impl std::fmt::Display for VoterSetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VoterSetError::Empty => write!(f, "voter set must contain at least one voter"),
-            VoterSetError::DuplicateVoter { node_id, directory_id } => {
-                write!(f, "duplicate voter: node_id={node_id}, directory_id={directory_id}")
+            VoterSetError::DuplicateVoter {
+                node_id,
+                directory_id,
+            } => {
+                write!(
+                    f,
+                    "duplicate voter: node_id={node_id}, directory_id={directory_id}"
+                )
             }
             VoterSetError::MissingEndpoints { node_id } => {
                 write!(f, "voter {node_id} has no endpoints")
@@ -543,7 +552,8 @@ mod tests {
             make_voter(3),
             make_voter(4),
             make_voter(5),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(vs5.quorum_size(), 3);
     }
 
@@ -560,7 +570,8 @@ mod tests {
                 directory_id: DirectoryId::new_random(),
                 endpoints: vec![Endpoint::new("host2", 6000)],
             },
-        ]).unwrap();
+        ])
+        .unwrap();
         assert!(vs.contains(NodeId(1)));
         assert!(vs.contains(NodeId(2)));
         assert!(!vs.contains(NodeId(3)));
@@ -623,28 +634,30 @@ mod tests {
 
     #[test]
     fn voter_set_rejects_nil_directory_id() {
-        let result = VoterSet::try_new(vec![
-            VoterRecord {
-                node_id: NodeId(1),
-                directory_id: DirectoryId::nil(),
-                endpoints: vec![Endpoint::new("host1", 6000)],
-            },
-        ]);
+        let result = VoterSet::try_new(vec![VoterRecord {
+            node_id: NodeId(1),
+            directory_id: DirectoryId::nil(),
+            endpoints: vec![Endpoint::new("host1", 6000)],
+        }]);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), VoterSetError::NilDirectoryId { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            VoterSetError::NilDirectoryId { .. }
+        ));
     }
 
     #[test]
     fn voter_set_rejects_missing_endpoints() {
-        let result = VoterSet::try_new(vec![
-            VoterRecord {
-                node_id: NodeId(1),
-                directory_id: DirectoryId::new_random(),
-                endpoints: vec![],
-            },
-        ]);
+        let result = VoterSet::try_new(vec![VoterRecord {
+            node_id: NodeId(1),
+            directory_id: DirectoryId::new_random(),
+            endpoints: vec![],
+        }]);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), VoterSetError::MissingEndpoints { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            VoterSetError::MissingEndpoints { .. }
+        ));
     }
 
     #[test]
@@ -653,7 +666,8 @@ mod tests {
             node_id: NodeId(1),
             directory_id: DirectoryId::new_random(),
             endpoints: vec![Endpoint::new("host1", 6000), Endpoint::new("host1", 6001)],
-        }]).unwrap();
+        }])
+        .unwrap();
         let json = serde_json::to_string(&vs).unwrap();
         let vs2: VoterSet = serde_json::from_str(&json).unwrap();
         assert_eq!(vs, vs2);
@@ -665,7 +679,10 @@ mod tests {
         let result: Result<VoterSet, _> = serde_json::from_str(json);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("at least one voter"), "expected validation error, got: {err}");
+        assert!(
+            err.contains("at least one voter"),
+            "expected validation error, got: {err}"
+        );
     }
 
     #[test]
@@ -674,7 +691,10 @@ mod tests {
         let result: Result<VoterSet, _> = serde_json::from_str(json);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("nil directory_id"), "expected validation error, got: {err}");
+        assert!(
+            err.contains("nil directory_id"),
+            "expected validation error, got: {err}"
+        );
     }
 
     #[test]
@@ -683,7 +703,10 @@ mod tests {
         let result: Result<VoterSet, _> = serde_json::from_str(json);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("no endpoints"), "expected validation error, got: {err}");
+        assert!(
+            err.contains("no endpoints"),
+            "expected validation error, got: {err}"
+        );
     }
 
     #[test]

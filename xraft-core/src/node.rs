@@ -109,7 +109,7 @@ mod tests {
 node_id = 1
 cluster_id = "test"
 listen_addr = "0.0.0.0:6000"
-peers = ["node2:6001", "node3:6002"]
+peers = ["node2:7000", "node3:7001"]
 "#,
         )
         .unwrap()

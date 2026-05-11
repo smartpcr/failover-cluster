@@ -49,7 +49,7 @@ use crc32fast::Hasher as Crc32Hasher;
 
 use xraft_core::error::{Result, XRaftError};
 use xraft_core::message::{Entry, EntryPayload};
-use xraft_core::storage::{LogStore, SnapshotMeta};
+use xraft_core::storage::LogStore;
 use xraft_core::types::{LogIndex, Term};
 
 // ---------------------------------------------------------------------------
@@ -105,6 +105,16 @@ impl MemoryLogStore {
 
 impl LogStore for MemoryLogStore {
     fn append(&mut self, entries: &[Entry]) -> Result<()> {
+        // Reject snapshot markers — they are in-memory only and stored via
+        // SnapshotStore, not the WAL.
+        for entry in entries {
+            if matches!(entry.payload, EntryPayload::Snapshot(_)) {
+                return Err(storage_err(
+                    "EntryPayload::Snapshot is an in-memory compaction marker \
+                     and must not be written to WAL",
+                ));
+            }
+        }
         self.entries.extend_from_slice(entries);
         Ok(())
     }
@@ -171,6 +181,7 @@ const ENTRY_HEADER_LEN: usize = 21;
 /// Metadata for a single WAL segment file.
 #[derive(Debug)]
 struct SegmentInfo {
+    #[expect(dead_code)]
     base_index: LogIndex,
     path: PathBuf,
 }
@@ -235,11 +246,7 @@ impl FileLogStore {
         let mut wal_files: Vec<_> = fs::read_dir(&self.dir)
             .map_err(io_to_storage)?
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map_or(false, |ext| ext == SEGMENT_EXT)
-            })
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == SEGMENT_EXT))
             .collect();
 
         wal_files.sort_by_key(|e| e.file_name());
@@ -273,12 +280,7 @@ impl FileLogStore {
     /// Replay all frames in a single segment file.  If `is_last` is true,
     /// a corrupt / truncated tail is silently trimmed; otherwise corruption
     /// is a hard error.
-    fn recover_segment(
-        &mut self,
-        path: &Path,
-        seg_idx: usize,
-        is_last: bool,
-    ) -> Result<()> {
+    fn recover_segment(&mut self, path: &Path, seg_idx: usize, is_last: bool) -> Result<()> {
         let buf = fs::read(path).map_err(io_to_storage)?;
         let mut cursor: usize = 0;
 
@@ -330,8 +332,7 @@ impl FileLogStore {
             return Err(storage_err("truncated frame: missing data_len"));
         }
 
-        let data_len =
-            u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+        let data_len = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
         let total = 4 + data_len + 4; // header + data + crc
 
         if remaining < total {
@@ -342,8 +343,7 @@ impl FileLogStore {
         let data_end = data_start + data_len;
         let data = &buf[data_start..data_end];
 
-        let stored_crc =
-            u32::from_le_bytes(buf[data_end..data_end + 4].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(buf[data_end..data_end + 4].try_into().unwrap());
         let computed_crc = crc32_of(data);
 
         if stored_crc != computed_crc {
@@ -358,18 +358,26 @@ impl FileLogStore {
     }
 
     /// Serialize entry fields into the data section of a frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `entry.payload` is `EntryPayload::Snapshot`. Snapshot entries
+    /// are in-memory compaction markers only and must **never** be persisted to
+    /// WAL segment files. The driver must intercept snapshot markers before
+    /// calling `LogStore::append`.
     fn serialize_entry(entry: &Entry) -> Vec<u8> {
         let (tag, payload_bytes) = match &entry.payload {
             EntryPayload::NoOp => (PAYLOAD_TAG_NOOP, Vec::new()),
             EntryPayload::Command(b) => (PAYLOAD_TAG_COMMAND, b.to_vec()),
-            EntryPayload::Snapshot(meta) => {
-                let encoded = bincode::serialize(meta)
-                    .expect("SnapshotMeta serialization should not fail");
-                (PAYLOAD_TAG_SNAPSHOT, encoded)
+            EntryPayload::Snapshot(_) => {
+                panic!(
+                    "BUG: EntryPayload::Snapshot is an in-memory compaction marker \
+                     and must never be written to WAL segment files"
+                );
             }
-            EntryPayload::ConfigChange(voter_set) => {
-                let encoded = bincode::serialize(voter_set)
-                    .expect("VoterSet serialization should not fail");
+            EntryPayload::ConfigChange(vs) => {
+                let encoded =
+                    bincode::serialize(vs).expect("VoterSet serialization should not fail");
                 (PAYLOAD_TAG_CONFIG_CHANGE, encoded)
             }
         };
@@ -392,13 +400,10 @@ impl FileLogStore {
             )));
         }
 
-        let index =
-            LogIndex(u64::from_le_bytes(data[0..8].try_into().unwrap()));
-        let term =
-            Term(u64::from_le_bytes(data[8..16].try_into().unwrap()));
+        let index = LogIndex(u64::from_le_bytes(data[0..8].try_into().unwrap()));
+        let term = Term(u64::from_le_bytes(data[8..16].try_into().unwrap()));
         let tag = data[16];
-        let payload_len =
-            u32::from_le_bytes(data[17..21].try_into().unwrap()) as usize;
+        let payload_len = u32::from_le_bytes(data[17..21].try_into().unwrap()) as usize;
 
         if data.len() < ENTRY_HEADER_LEN + payload_len {
             return Err(storage_err("entry payload truncated"));
@@ -408,27 +413,22 @@ impl FileLogStore {
 
         let payload = match tag {
             PAYLOAD_TAG_NOOP => EntryPayload::NoOp,
-            PAYLOAD_TAG_COMMAND => {
-                EntryPayload::Command(Bytes::copy_from_slice(payload_data))
-            }
+            PAYLOAD_TAG_COMMAND => EntryPayload::Command(Bytes::copy_from_slice(payload_data)),
             PAYLOAD_TAG_SNAPSHOT => {
-                let meta: SnapshotMeta = bincode::deserialize(payload_data)
-                    .map_err(|e| {
-                        storage_err(format!("SnapshotMeta decode failed: {e}"))
-                    })?;
-                EntryPayload::Snapshot(meta)
+                // Snapshot markers must never appear in WAL segments. If one is
+                // found in a legacy file, reject it as corrupt.
+                return Err(storage_err(
+                    "EntryPayload::Snapshot found in WAL segment; snapshot entries \
+                     are in-memory compaction markers and must not be persisted to WAL",
+                ));
             }
             PAYLOAD_TAG_CONFIG_CHANGE => {
-                let voter_set: xraft_core::types::VoterSet =
-                    bincode::deserialize(payload_data).map_err(|e| {
-                        storage_err(format!("VoterSet decode failed: {e}"))
-                    })?;
-                EntryPayload::ConfigChange(voter_set)
+                let vs: xraft_core::types::VoterSet = bincode::deserialize(payload_data)
+                    .map_err(|e| storage_err(format!("VoterSet decode failed: {e}")))?;
+                EntryPayload::ConfigChange(vs)
             }
             other => {
-                return Err(storage_err(format!(
-                    "unknown payload tag: {other}"
-                )));
+                return Err(storage_err(format!("unknown payload tag: {other}")));
             }
         };
 
@@ -461,15 +461,11 @@ impl FileLogStore {
 
         let file = OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(&path)
             .map_err(io_to_storage)?;
 
-        self.segments.push(SegmentInfo {
-            base_index,
-            path,
-        });
+        self.segments.push(SegmentInfo { base_index, path });
         self.active_writer = Some(file);
         self.active_segment_size = 0;
         Ok(())
@@ -483,8 +479,7 @@ impl FileLogStore {
                 .append(true)
                 .open(&last.path)
                 .map_err(io_to_storage)?;
-            self.active_segment_size =
-                file.metadata().map_err(io_to_storage)?.len();
+            self.active_segment_size = file.metadata().map_err(io_to_storage)?.len();
             self.active_writer = Some(file);
         } else {
             self.active_writer = None;
@@ -501,6 +496,15 @@ impl FileLogStore {
 impl LogStore for FileLogStore {
     fn append(&mut self, entries: &[Entry]) -> Result<()> {
         for entry in entries {
+            // Snapshot entries are in-memory compaction markers only and must
+            // never be persisted to WAL segment files. The driver intercepts
+            // snapshot markers and stores them via SnapshotStore instead.
+            if matches!(entry.payload, EntryPayload::Snapshot(_)) {
+                return Err(storage_err(
+                    "EntryPayload::Snapshot is an in-memory compaction marker \
+                     and must not be written to WAL segment files",
+                ));
+            }
             let frame = Self::encode_frame(entry);
 
             if self.should_rotate(frame.len()) {
@@ -558,11 +562,7 @@ impl LogStore for FileLogStore {
 
     fn truncate_from(&mut self, index: LogIndex) -> Result<()> {
         // Find the physical location of the first entry to remove.
-        let location = self
-            .offsets
-            .range(index..)
-            .next()
-            .map(|(_, &loc)| loc);
+        let location = self.offsets.range(index..).next().map(|(_, &loc)| loc);
 
         let (seg_idx, byte_offset) = match location {
             Some(loc) => loc,
@@ -588,15 +588,14 @@ impl LogStore for FileLogStore {
         }
 
         // If the truncated segment is now empty, remove it as well.
-        if byte_offset == 0 {
-            if let Some(seg) = self.segments.pop() {
-                let _ = fs::remove_file(&seg.path);
-            }
+        if byte_offset == 0
+            && let Some(seg) = self.segments.pop()
+        {
+            let _ = fs::remove_file(&seg.path);
         }
 
         // Purge in-memory caches.
-        let to_remove: Vec<LogIndex> =
-            self.entries.range(index..).map(|(k, _)| *k).collect();
+        let to_remove: Vec<LogIndex> = self.entries.range(index..).map(|(k, _)| *k).collect();
         for k in &to_remove {
             self.entries.remove(k);
             self.offsets.remove(k);
@@ -625,6 +624,7 @@ impl LogStore for FileLogStore {
 mod tests {
     use super::*;
     use xraft_core::message::{Entry, EntryPayload};
+    use xraft_core::storage::SnapshotMeta;
 
     fn make_entry(index: u64, term: u64) -> Entry {
         Entry {
@@ -709,9 +709,7 @@ mod tests {
 
     /// Create a fresh temp directory for a test, cleaning up any prior run.
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join("xraft-wal-tests")
-            .join(name);
+        let dir = std::env::temp_dir().join("xraft-wal-tests").join(name);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -746,8 +744,7 @@ mod tests {
         let dir = test_dir("file_append_command_payload");
         let mut log = FileLogStore::open(&dir).unwrap();
 
-        log.append(&[make_cmd_entry(1, 1, b"hello world")])
-            .unwrap();
+        log.append(&[make_cmd_entry(1, 1, b"hello world")]).unwrap();
         log.flush().unwrap();
 
         // Re-open and verify payload survived.
@@ -878,19 +875,14 @@ mod tests {
             let mut wal_files: Vec<_> = fs::read_dir(&dir)
                 .unwrap()
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .map_or(false, |x| x == SEGMENT_EXT)
-                })
+                .filter(|e| e.path().extension().is_some_and(|x| x == SEGMENT_EXT))
                 .collect();
             assert!(!wal_files.is_empty());
             wal_files.sort_by_key(|e| e.file_name());
             let path = wal_files.last().unwrap().path();
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
             // Write a partial frame header followed by junk.
-            f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02])
-                .unwrap();
+            f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]).unwrap();
             f.sync_all().unwrap();
         }
 
@@ -918,11 +910,7 @@ mod tests {
             let wal_path: PathBuf = fs::read_dir(&dir)
                 .unwrap()
                 .filter_map(|e| e.ok())
-                .find(|e| {
-                    e.path()
-                        .extension()
-                        .map_or(false, |x| x == SEGMENT_EXT)
-                })
+                .find(|e| e.path().extension().is_some_and(|x| x == SEGMENT_EXT))
                 .unwrap()
                 .path();
             let mut data = fs::read(&wal_path).unwrap();
@@ -943,8 +931,7 @@ mod tests {
     fn file_segment_rotation() {
         let dir = test_dir("file_segment_rotation");
         // Use a tiny segment cap so rotation triggers quickly.
-        let mut log =
-            FileLogStore::open_with_max_segment_size(&dir, 100).unwrap();
+        let mut log = FileLogStore::open_with_max_segment_size(&dir, 100).unwrap();
 
         // Each NoOp frame is ~29 bytes.  After ~4 entries the first
         // segment exceeds 100 bytes, triggering rotation.
@@ -975,8 +962,7 @@ mod tests {
     #[test]
     fn file_truncate_across_segments() {
         let dir = test_dir("file_truncate_across_segments");
-        let mut log =
-            FileLogStore::open_with_max_segment_size(&dir, 100).unwrap();
+        let mut log = FileLogStore::open_with_max_segment_size(&dir, 100).unwrap();
 
         for i in 1..=10 {
             log.append(&[make_entry(i, 1)]).unwrap();
@@ -996,35 +982,52 @@ mod tests {
     }
 
     #[test]
-    fn file_snapshot_entry_roundtrip() {
-        let dir = test_dir("file_snapshot_entry_roundtrip");
+    fn file_snapshot_entry_rejected_by_wal() {
+        let dir = test_dir("file_snapshot_entry_rejected_by_wal");
         let meta = SnapshotMeta {
             last_included_index: LogIndex(10),
             last_included_term: Term(3),
             id: "snap-1".to_string(),
             voter_set: None,
+            size_bytes: None,
+            checksum: None,
         };
         let entry = Entry {
             index: LogIndex(11),
             term: Term(3),
-            payload: EntryPayload::Snapshot(meta.clone()),
+            payload: EntryPayload::Snapshot(meta),
         };
 
-        {
-            let mut log = FileLogStore::open(&dir).unwrap();
-            log.append(&[entry]).unwrap();
-            log.flush().unwrap();
-        }
+        let mut log = FileLogStore::open(&dir).unwrap();
+        // Snapshot entries are in-memory compaction markers and must NOT be
+        // persisted to WAL segment files. append() must return an error.
+        let result = log.append(&[entry]);
+        assert!(result.is_err(), "Snapshot entries must be rejected by WAL");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("compaction marker"),
+            "error message should mention compaction marker, got: {err_msg}"
+        );
+    }
 
-        let log = FileLogStore::open(&dir).unwrap();
-        let recovered = log.get(LogIndex(11)).unwrap().unwrap();
-        match recovered.payload {
-            EntryPayload::Snapshot(ref m) => {
-                assert_eq!(m.id, "snap-1");
-                assert_eq!(m.last_included_index, LogIndex(10));
-                assert_eq!(m.last_included_term, Term(3));
-            }
-            _ => panic!("expected Snapshot payload"),
-        }
+    #[test]
+    fn memory_snapshot_entry_rejected_by_wal() {
+        let meta = SnapshotMeta {
+            last_included_index: LogIndex(10),
+            last_included_term: Term(3),
+            id: "snap-1".to_string(),
+            voter_set: None,
+            size_bytes: None,
+            checksum: None,
+        };
+        let entry = Entry {
+            index: LogIndex(11),
+            term: Term(3),
+            payload: EntryPayload::Snapshot(meta),
+        };
+
+        let mut log = MemoryLogStore::new();
+        let result = log.append(&[entry]);
+        assert!(result.is_err(), "Snapshot entries must be rejected by MemoryLogStore");
     }
 }
