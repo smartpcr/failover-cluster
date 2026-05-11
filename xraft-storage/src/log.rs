@@ -1,14 +1,97 @@
-//! In-memory log store for testing and prototyping.
-//!
-//! Implements `xraft_core::storage::LogStore` backed by a `Vec<Entry>`.
-//! Not suitable for production — entries are lost on restart.
+// -----------------------------------------------------------------------
+// <copyright file="log.rs" company="Microsoft Corp.">
+//     Copyright (c) Microsoft Corp. All rights reserved.
+// </copyright>
+// -----------------------------------------------------------------------
 
-use xraft_core::error::Result;
-use xraft_core::message::Entry;
-use xraft_core::storage::LogStore;
+//! Write-ahead log implementations for the Raft [`LogStore`] trait.
+//!
+//! Two implementations are provided:
+//!
+//! * [`MemoryLogStore`] — volatile, in-memory store for testing.
+//! * [`FileLogStore`] — durable, file-backed WAL with CRC-32 integrity
+//!   checks, configurable segment rotation, and automatic crash recovery.
+//!
+//! # Binary frame format (on disk)
+//!
+//! ```text
+//! ┌──────────┬───────┬──────┬─────┬─────────────┬──────────────┬───────┐
+//! │ data_len │ index │ term │ tag │ payload_len │ payload_data │ crc32 │
+//! │  u32 LE  │ u64LE │u64LE │ u8  │   u32 LE    │  [u8; N]     │u32 LE │
+//! └──────────┴───────┴──────┴─────┴─────────────┴──────────────┴───────┘
+//!   4 bytes    8       8      1      4              N             4
+//! ```
+//!
+//! * `data_len` = 21 + N  (covers index through payload_data)
+//! * `crc32` is computed over the data section (index..payload_data)
+//! * Total frame = `data_len + 8` bytes
+//!
+//! # Segment files
+//!
+//! Segments are named `{base_index:020}.wal` and rotate when the active
+//! segment exceeds [`DEFAULT_MAX_SEGMENT_SIZE`] (64 MiB by default).
+//!
+//! # Dependencies required in `xraft-storage/Cargo.toml`
+//!
+//! ```toml
+//! crc32fast = "1"
+//! bincode = "1"
+//! bytes = { workspace = true }
+//! ```
+
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use bytes::Bytes;
+use crc32fast::Hasher as Crc32Hasher;
+
+use xraft_core::error::{Result, XRaftError};
+use xraft_core::message::{Entry, EntryPayload};
+use xraft_core::storage::{LogStore, SnapshotMeta};
 use xraft_core::types::{LogIndex, Term};
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn storage_err(msg: impl Into<String>) -> XRaftError {
+    XRaftError::Storage(msg.into())
+}
+
+fn io_to_storage(e: io::Error) -> XRaftError {
+    storage_err(e.to_string())
+}
+
+fn crc32_of(data: &[u8]) -> u32 {
+    let mut h = Crc32Hasher::new();
+    h.update(data);
+    h.finalize()
+}
+
+fn segment_filename(base_index: LogIndex) -> String {
+    format!("{:020}.wal", base_index.0)
+}
+
+fn parse_segment_filename(path: &Path) -> Result<LogIndex> {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| storage_err("invalid segment filename"))?;
+    let idx: u64 = stem
+        .parse()
+        .map_err(|_| storage_err(format!("non-numeric segment stem: {stem}")))?;
+    Ok(LogIndex(idx))
+}
+
+// ---------------------------------------------------------------------------
+// MemoryLogStore
+// ---------------------------------------------------------------------------
+
 /// In-memory log store backed by a simple `Vec`.
+///
+/// **Not suitable for production** — entries are lost on restart.
 #[derive(Debug, Default)]
 pub struct MemoryLogStore {
     entries: Vec<Entry>,
@@ -56,13 +139,474 @@ impl LogStore for MemoryLogStore {
     }
 
     fn term_at(&self, index: LogIndex) -> Result<Option<Term>> {
-        Ok(self.entries.iter().find(|e| e.index == index).map(|e| e.term))
+        Ok(self
+            .entries
+            .iter()
+            .find(|e| e.index == index)
+            .map(|e| e.term))
     }
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// FileLogStore — constants and internal types
+// ---------------------------------------------------------------------------
+
+const PAYLOAD_TAG_NOOP: u8 = 0;
+const PAYLOAD_TAG_COMMAND: u8 = 1;
+const PAYLOAD_TAG_SNAPSHOT: u8 = 2;
+
+/// Default maximum segment size before rotation (64 MiB).
+pub const DEFAULT_MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
+
+const SEGMENT_EXT: &str = "wal";
+
+/// Fixed byte overhead per entry: index(8) + term(8) + tag(1) + payload_len(4).
+const ENTRY_HEADER_LEN: usize = 21;
+
+/// Metadata for a single WAL segment file.
+#[derive(Debug)]
+struct SegmentInfo {
+    base_index: LogIndex,
+    path: PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// FileLogStore
+// ---------------------------------------------------------------------------
+
+/// Durable, file-backed write-ahead log with CRC-32 integrity, segment
+/// rotation, and crash recovery.
+///
+/// All appended entries are kept in an in-memory [`BTreeMap`] for fast
+/// reads; the on-disk segments are the durable source of truth and are
+/// replayed on [`open`](FileLogStore::open).
+pub struct FileLogStore {
+    dir: PathBuf,
+    segments: Vec<SegmentInfo>,
+    active_writer: Option<File>,
+    active_segment_size: u64,
+    /// In-memory cache of every entry in the log.
+    entries: BTreeMap<LogIndex, Entry>,
+    /// Maps each entry to its physical location: `(segment_vec_index, byte_offset)`.
+    offsets: BTreeMap<LogIndex, (usize, u64)>,
+    max_segment_size: u64,
+}
+
+// Manual impls not required — all fields are `Send + Sync`.
+
+impl FileLogStore {
+    /// Open (or create) a WAL in `dir` with the default 64 MiB segment cap.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_max_segment_size(dir, DEFAULT_MAX_SEGMENT_SIZE)
+    }
+
+    /// Open (or create) a WAL in `dir` with a custom segment-size cap.
+    pub fn open_with_max_segment_size(
+        dir: impl AsRef<Path>,
+        max_segment_size: u64,
+    ) -> Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        fs::create_dir_all(&dir).map_err(io_to_storage)?;
+
+        let mut store = Self {
+            dir,
+            segments: Vec::new(),
+            active_writer: None,
+            active_segment_size: 0,
+            entries: BTreeMap::new(),
+            offsets: BTreeMap::new(),
+            max_segment_size,
+        };
+
+        store.recover()?;
+        Ok(store)
+    }
+
+    // -- recovery ----------------------------------------------------------
+
+    /// Scan existing segment files, replay valid frames, and truncate any
+    /// corrupt tail on the last segment.
+    fn recover(&mut self) -> Result<()> {
+        let mut wal_files: Vec<_> = fs::read_dir(&self.dir)
+            .map_err(io_to_storage)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map_or(false, |ext| ext == SEGMENT_EXT)
+            })
+            .collect();
+
+        wal_files.sort_by_key(|e| e.file_name());
+
+        let count = wal_files.len();
+        for (i, dir_entry) in wal_files.into_iter().enumerate() {
+            let path = dir_entry.path();
+            let base_index = parse_segment_filename(&path)?;
+            let seg_idx = self.segments.len();
+            self.segments.push(SegmentInfo {
+                base_index,
+                path: path.clone(),
+            });
+            let is_last = i == count - 1;
+            self.recover_segment(&path, seg_idx, is_last)?;
+        }
+
+        // Open active writer on the last segment.
+        if let Some(last) = self.segments.last() {
+            let file = OpenOptions::new()
+                .append(true)
+                .open(&last.path)
+                .map_err(io_to_storage)?;
+            self.active_segment_size = file.metadata().map_err(io_to_storage)?.len();
+            self.active_writer = Some(file);
+        }
+
+        Ok(())
+    }
+
+    /// Replay all frames in a single segment file.  If `is_last` is true,
+    /// a corrupt / truncated tail is silently trimmed; otherwise corruption
+    /// is a hard error.
+    fn recover_segment(
+        &mut self,
+        path: &Path,
+        seg_idx: usize,
+        is_last: bool,
+    ) -> Result<()> {
+        let buf = fs::read(path).map_err(io_to_storage)?;
+        let mut cursor: usize = 0;
+
+        while cursor < buf.len() {
+            let frame_start = cursor;
+            match Self::decode_frame(&buf, cursor) {
+                Ok((entry, next)) => {
+                    self.offsets
+                        .insert(entry.index, (seg_idx, frame_start as u64));
+                    self.entries.insert(entry.index, entry);
+                    cursor = next;
+                }
+                Err(_) if is_last => {
+                    // Truncate the corrupt tail.
+                    let f = OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .map_err(io_to_storage)?;
+                    f.set_len(frame_start as u64).map_err(io_to_storage)?;
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(())
+    }
+
+    // -- frame codec -------------------------------------------------------
+
+    /// Encode an [`Entry`] into a self-describing, CRC-protected frame.
+    fn encode_frame(entry: &Entry) -> Vec<u8> {
+        let data = Self::serialize_entry(entry);
+        let crc = crc32_of(&data);
+
+        let mut frame = Vec::with_capacity(4 + data.len() + 4);
+        frame.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&data);
+        frame.extend_from_slice(&crc.to_le_bytes());
+        frame
+    }
+
+    /// Decode one frame starting at `offset` in `buf`.
+    /// Returns `(entry, next_offset)` on success.
+    fn decode_frame(buf: &[u8], offset: usize) -> Result<(Entry, usize)> {
+        let remaining = buf.len().saturating_sub(offset);
+
+        if remaining < 4 {
+            return Err(storage_err("truncated frame: missing data_len"));
+        }
+
+        let data_len =
+            u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+        let total = 4 + data_len + 4; // header + data + crc
+
+        if remaining < total {
+            return Err(storage_err("truncated frame: incomplete body"));
+        }
+
+        let data_start = offset + 4;
+        let data_end = data_start + data_len;
+        let data = &buf[data_start..data_end];
+
+        let stored_crc =
+            u32::from_le_bytes(buf[data_end..data_end + 4].try_into().unwrap());
+        let computed_crc = crc32_of(data);
+
+        if stored_crc != computed_crc {
+            return Err(storage_err(format!(
+                "CRC mismatch at byte {offset}: stored={stored_crc:#010x} \
+                 computed={computed_crc:#010x}"
+            )));
+        }
+
+        let entry = Self::deserialize_entry(data)?;
+        Ok((entry, offset + total))
+    }
+
+    /// Serialize entry fields into the data section of a frame.
+    fn serialize_entry(entry: &Entry) -> Vec<u8> {
+        let (tag, payload_bytes) = match &entry.payload {
+            EntryPayload::NoOp => (PAYLOAD_TAG_NOOP, Vec::new()),
+            EntryPayload::Command(b) => (PAYLOAD_TAG_COMMAND, b.to_vec()),
+            EntryPayload::Snapshot(meta) => {
+                let encoded = bincode::serialize(meta)
+                    .expect("SnapshotMeta serialization should not fail");
+                (PAYLOAD_TAG_SNAPSHOT, encoded)
+            }
+        };
+
+        let mut buf = Vec::with_capacity(ENTRY_HEADER_LEN + payload_bytes.len());
+        buf.extend_from_slice(&entry.index.0.to_le_bytes());
+        buf.extend_from_slice(&entry.term.0.to_le_bytes());
+        buf.push(tag);
+        buf.extend_from_slice(&(payload_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&payload_bytes);
+        buf
+    }
+
+    /// Deserialize entry fields from the data section of a frame.
+    fn deserialize_entry(data: &[u8]) -> Result<Entry> {
+        if data.len() < ENTRY_HEADER_LEN {
+            return Err(storage_err(format!(
+                "entry data too short: {} < {ENTRY_HEADER_LEN}",
+                data.len()
+            )));
+        }
+
+        let index =
+            LogIndex(u64::from_le_bytes(data[0..8].try_into().unwrap()));
+        let term =
+            Term(u64::from_le_bytes(data[8..16].try_into().unwrap()));
+        let tag = data[16];
+        let payload_len =
+            u32::from_le_bytes(data[17..21].try_into().unwrap()) as usize;
+
+        if data.len() < ENTRY_HEADER_LEN + payload_len {
+            return Err(storage_err("entry payload truncated"));
+        }
+
+        let payload_data = &data[ENTRY_HEADER_LEN..ENTRY_HEADER_LEN + payload_len];
+
+        let payload = match tag {
+            PAYLOAD_TAG_NOOP => EntryPayload::NoOp,
+            PAYLOAD_TAG_COMMAND => {
+                EntryPayload::Command(Bytes::copy_from_slice(payload_data))
+            }
+            PAYLOAD_TAG_SNAPSHOT => {
+                let meta: SnapshotMeta = bincode::deserialize(payload_data)
+                    .map_err(|e| {
+                        storage_err(format!("SnapshotMeta decode failed: {e}"))
+                    })?;
+                EntryPayload::Snapshot(meta)
+            }
+            other => {
+                return Err(storage_err(format!(
+                    "unknown payload tag: {other}"
+                )));
+            }
+        };
+
+        Ok(Entry {
+            index,
+            term,
+            payload,
+        })
+    }
+
+    // -- segment management ------------------------------------------------
+
+    fn should_rotate(&self, additional: usize) -> bool {
+        self.active_writer.is_some()
+            && self.active_segment_size + additional as u64 > self.max_segment_size
+    }
+
+    fn rotate_segment(&mut self, next_base: LogIndex) -> Result<()> {
+        if let Some(ref w) = self.active_writer {
+            w.sync_all().map_err(io_to_storage)?;
+        }
+        self.active_writer = None;
+        self.active_segment_size = 0;
+        self.create_segment(next_base)
+    }
+
+    fn create_segment(&mut self, base_index: LogIndex) -> Result<()> {
+        let name = segment_filename(base_index);
+        let path = self.dir.join(&name);
+
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(&path)
+            .map_err(io_to_storage)?;
+
+        self.segments.push(SegmentInfo {
+            base_index,
+            path,
+        });
+        self.active_writer = Some(file);
+        self.active_segment_size = 0;
+        Ok(())
+    }
+
+    /// Re-open the active writer on the last segment, or clear it if no
+    /// segments remain.
+    fn reopen_active_writer(&mut self) -> Result<()> {
+        if let Some(last) = self.segments.last() {
+            let file = OpenOptions::new()
+                .append(true)
+                .open(&last.path)
+                .map_err(io_to_storage)?;
+            self.active_segment_size =
+                file.metadata().map_err(io_to_storage)?.len();
+            self.active_writer = Some(file);
+        } else {
+            self.active_writer = None;
+            self.active_segment_size = 0;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LogStore implementation
+// ---------------------------------------------------------------------------
+
+impl LogStore for FileLogStore {
+    fn append(&mut self, entries: &[Entry]) -> Result<()> {
+        for entry in entries {
+            let frame = Self::encode_frame(entry);
+
+            if self.should_rotate(frame.len()) {
+                self.rotate_segment(entry.index)?;
+            }
+            if self.active_writer.is_none() {
+                self.create_segment(entry.index)?;
+            }
+
+            let offset = self.active_segment_size;
+            let seg_idx = self.segments.len() - 1;
+
+            self.active_writer
+                .as_mut()
+                .unwrap()
+                .write_all(&frame)
+                .map_err(io_to_storage)?;
+
+            self.active_segment_size += frame.len() as u64;
+            self.entries.insert(entry.index, entry.clone());
+            self.offsets.insert(entry.index, (seg_idx, offset));
+        }
+        Ok(())
+    }
+
+    fn get(&self, index: LogIndex) -> Result<Option<Entry>> {
+        if index.0 == 0 {
+            return Ok(None);
+        }
+        Ok(self.entries.get(&index).cloned())
+    }
+
+    fn get_range(&self, start: LogIndex, end: LogIndex) -> Result<Vec<Entry>> {
+        Ok(self
+            .entries
+            .range(start..end)
+            .map(|(_, e)| e.clone())
+            .collect())
+    }
+
+    fn last_index(&self) -> LogIndex {
+        self.entries
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(LogIndex(0))
+    }
+
+    fn last_term(&self) -> Term {
+        self.entries
+            .values()
+            .next_back()
+            .map_or(Term(0), |e| e.term)
+    }
+
+    fn truncate_from(&mut self, index: LogIndex) -> Result<()> {
+        // Find the physical location of the first entry to remove.
+        let location = self
+            .offsets
+            .range(index..)
+            .next()
+            .map(|(_, &loc)| loc);
+
+        let (seg_idx, byte_offset) = match location {
+            Some(loc) => loc,
+            None => return Ok(()), // nothing to truncate
+        };
+
+        // Close the active writer before mutating files.
+        self.active_writer = None;
+
+        // Truncate the segment containing the first removed entry.
+        {
+            let seg_path = &self.segments[seg_idx].path;
+            let f = OpenOptions::new()
+                .write(true)
+                .open(seg_path)
+                .map_err(io_to_storage)?;
+            f.set_len(byte_offset).map_err(io_to_storage)?;
+        }
+
+        // Delete all subsequent segment files.
+        for seg in self.segments.drain(seg_idx + 1..) {
+            let _ = fs::remove_file(&seg.path);
+        }
+
+        // If the truncated segment is now empty, remove it as well.
+        if byte_offset == 0 {
+            if let Some(seg) = self.segments.pop() {
+                let _ = fs::remove_file(&seg.path);
+            }
+        }
+
+        // Purge in-memory caches.
+        let to_remove: Vec<LogIndex> =
+            self.entries.range(index..).map(|(k, _)| *k).collect();
+        for k in &to_remove {
+            self.entries.remove(k);
+            self.offsets.remove(k);
+        }
+
+        self.reopen_active_writer()
+    }
+
+    fn term_at(&self, index: LogIndex) -> Result<Option<Term>> {
+        Ok(self.entries.get(&index).map(|e| e.term))
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if let Some(ref w) = self.active_writer {
+            w.sync_all().map_err(io_to_storage)?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -76,6 +620,16 @@ mod tests {
             payload: EntryPayload::NoOp,
         }
     }
+
+    fn make_cmd_entry(index: u64, term: u64, data: &[u8]) -> Entry {
+        Entry {
+            index: LogIndex(index),
+            term: Term(term),
+            payload: EntryPayload::Command(Bytes::copy_from_slice(data)),
+        }
+    }
+
+    // -- MemoryLogStore tests (preserved) ----------------------------------
 
     #[test]
     fn empty_log_defaults() {
@@ -136,5 +690,328 @@ mod tests {
     fn flush_is_noop() {
         let mut log = MemoryLogStore::new();
         assert!(log.flush().is_ok());
+    }
+
+    // -- FileLogStore tests ------------------------------------------------
+
+    /// Create a fresh temp directory for a test, cleaning up any prior run.
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("xraft-wal-tests")
+            .join(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn file_empty_log_defaults() {
+        let dir = test_dir("file_empty_log_defaults");
+        let log = FileLogStore::open(&dir).unwrap();
+        assert_eq!(log.last_index(), LogIndex(0));
+        assert_eq!(log.last_term(), Term(0));
+        assert!(log.get(LogIndex(1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn file_append_and_get() {
+        let dir = test_dir("file_append_and_get");
+        let mut log = FileLogStore::open(&dir).unwrap();
+
+        log.append(&[make_entry(1, 1), make_entry(2, 1)]).unwrap();
+
+        assert_eq!(log.last_index(), LogIndex(2));
+        assert_eq!(log.last_term(), Term(1));
+
+        let e = log.get(LogIndex(1)).unwrap().unwrap();
+        assert_eq!(e.index, LogIndex(1));
+        assert_eq!(e.term, Term(1));
+    }
+
+    #[test]
+    fn file_append_command_payload() {
+        let dir = test_dir("file_append_command_payload");
+        let mut log = FileLogStore::open(&dir).unwrap();
+
+        log.append(&[make_cmd_entry(1, 1, b"hello world")])
+            .unwrap();
+        log.flush().unwrap();
+
+        // Re-open and verify payload survived.
+        drop(log);
+        let log = FileLogStore::open(&dir).unwrap();
+        let e = log.get(LogIndex(1)).unwrap().unwrap();
+        match e.payload {
+            EntryPayload::Command(ref b) => assert_eq!(&b[..], b"hello world"),
+            _ => panic!("expected Command payload"),
+        }
+    }
+
+    #[test]
+    fn file_get_range() {
+        let dir = test_dir("file_get_range");
+        let mut log = FileLogStore::open(&dir).unwrap();
+
+        log.append(&[make_entry(1, 1), make_entry(2, 1), make_entry(3, 2)])
+            .unwrap();
+
+        let range = log.get_range(LogIndex(1), LogIndex(3)).unwrap();
+        assert_eq!(range.len(), 2);
+        assert_eq!(range[0].index, LogIndex(1));
+        assert_eq!(range[1].index, LogIndex(2));
+    }
+
+    #[test]
+    fn file_truncate_from_middle() {
+        let dir = test_dir("file_truncate_from_middle");
+        let mut log = FileLogStore::open(&dir).unwrap();
+
+        log.append(&[make_entry(1, 1), make_entry(2, 1), make_entry(3, 2)])
+            .unwrap();
+
+        log.truncate_from(LogIndex(2)).unwrap();
+
+        assert_eq!(log.last_index(), LogIndex(1));
+        assert!(log.get(LogIndex(2)).unwrap().is_none());
+
+        // Can still append after truncation.
+        log.append(&[make_entry(2, 3)]).unwrap();
+        assert_eq!(log.last_index(), LogIndex(2));
+        assert_eq!(log.last_term(), Term(3));
+    }
+
+    #[test]
+    fn file_truncate_all() {
+        let dir = test_dir("file_truncate_all");
+        let mut log = FileLogStore::open(&dir).unwrap();
+
+        log.append(&[make_entry(1, 1), make_entry(2, 1)]).unwrap();
+        log.truncate_from(LogIndex(1)).unwrap();
+
+        assert_eq!(log.last_index(), LogIndex(0));
+        assert_eq!(log.last_term(), Term(0));
+    }
+
+    #[test]
+    fn file_truncate_beyond_last_is_noop() {
+        let dir = test_dir("file_truncate_beyond");
+        let mut log = FileLogStore::open(&dir).unwrap();
+
+        log.append(&[make_entry(1, 1)]).unwrap();
+        log.truncate_from(LogIndex(99)).unwrap();
+
+        assert_eq!(log.last_index(), LogIndex(1));
+    }
+
+    #[test]
+    fn file_term_at() {
+        let dir = test_dir("file_term_at");
+        let mut log = FileLogStore::open(&dir).unwrap();
+
+        log.append(&[make_entry(1, 5)]).unwrap();
+        assert_eq!(log.term_at(LogIndex(1)).unwrap(), Some(Term(5)));
+        assert_eq!(log.term_at(LogIndex(2)).unwrap(), None);
+    }
+
+    #[test]
+    fn file_get_index_zero() {
+        let dir = test_dir("file_get_index_zero");
+        let log = FileLogStore::open(&dir).unwrap();
+        assert!(log.get(LogIndex(0)).unwrap().is_none());
+    }
+
+    #[test]
+    fn file_crash_recovery() {
+        let dir = test_dir("file_crash_recovery");
+
+        // Phase 1: write entries and flush.
+        {
+            let mut log = FileLogStore::open(&dir).unwrap();
+            log.append(&[
+                make_entry(1, 1),
+                make_cmd_entry(2, 1, b"data"),
+                make_entry(3, 2),
+            ])
+            .unwrap();
+            log.flush().unwrap();
+        }
+
+        // Phase 2: reopen — entries must survive.
+        {
+            let log = FileLogStore::open(&dir).unwrap();
+            assert_eq!(log.last_index(), LogIndex(3));
+            assert_eq!(log.last_term(), Term(2));
+            let e = log.get(LogIndex(2)).unwrap().unwrap();
+            match e.payload {
+                EntryPayload::Command(ref b) => assert_eq!(&b[..], b"data"),
+                _ => panic!("expected Command"),
+            }
+        }
+    }
+
+    #[test]
+    fn file_corrupt_tail_recovery() {
+        let dir = test_dir("file_corrupt_tail_recovery");
+
+        // Write valid entries.
+        {
+            let mut log = FileLogStore::open(&dir).unwrap();
+            log.append(&[make_entry(1, 1), make_entry(2, 1)]).unwrap();
+            log.flush().unwrap();
+        }
+
+        // Corrupt the tail of the segment file by appending garbage.
+        {
+            let mut wal_files: Vec<_> = fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map_or(false, |x| x == SEGMENT_EXT)
+                })
+                .collect();
+            assert!(!wal_files.is_empty());
+            wal_files.sort_by_key(|e| e.file_name());
+            let path = wal_files.last().unwrap().path();
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            // Write a partial frame header followed by junk.
+            f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02])
+                .unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Reopen — should recover first two entries, discarding the
+        // corrupt tail.
+        {
+            let log = FileLogStore::open(&dir).unwrap();
+            assert_eq!(log.last_index(), LogIndex(2));
+            assert_eq!(log.last_term(), Term(1));
+        }
+    }
+
+    #[test]
+    fn file_crc_integrity() {
+        let dir = test_dir("file_crc_integrity");
+
+        {
+            let mut log = FileLogStore::open(&dir).unwrap();
+            log.append(&[make_entry(1, 1)]).unwrap();
+            log.flush().unwrap();
+        }
+
+        // Flip a byte inside the data section of the first frame.
+        {
+            let wal_path: PathBuf = fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .find(|e| {
+                    e.path()
+                        .extension()
+                        .map_or(false, |x| x == SEGMENT_EXT)
+                })
+                .unwrap()
+                .path();
+            let mut data = fs::read(&wal_path).unwrap();
+            // Byte 4 is the first byte of the index field; flip it.
+            data[4] ^= 0xFF;
+            fs::write(&wal_path, &data).unwrap();
+        }
+
+        // Recovery should detect the CRC mismatch and truncate the
+        // corrupt frame (which is the only frame, so the log is empty).
+        {
+            let log = FileLogStore::open(&dir).unwrap();
+            assert_eq!(log.last_index(), LogIndex(0));
+        }
+    }
+
+    #[test]
+    fn file_segment_rotation() {
+        let dir = test_dir("file_segment_rotation");
+        // Use a tiny segment cap so rotation triggers quickly.
+        let mut log =
+            FileLogStore::open_with_max_segment_size(&dir, 100).unwrap();
+
+        // Each NoOp frame is ~29 bytes.  After ~4 entries the first
+        // segment exceeds 100 bytes, triggering rotation.
+        for i in 1..=10 {
+            log.append(&[make_entry(i, 1)]).unwrap();
+        }
+
+        assert!(log.segments.len() >= 2, "expected segment rotation");
+        assert_eq!(log.last_index(), LogIndex(10));
+
+        // Verify all entries are readable.
+        for i in 1..=10 {
+            assert!(log.get(LogIndex(i)).unwrap().is_some());
+        }
+
+        // Flush, close, reopen — entries survive across segments.
+        log.flush().unwrap();
+        drop(log);
+
+        let log = FileLogStore::open_with_max_segment_size(&dir, 100).unwrap();
+        assert_eq!(log.last_index(), LogIndex(10));
+        for i in 1..=10 {
+            let e = log.get(LogIndex(i)).unwrap().unwrap();
+            assert_eq!(e.index, LogIndex(i));
+        }
+    }
+
+    #[test]
+    fn file_truncate_across_segments() {
+        let dir = test_dir("file_truncate_across_segments");
+        let mut log =
+            FileLogStore::open_with_max_segment_size(&dir, 100).unwrap();
+
+        for i in 1..=10 {
+            log.append(&[make_entry(i, 1)]).unwrap();
+        }
+        let seg_count_before = log.segments.len();
+        assert!(seg_count_before >= 2);
+
+        // Truncate from index 3 — should remove segments that held 3..10.
+        log.truncate_from(LogIndex(3)).unwrap();
+        assert_eq!(log.last_index(), LogIndex(2));
+        assert!(log.segments.len() < seg_count_before);
+
+        // Append new entries after truncation.
+        log.append(&[make_entry(3, 5), make_entry(4, 5)]).unwrap();
+        assert_eq!(log.last_index(), LogIndex(4));
+        assert_eq!(log.last_term(), Term(5));
+    }
+
+    #[test]
+    fn file_snapshot_entry_roundtrip() {
+        let dir = test_dir("file_snapshot_entry_roundtrip");
+        let meta = SnapshotMeta {
+            last_included_index: LogIndex(10),
+            last_included_term: Term(3),
+            id: "snap-1".to_string(),
+            voter_set: None,
+        };
+        let entry = Entry {
+            index: LogIndex(11),
+            term: Term(3),
+            payload: EntryPayload::Snapshot(meta.clone()),
+        };
+
+        {
+            let mut log = FileLogStore::open(&dir).unwrap();
+            log.append(&[entry]).unwrap();
+            log.flush().unwrap();
+        }
+
+        let log = FileLogStore::open(&dir).unwrap();
+        let recovered = log.get(LogIndex(11)).unwrap().unwrap();
+        match recovered.payload {
+            EntryPayload::Snapshot(ref m) => {
+                assert_eq!(m.id, "snap-1");
+                assert_eq!(m.last_included_index, LogIndex(10));
+                assert_eq!(m.last_included_term, Term(3));
+            }
+            _ => panic!("expected Snapshot payload"),
+        }
     }
 }
