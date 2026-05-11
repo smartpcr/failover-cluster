@@ -137,3 +137,15 @@ message FetchSnapshotChunk {
   bool   done                  = 5;
   optional SnapshotMetadata metadata = 6;
 }
+
+// ---------------------------------------------------------------------------
+// Raft gRPC service
+// ---------------------------------------------------------------------------
+
+service RaftService {
+  rpc Vote(VoteRequest)                       returns (VoteResponse);
+  rpc PreVote(PreVoteRequest)                 returns (PreVoteResponse);
+  rpc Fetch(FetchRequest)                     returns (FetchResponse);
+  // Server-streaming: leader streams snapshot chunks to the requesting follower.
+  rpc FetchSnapshot(FetchSnapshotRequest)     returns (stream FetchSnapshotChunk);
+}

@@ -49,7 +49,7 @@ use crc32fast::Hasher as Crc32Hasher;
 
 use xraft_core::error::{Result, XRaftError};
 use xraft_core::message::{Entry, EntryPayload};
-use xraft_core::storage::{LogStore, SnapshotMeta};
+use xraft_core::storage::LogStore;
 use xraft_core::types::{LogIndex, Term};
 
 // ---------------------------------------------------------------------------
@@ -105,6 +105,16 @@ impl MemoryLogStore {
 
 impl LogStore for MemoryLogStore {
     fn append(&mut self, entries: &[Entry]) -> Result<()> {
+        // Reject snapshot markers — they are in-memory only and stored via
+        // SnapshotStore, not the WAL.
+        for entry in entries {
+            if matches!(entry.payload, EntryPayload::Snapshot(_)) {
+                return Err(storage_err(
+                    "EntryPayload::Snapshot is an in-memory compaction marker \
+                     and must not be written to WAL",
+                ));
+            }
+        }
         self.entries.extend_from_slice(entries);
         Ok(())
     }
@@ -348,14 +358,22 @@ impl FileLogStore {
     }
 
     /// Serialize entry fields into the data section of a frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `entry.payload` is `EntryPayload::Snapshot`. Snapshot entries
+    /// are in-memory compaction markers only and must **never** be persisted to
+    /// WAL segment files. The driver must intercept snapshot markers before
+    /// calling `LogStore::append`.
     fn serialize_entry(entry: &Entry) -> Vec<u8> {
         let (tag, payload_bytes) = match &entry.payload {
             EntryPayload::NoOp => (PAYLOAD_TAG_NOOP, Vec::new()),
             EntryPayload::Command(b) => (PAYLOAD_TAG_COMMAND, b.to_vec()),
-            EntryPayload::Snapshot(meta) => {
-                let encoded =
-                    bincode::serialize(meta).expect("SnapshotMeta serialization should not fail");
-                (PAYLOAD_TAG_SNAPSHOT, encoded)
+            EntryPayload::Snapshot(_) => {
+                panic!(
+                    "BUG: EntryPayload::Snapshot is an in-memory compaction marker \
+                     and must never be written to WAL segment files"
+                );
             }
             EntryPayload::ConfigChange(vs) => {
                 let encoded =
@@ -397,9 +415,12 @@ impl FileLogStore {
             PAYLOAD_TAG_NOOP => EntryPayload::NoOp,
             PAYLOAD_TAG_COMMAND => EntryPayload::Command(Bytes::copy_from_slice(payload_data)),
             PAYLOAD_TAG_SNAPSHOT => {
-                let meta: SnapshotMeta = bincode::deserialize(payload_data)
-                    .map_err(|e| storage_err(format!("SnapshotMeta decode failed: {e}")))?;
-                EntryPayload::Snapshot(meta)
+                // Snapshot markers must never appear in WAL segments. If one is
+                // found in a legacy file, reject it as corrupt.
+                return Err(storage_err(
+                    "EntryPayload::Snapshot found in WAL segment; snapshot entries \
+                     are in-memory compaction markers and must not be persisted to WAL",
+                ));
             }
             PAYLOAD_TAG_CONFIG_CHANGE => {
                 let vs: xraft_core::types::VoterSet = bincode::deserialize(payload_data)
@@ -475,6 +496,15 @@ impl FileLogStore {
 impl LogStore for FileLogStore {
     fn append(&mut self, entries: &[Entry]) -> Result<()> {
         for entry in entries {
+            // Snapshot entries are in-memory compaction markers only and must
+            // never be persisted to WAL segment files. The driver intercepts
+            // snapshot markers and stores them via SnapshotStore instead.
+            if matches!(entry.payload, EntryPayload::Snapshot(_)) {
+                return Err(storage_err(
+                    "EntryPayload::Snapshot is an in-memory compaction marker \
+                     and must not be written to WAL segment files",
+                ));
+            }
             let frame = Self::encode_frame(entry);
 
             if self.should_rotate(frame.len()) {
@@ -594,6 +624,7 @@ impl LogStore for FileLogStore {
 mod tests {
     use super::*;
     use xraft_core::message::{Entry, EntryPayload};
+    use xraft_core::storage::SnapshotMeta;
 
     fn make_entry(index: u64, term: u64) -> Entry {
         Entry {
@@ -951,8 +982,8 @@ mod tests {
     }
 
     #[test]
-    fn file_snapshot_entry_roundtrip() {
-        let dir = test_dir("file_snapshot_entry_roundtrip");
+    fn file_snapshot_entry_rejected_by_wal() {
+        let dir = test_dir("file_snapshot_entry_rejected_by_wal");
         let meta = SnapshotMeta {
             last_included_index: LogIndex(10),
             last_included_term: Term(3),
@@ -964,24 +995,39 @@ mod tests {
         let entry = Entry {
             index: LogIndex(11),
             term: Term(3),
-            payload: EntryPayload::Snapshot(meta.clone()),
+            payload: EntryPayload::Snapshot(meta),
         };
 
-        {
-            let mut log = FileLogStore::open(&dir).unwrap();
-            log.append(&[entry]).unwrap();
-            log.flush().unwrap();
-        }
+        let mut log = FileLogStore::open(&dir).unwrap();
+        // Snapshot entries are in-memory compaction markers and must NOT be
+        // persisted to WAL segment files. append() must return an error.
+        let result = log.append(&[entry]);
+        assert!(result.is_err(), "Snapshot entries must be rejected by WAL");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("compaction marker"),
+            "error message should mention compaction marker, got: {err_msg}"
+        );
+    }
 
-        let log = FileLogStore::open(&dir).unwrap();
-        let recovered = log.get(LogIndex(11)).unwrap().unwrap();
-        match recovered.payload {
-            EntryPayload::Snapshot(ref m) => {
-                assert_eq!(m.id, "snap-1");
-                assert_eq!(m.last_included_index, LogIndex(10));
-                assert_eq!(m.last_included_term, Term(3));
-            }
-            _ => panic!("expected Snapshot payload"),
-        }
+    #[test]
+    fn memory_snapshot_entry_rejected_by_wal() {
+        let meta = SnapshotMeta {
+            last_included_index: LogIndex(10),
+            last_included_term: Term(3),
+            id: "snap-1".to_string(),
+            voter_set: None,
+            size_bytes: None,
+            checksum: None,
+        };
+        let entry = Entry {
+            index: LogIndex(11),
+            term: Term(3),
+            payload: EntryPayload::Snapshot(meta),
+        };
+
+        let mut log = MemoryLogStore::new();
+        let result = log.append(&[entry]);
+        assert!(result.is_err(), "Snapshot entries must be rejected by MemoryLogStore");
     }
 }
