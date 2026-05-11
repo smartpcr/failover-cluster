@@ -158,6 +158,7 @@ impl LogStore for MemoryLogStore {
 const PAYLOAD_TAG_NOOP: u8 = 0;
 const PAYLOAD_TAG_COMMAND: u8 = 1;
 const PAYLOAD_TAG_SNAPSHOT: u8 = 2;
+const PAYLOAD_TAG_CONFIG_CHANGE: u8 = 3;
 
 /// Default maximum segment size before rotation (64 MiB).
 pub const DEFAULT_MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
@@ -366,6 +367,11 @@ impl FileLogStore {
                     .expect("SnapshotMeta serialization should not fail");
                 (PAYLOAD_TAG_SNAPSHOT, encoded)
             }
+            EntryPayload::ConfigChange(voter_set) => {
+                let encoded = bincode::serialize(voter_set)
+                    .expect("VoterSet serialization should not fail");
+                (PAYLOAD_TAG_CONFIG_CHANGE, encoded)
+            }
         };
 
         let mut buf = Vec::with_capacity(ENTRY_HEADER_LEN + payload_bytes.len());
@@ -411,6 +417,13 @@ impl FileLogStore {
                         storage_err(format!("SnapshotMeta decode failed: {e}"))
                     })?;
                 EntryPayload::Snapshot(meta)
+            }
+            PAYLOAD_TAG_CONFIG_CHANGE => {
+                let voter_set: xraft_core::types::VoterSet =
+                    bincode::deserialize(payload_data).map_err(|e| {
+                        storage_err(format!("VoterSet decode failed: {e}"))
+                    })?;
+                EntryPayload::ConfigChange(voter_set)
             }
             other => {
                 return Err(storage_err(format!(

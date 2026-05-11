@@ -604,7 +604,7 @@ peers = ["node1"]
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6000"]
+peers = ["node1:6001"]
 election_timeout_min_ms = 0
 "#;
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
@@ -617,7 +617,7 @@ election_timeout_min_ms = 0
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6000"]
+peers = ["node1:6001"]
 election_timeout_min_ms = 300
 election_timeout_max_ms = 150
 "#;
@@ -631,7 +631,7 @@ election_timeout_max_ms = 150
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6000"]
+peers = ["node1:6001"]
 election_timeout_min_ms = 200
 election_timeout_max_ms = 200
 "#;
@@ -645,7 +645,7 @@ election_timeout_max_ms = 200
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6000"]
+peers = ["node1:6001"]
 fetch_interval_ms = 0
 "#;
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
@@ -658,7 +658,7 @@ fetch_interval_ms = 0
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6000"]
+peers = ["node1:6001"]
 tick_interval_ms = 0
 "#;
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
@@ -671,7 +671,7 @@ tick_interval_ms = 0
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6000"]
+peers = ["node1:6001"]
 snapshot_interval = 0
 "#;
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
@@ -684,7 +684,7 @@ snapshot_interval = 0
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6000"]
+peers = ["node1:6001"]
 max_log_entries_before_compaction = 0
 "#;
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
@@ -697,7 +697,7 @@ max_log_entries_before_compaction = 0
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6000"]
+peers = ["node1:6001"]
 data_dir = ""
 "#;
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
