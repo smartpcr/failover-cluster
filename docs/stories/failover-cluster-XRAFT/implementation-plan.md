@@ -52,7 +52,7 @@ storyId: "failover-cluster:XRAFT"
 ## Stage 1.3: RPC Message Definitions
 
 ### Implementation Steps
-- [ ] Create `proto/raft.proto` defining protobuf messages: `VoteRequest`, `VoteResponse`, `PreVoteRequest`, `PreVoteResponse`, `FetchRequest`, `FetchResponse`, `AppendEntriesRequest`, `AppendEntriesResponse` — the `AppendEntries*` types are internal-only proto types used for the `Action::AppendEntries` side-effect within `xraft-core` (leader writing to its own log); they are **not** exposed as a network RPC (per `tech-spec.md` §2.2)
+- [ ] Create `proto/raft.proto` defining protobuf messages: `VoteRequest`, `VoteResponse`, `PreVoteRequest`, `PreVoteResponse`, `FetchRequest`, `FetchResponse` — per `tech-spec.md` §2.2, there are no `AppendEntries` wire RPC messages; the pull-based Fetch model entirely subsumes them.  `xraft-core` uses `Action::AppendEntries` internally as a side-effect name for the leader writing to its own log, but this is not a network RPC or proto message.
 - [ ] Define `LogEntry` protobuf message with fields: `index`, `term`, `entry_type` (enum: Command, NoOp, Config), `data` (bytes)
 - [ ] Define `SnapshotMetadata` protobuf message with fields: `last_included_index`, `last_included_term`, `voter_set`
 - [ ] Define `FetchSnapshotRequest` and `FetchSnapshotChunk` protobuf messages for streamed snapshot transfer from leader to follower

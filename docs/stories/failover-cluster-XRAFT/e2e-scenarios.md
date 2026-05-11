@@ -435,14 +435,12 @@ Feature: Check Quorum prevents split-brain
 
 ```gherkin
 Feature: Inter-node request routing and leader discovery
-  Per tech-spec §2.6/§5.6, `xraft-client` is a **dual-role** crate: it serves as
-  both an **external consumer library** (providing `XRaftClient.propose` and `read`
-  for callers outside the cluster) and an **internal peer/admin client** (used by
-  `xraft-server` for inter-node gRPC and operational queries such as status,
-  metrics, health, and snapshot triggering).  Leader discovery occurs through
-  Fetch RPC responses that carry leader_id and epoch metadata (per architecture.md
-  §2.5).  The AdminClient role is limited to operational queries — writes go
-  through the external consumer API (`propose`), not through AdminClient.
+  Per architecture.md §2.5, `xraft-client` is an **internal** peer RPC and admin
+  client only — no external consumer SDK (`propose`/`read`) is in scope for v1.
+  `xraft-server` uses `PeerClient` for inter-node gRPC and `AdminClient` for
+  operational queries such as status, metrics, health, and snapshot triggering.
+  Leader discovery occurs through Fetch RPC responses that carry leader_id and
+  epoch metadata.
 
   Background:
     Given a cluster of 3 nodes
@@ -471,27 +469,13 @@ Feature: Inter-node request routing and leader discovery
     Then within one Fetch cycle, all followers learn node-2 is the leader
     And all nodes' internal leader tracking agrees on node-2 for epoch 7
 
-  Scenario: External consumer proposes a write via XRaftClient
-    When an external caller uses `XRaftClient.propose(data)` to submit a write
-    Then the client connects to the cluster via gRPC
-    And if the target node is not the leader, it responds with NOT_LEADER and leader_hint
-    And the client redirects the proposal to the current leader
-    And the leader appends the entry and commits it via quorum replication
-    And the client receives a `ProposalId` confirming acceptance
-
-  Scenario: External consumer reads via XRaftClient
-    When an external caller uses `XRaftClient.read(key)` to query committed state
-    Then the client connects to the leader (following NOT_LEADER redirects if needed)
-    And the leader serves the read from committed state
-    And the client receives the result as `Result<Vec<u8>>`
-
   Scenario: AdminClient is limited to operational queries
     When an operator uses the AdminClient to query cluster status
     Then the AdminClient returns leader identity, current epoch, and node roles
     And the AdminClient can query `/health` and `/metrics` endpoints
     And the AdminClient can trigger a snapshot
-    But the AdminClient does NOT expose `propose` or `read` — writes and reads
-      go through the external consumer API (`XRaftClient`)
+    But the AdminClient does NOT expose `propose` or `read` — those are
+      out of scope for v1 (no external consumer SDK)
 ```
 
 ---
@@ -499,11 +483,11 @@ Feature: Inter-node request routing and leader discovery
 ## Feature 12: Static Cluster Membership and Observer Join
 
 ```gherkin
-Feature: Static voter membership with observer join and stretch-goal dynamic membership
+Feature: Static voter membership with observer join
   Per tech-spec §2.7 and §3, the voter set is fixed at cluster bootstrap for the
-  core v1 deliverable.  Dynamic membership (`AddVoter`/`RemoveVoter`) is a
-  **stretch goal** within this story — it may be delivered if schedule permits
-  (per `tech-spec.md` §2.7/§3 and `architecture.md` §5.5/§10).
+  core v1 deliverable.  Dynamic membership (`AddVoter`/`RemoveVoter`) is **out
+  of scope for v1** and deferred to a future story entirely — not a stretch goal
+  (per `architecture.md` §5.5 and `e2e-scenarios.md` Alignment Notes).
   `implementation-plan.md` Stage 7.2 covers the static voter set bootstrap and
   observer support as the baseline.  Observers (non-voting nodes) may join to
   replicate the log for read scaling.
@@ -517,7 +501,7 @@ Feature: Static voter membership with observer join and stretch-goal dynamic mem
     When the cluster starts
     Then all 3 nodes load the static voter configuration
     And quorum size is fixed at 2 of 3
-    And the voter set remains unchanged unless the dynamic membership stretch goal is implemented
+    And the voter set remains unchanged (dynamic membership is out of scope for v1)
 
   Scenario: Observer joins and replicates the log
     Given observer-0 is configured as a non-voting observer
@@ -535,27 +519,11 @@ Feature: Static voter membership with observer join and stretch-goal dynamic mem
     And observer-0 initiates a FetchSnapshot RPC
     And observer-0 loads the snapshot and resumes Fetch from index 8,001
 
-  Scenario: AddVoter/RemoveVoter stretch goal — baseline rejection
+  Scenario: AddVoter/RemoveVoter — out of scope for v1
     When an operator attempts to issue an AddVoter or RemoveVoter command
-    And the dynamic membership stretch goal has NOT been implemented
     Then the node rejects the request with an UNSUPPORTED error
     And the voter set remains unchanged
-
-  Scenario: AddVoter stretch goal — adding a voter (if implemented)
-    Given the dynamic membership stretch goal has been implemented
-    When an operator issues an AddVoter command for node-3
-    Then the leader appends a ConfigChange entry to the log
-    And once the ConfigChange is committed, node-3 becomes a voting member
-    And quorum size adjusts to reflect the new voter set
-    # Note: this scenario applies only if the stretch goal ships (tech-spec §2.7)
-
-  Scenario: RemoveVoter stretch goal — removing a voter (if implemented)
-    Given the dynamic membership stretch goal has been implemented
-    When an operator issues a RemoveVoter command for node-2
-    Then the leader appends a ConfigChange entry to the log
-    And once the ConfigChange is committed, node-2 is removed from the voter set
-    And quorum size adjusts to reflect the new voter set
-    # Note: this scenario applies only if the stretch goal ships (tech-spec §2.7)
+    # Note: dynamic membership is out of scope for v1 and deferred to a future story
 ```
 
 ---
@@ -617,7 +585,7 @@ Feature: Timing-sensitive behaviour and performance boundaries
     And the Fetch interval is recorded as a metric
 
   Scenario: Write commit latency under normal conditions
-    When an external caller uses `XRaftClient.propose(data)` to submit a write
+    When a client submits a write to the leader
     Then the entry is committed within broadcastTime + follower Fetch scheduling delay + fsync latency
     And the commit latency is recorded as a metric
     And commit latency is recorded as a histogram metric for operational monitoring
