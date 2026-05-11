@@ -1,3 +1,3 @@
 mod snapshot_store;
 
-pub use snapshot_store::SnapshotStore;
+pub use xraft_core::storage::SnapshotStore;
