@@ -1117,8 +1117,7 @@ impl FileSnapshotStore {
             // Use `checked_div` to satisfy clippy's `manual_checked_ops` lint
             // (new in Rust 1.95, promoted to error by the workspace's
             // `-D warnings` policy).
-            let logical_chunk_index =
-                (offset_usize.checked_div(chunk_size).unwrap_or(0)) as u64;
+            let logical_chunk_index = (offset_usize.checked_div(chunk_size).unwrap_or(0)) as u64;
             return Ok(SnapshotChunkReader {
                 reader,
                 meta: Some(file_meta),
