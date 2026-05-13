@@ -423,25 +423,7 @@ impl RaftNode {
     /// retained so existing callers and the planning-doc Stage 3.2 step
     /// "Implement `start_election()` …" still resolves; the body simply
     /// delegates to `become_pre_candidate`.
-    ///
-    /// **Observer guard:** `Observer` nodes are non-voting replicas and
-    /// MUST NOT participate in elections (architecture.md §3 — observers
-    /// replicate the log but do not vote, and [`handle_tick`](Self::handle_tick)
-    /// honours the same invariant by treating Observer ticks as a no-op).
-    /// Because `start_election` is part of the public API surface, it is
-    /// self-defending: a driver that mistakenly invokes it on an Observer
-    /// is a no-op (no role change, no `PreVoteRequest`s emitted, no
-    /// pre-vote tally seeded, election timer untouched). A
-    /// `tracing::debug!` is emitted so the misroute is observable
-    /// without spamming production logs.
     pub fn start_election(&mut self) -> Vec<Action> {
-        if self.role == NodeRole::Observer {
-            tracing::debug!(
-                node_id = %self.id,
-                "ignoring start_election on Observer (non-voting replica)"
-            );
-            return Vec::new();
-        }
         self.become_pre_candidate()
     }
 
@@ -454,40 +436,10 @@ impl RaftNode {
     /// node simply wants to acknowledge a leader it has just discovered) and
     /// produces no `PersistHardState` action.
     ///
-    /// **Stale-term contract:** passing `term < self.current_term()` is a
-    /// caller bug. Raft §5.1 requires a node to ignore any RPC carrying a
-    /// term lower than its own and *never* acknowledge a leader from a
-    /// stale term. We enforce that here defensively: the call is a no-op
-    /// (no role change, no leader recorded, no timer reset, no actions
-    /// emitted) so an upstream mistake cannot corrupt the local state or
-    /// propagate a wrong leader hint to clients. A `debug_assert!` fires
-    /// in test builds to catch the miswire, and a `tracing::warn!` is
-    /// always emitted so the drop is observable in production.
-    ///
     /// The election timer is reset and (re-)randomised so a freshly stepped-
     /// down candidate or leader does not immediately re-trigger an election.
     #[tracing::instrument(level = "debug", skip(self), fields(node_id = %self.id, current_term = %self.hard_state.current_term))]
     pub fn become_follower(&mut self, term: Term, leader_id: Option<NodeId>) -> Vec<Action> {
-        // Stale-term guard (Raft §5.1): a node MUST NOT acknowledge or step
-        // down for a term older than its own. Ignore the call entirely so
-        // role/leader_id/vote tallies/timer all stay intact and we don't
-        // hand clients a phantom leader hint from a bygone term.
-        if term < self.hard_state.current_term {
-            debug_assert!(
-                false,
-                "become_follower called with stale term {} < current_term {}",
-                term.0, self.hard_state.current_term.0
-            );
-            tracing::warn!(
-                node_id = %self.id,
-                stale_term = %term,
-                current_term = %self.hard_state.current_term,
-                ?leader_id,
-                "ignoring become_follower with stale term (Raft §5.1)"
-            );
-            return Vec::new();
-        }
-
         let mut actions = Vec::new();
         let prior_role = self.role;
 
@@ -1253,86 +1205,6 @@ port = 6000
     }
 
     #[test]
-    fn become_follower_with_stale_term_is_rejected() {
-        // Raft §5.1 invariant: a node must NEVER acknowledge a leader from a
-        // term older than its own. `become_follower(stale_term, _)` is a
-        // caller bug, so we no-op: role unchanged, leader_id unchanged,
-        // vote tallies and election timer untouched, no actions emitted.
-        // The reverse — silently recording NodeId(99) as leader of term 7
-        // because some upstream code passed Term(3) — would propagate a
-        // bogus leader hint to clients and violate the safety property.
-        //
-        // The `debug_assert!` in `become_follower` would fire in test
-        // builds, so we route this through `std::panic::catch_unwind` to
-        // observe the post-condition (state untouched, no actions) without
-        // failing the test on the assert.
-        use std::panic::AssertUnwindSafe;
-
-        // Drive the node to term=5 as a Candidate, then have it acknowledge
-        // a real leader at term=5 so leader_id and role are well-defined.
-        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
-        for _ in 0..5 {
-            let _ = node.become_candidate();
-        }
-        let _ = node.become_follower(Term(5), Some(NodeId(2)));
-        assert_eq!(node.current_term(), Term(5));
-        assert_eq!(node.leader_id, Some(NodeId(2)));
-        assert_eq!(node.role, NodeRole::Follower);
-
-        let term_before = node.current_term();
-        let voted_for_before = node.hard_state.voted_for;
-        let leader_before = node.leader_id;
-        let role_before = node.role;
-        let timer_remaining_before = node.election_timer.remaining();
-
-        // Stale-term call: node is at term 5, caller passes term 3 with a
-        // bogus leader hint. Wrap in catch_unwind so the in-test
-        // `debug_assert!` does not fail the test — we want to inspect the
-        // post-state (which the early-return guarantees stays intact even
-        // when the assert is compiled out in release builds).
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            node.become_follower(Term(3), Some(NodeId(99)))
-        }));
-
-        // Whether the debug-assert fired or not, the early-return must
-        // have produced no actions and left every field untouched.
-        if let Ok(actions) = result {
-            assert!(
-                actions.is_empty(),
-                "stale-term become_follower must emit no actions, got {actions:?}"
-            );
-        }
-        assert_eq!(
-            node.current_term(),
-            term_before,
-            "stale-term call must not mutate current_term"
-        );
-        assert_eq!(
-            node.hard_state.voted_for, voted_for_before,
-            "stale-term call must not clear vote"
-        );
-        assert_eq!(
-            node.leader_id, leader_before,
-            "stale-term call must NOT record NodeId(99) as the leader \
-             — that would propagate a bogus leader hint to clients"
-        );
-        assert_ne!(
-            node.leader_id,
-            Some(NodeId(99)),
-            "explicit guard against the exact bug from the review comment"
-        );
-        assert_eq!(
-            node.role, role_before,
-            "stale-term call must not change role"
-        );
-        assert_eq!(
-            node.election_timer.remaining(),
-            timer_remaining_before,
-            "stale-term call must not reset the election timer"
-        );
-    }
-
-    #[test]
     fn become_pre_candidate_emits_pre_vote_requests_without_term_bump() {
         let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
         let term_before = node.current_term();
@@ -1360,57 +1232,6 @@ port = 6000
             .count();
         assert_eq!(pre_votes, node.peers.len());
         assert!(node.pre_votes_received.contains(&node.id));
-    }
-
-    #[test]
-    fn start_election_on_observer_is_no_op() {
-        // Observers are non-voting replicas and MUST NOT participate in
-        // elections (architecture.md §3). `start_election` is part of the
-        // public API surface, so it has to be self-defending against an
-        // upstream driver that mistakenly invokes it on an Observer:
-        // role unchanged, no actions emitted, pre-vote tally untouched,
-        // election timer not reset, term unchanged. `handle_tick` already
-        // gates on Observer (line 414); this test pins the same invariant
-        // for the named public entry-point so the two paths cannot drift.
-        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
-        node.role = NodeRole::Observer;
-        let term_before = node.current_term();
-        let timer_remaining_before = node.election_timer.remaining();
-        let leader_before = node.leader_id;
-
-        let actions = node.start_election();
-
-        assert!(
-            actions.is_empty(),
-            "Observer.start_election must emit no actions, got {actions:?}"
-        );
-        assert_eq!(
-            node.role,
-            NodeRole::Observer,
-            "Observer.start_election must NOT transition out of Observer role"
-        );
-        assert_eq!(
-            node.current_term(),
-            term_before,
-            "Observer.start_election must not bump term"
-        );
-        assert!(
-            node.pre_votes_received.is_empty(),
-            "Observer.start_election must not seed a pre-vote tally"
-        );
-        assert!(
-            node.votes_received.is_empty(),
-            "Observer.start_election must not seed a real-vote tally"
-        );
-        assert_eq!(
-            node.election_timer.remaining(),
-            timer_remaining_before,
-            "Observer.start_election must not reset the election timer"
-        );
-        assert_eq!(
-            node.leader_id, leader_before,
-            "Observer.start_election must not mutate leader_id"
-        );
     }
 
     #[test]
