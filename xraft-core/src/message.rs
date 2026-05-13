@@ -49,13 +49,26 @@ pub struct Entry {
 }
 
 /// Inputs consumed by the Raft state machine.
+///
+/// `Vote` / `PreVote` response variants carry an explicit `from: NodeId` because
+/// the on-the-wire response struct does not embed the responder identity (see
+/// the doc comment on [`VoteResponse`] / [`PreVoteResponse`]). The transport
+/// layer is responsible for deriving `from` from the connection context and
+/// passing it in. Other responses (`FetchResponse`) embed the responder ID
+/// (`leader_id`) inside the response payload so a separate field is unnecessary.
 #[derive(Debug, Clone)]
 pub enum Input {
     Tick,
     VoteRequest(VoteRequest),
-    VoteResponse(VoteResponse),
+    VoteResponse {
+        from: NodeId,
+        response: VoteResponse,
+    },
     PreVoteRequest(PreVoteRequest),
-    PreVoteResponse(PreVoteResponse),
+    PreVoteResponse {
+        from: NodeId,
+        response: PreVoteResponse,
+    },
     FetchRequest(FetchRequest),
     FetchResponse(FetchResponse),
     ClientPropose(Bytes),
