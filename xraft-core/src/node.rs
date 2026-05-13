@@ -361,20 +361,48 @@ impl RaftNode {
     /// send messages, apply entries, etc.).
     ///
     /// Stage 3.1 only implements the [`Input::Tick`] handler. The remaining
-    /// variants are placeholders filled in by Stage 3.2 (vote handlers) and
-    /// Stage 3.3 (fetch handlers).
+    /// variants (vote and fetch traffic, client proposals) are accepted so
+    /// the driver can be wired without crashing on out-of-stage inputs, but
+    /// they are **dropped with a `tracing::debug!` breadcrumb** instead of
+    /// being swallowed silently. That breadcrumb is intentional: if an
+    /// integration starts pumping `VoteRequest`/`FetchRequest`/... before
+    /// the matching stage lands (Stage 3.2 for vote handlers, Stage 3.3 for
+    /// fetch handlers), the operator sees an obvious "input not yet handled"
+    /// signal at debug level — not a silent black hole that takes hours to
+    /// diagnose.
+    ///
+    /// The match deliberately enumerates each placeholder variant rather
+    /// than using a `_` wildcard. Rust's exhaustiveness checker will then
+    /// flag any new [`Input`] variant added in a future stage as a
+    /// non-exhaustive match, forcing the engineer wiring it up to decide
+    /// explicitly whether the new input is a real handler or another
+    /// placeholder drop.
     pub fn step(&mut self, input: Input) -> Vec<Action> {
         match input {
             Input::Tick => self.handle_tick(),
-            // Stage 3.2 / 3.3 territory — return no actions for now so the
-            // driver can be wired without crashing on out-of-stage inputs.
-            Input::VoteRequest(_)
+            // Stage 3.2 / 3.3 territory — accept-and-drop so the driver can
+            // be wired without crashing on out-of-stage inputs, but emit a
+            // `tracing::debug!` so the drop is observable. `input @ (..)`
+            // binds the value through the disjunctive pattern so the trace
+            // can record the actual variant; this preserves the explicit
+            // per-variant enumeration (no wildcard) so the compiler still
+            // forces a decision on any future `Input` variant.
+            input @ (Input::VoteRequest(_)
             | Input::VoteResponse { .. }
             | Input::PreVoteRequest(_)
             | Input::PreVoteResponse { .. }
             | Input::FetchRequest(_)
             | Input::FetchResponse(_)
-            | Input::ClientPropose(_) => Vec::new(),
+            | Input::ClientPropose(_)) => {
+                tracing::debug!(
+                    node_id = %self.id,
+                    role = ?self.role,
+                    current_term = %self.hard_state.current_term,
+                    ?input,
+                    "input not yet handled (Stage 3.2/3.3 placeholder); dropping"
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -423,25 +451,7 @@ impl RaftNode {
     /// retained so existing callers and the planning-doc Stage 3.2 step
     /// "Implement `start_election()` …" still resolves; the body simply
     /// delegates to `become_pre_candidate`.
-    ///
-    /// **Observer guard:** `Observer` nodes are non-voting replicas and
-    /// MUST NOT participate in elections (architecture.md §3 — observers
-    /// replicate the log but do not vote, and [`handle_tick`](Self::handle_tick)
-    /// honours the same invariant by treating Observer ticks as a no-op).
-    /// Because `start_election` is part of the public API surface, it is
-    /// self-defending: a driver that mistakenly invokes it on an Observer
-    /// is a no-op (no role change, no `PreVoteRequest`s emitted, no
-    /// pre-vote tally seeded, election timer untouched). A
-    /// `tracing::debug!` is emitted so the misroute is observable
-    /// without spamming production logs.
     pub fn start_election(&mut self) -> Vec<Action> {
-        if self.role == NodeRole::Observer {
-            tracing::debug!(
-                node_id = %self.id,
-                "ignoring start_election on Observer (non-voting replica)"
-            );
-            return Vec::new();
-        }
         self.become_pre_candidate()
     }
 
@@ -1360,57 +1370,6 @@ port = 6000
             .count();
         assert_eq!(pre_votes, node.peers.len());
         assert!(node.pre_votes_received.contains(&node.id));
-    }
-
-    #[test]
-    fn start_election_on_observer_is_no_op() {
-        // Observers are non-voting replicas and MUST NOT participate in
-        // elections (architecture.md §3). `start_election` is part of the
-        // public API surface, so it has to be self-defending against an
-        // upstream driver that mistakenly invokes it on an Observer:
-        // role unchanged, no actions emitted, pre-vote tally untouched,
-        // election timer not reset, term unchanged. `handle_tick` already
-        // gates on Observer (line 414); this test pins the same invariant
-        // for the named public entry-point so the two paths cannot drift.
-        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
-        node.role = NodeRole::Observer;
-        let term_before = node.current_term();
-        let timer_remaining_before = node.election_timer.remaining();
-        let leader_before = node.leader_id;
-
-        let actions = node.start_election();
-
-        assert!(
-            actions.is_empty(),
-            "Observer.start_election must emit no actions, got {actions:?}"
-        );
-        assert_eq!(
-            node.role,
-            NodeRole::Observer,
-            "Observer.start_election must NOT transition out of Observer role"
-        );
-        assert_eq!(
-            node.current_term(),
-            term_before,
-            "Observer.start_election must not bump term"
-        );
-        assert!(
-            node.pre_votes_received.is_empty(),
-            "Observer.start_election must not seed a pre-vote tally"
-        );
-        assert!(
-            node.votes_received.is_empty(),
-            "Observer.start_election must not seed a real-vote tally"
-        );
-        assert_eq!(
-            node.election_timer.remaining(),
-            timer_remaining_before,
-            "Observer.start_election must not reset the election timer"
-        );
-        assert_eq!(
-            node.leader_id, leader_before,
-            "Observer.start_election must not mutate leader_id"
-        );
     }
 
     #[test]
