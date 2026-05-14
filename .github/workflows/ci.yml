@@ -17,6 +17,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install protoc
+        # xraft-core/build.rs invokes tonic-build → prost-build, which
+        # requires the `protoc` binary on PATH to compile the .proto
+        # files. The ubuntu-latest runner doesn't ship protoc by
+        # default, so install it explicitly before the Rust build steps
+        # run. arduino/setup-protoc handles the pin + cache.
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

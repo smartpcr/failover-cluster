@@ -31,6 +31,12 @@ pub enum XRaftError {
     /// Configuration error.
     #[error("configuration error: {0}")]
     Config(String),
+    /// Snapshot file is corrupt (bad magic, CRC mismatch, truncated header).
+    #[error("corrupt snapshot: {0}")]
+    CorruptSnapshot(String),
+    /// Requested snapshot was not found in the store.
+    #[error("snapshot not found: {0}")]
+    SnapshotNotFound(String),
 }
 
 /// Convenience result alias.
