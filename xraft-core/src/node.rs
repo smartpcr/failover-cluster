@@ -1019,7 +1019,7 @@ impl RaftNode {
     /// the election timer, or `leader_id`. The only emitted action is the
     /// reply `SendMessage`.
     #[tracing::instrument(level = "debug", skip(self), fields(node_id = %self.id, current_term = %self.hard_state.current_term))]
-    pub fn handle_pre_vote_request(&mut self, req: PreVoteRequest) -> Vec<Action> {
+    pub fn handle_pre_vote_request(&self, req: PreVoteRequest) -> Vec<Action> {
         if req.cluster_id != self.config.cluster_id {
             return Vec::new();
         }
@@ -2338,7 +2338,7 @@ port = 6000
     fn handle_pre_vote_request_grants_when_no_leader() {
         // Fresh follower with no known leader and an empty log must grant
         // a pre-vote for a higher next_term and adequate log.
-        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        let node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
         let actions = node.handle_pre_vote_request(pre_vote_req("test", 1, NodeId(2), 0, 0));
         let resp = extract_pre_vote_response(&actions);
         assert!(resp.vote_granted);
@@ -2448,7 +2448,7 @@ port = 6000
 
     #[test]
     fn handle_pre_vote_request_does_not_mutate_state() {
-        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        let node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
         let term_before = node.current_term();
         let timer_elapsed_before = node.election_timer.elapsed();
         let voted_for_before = node.hard_state.voted_for;
@@ -2462,7 +2462,7 @@ port = 6000
 
     #[test]
     fn handle_pre_vote_request_drops_non_voter_candidate() {
-        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        let node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
         let actions = node.handle_pre_vote_request(pre_vote_req("test", 1, NodeId(99), 0, 0));
         assert!(actions.is_empty());
     }
