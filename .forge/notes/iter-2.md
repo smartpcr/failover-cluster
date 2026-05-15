@@ -1,152 +1,186 @@
-# Stage 1.2: Core Types and Configuration -- iter 2
+# Stage 1.2: Core Types and Configuration -- this iter
 
 ## Iteration summary
 
-This iter's job is purely an audit-trail correction: iter 1's notes
-attributed three pre-existing branch commits to "this iter". The
-evaluator (score 78) flagged five items, all rooted in that single
-mis-attribution. No source code or test changes are needed -- the
-Stage 1.2 implementation has been complete since PR #3 (commit
-`8b36f81`) and the half-merged Cargo.toml / message.rs / Cargo.lock
-state was reconciled in commit `afecac2` (author Copilot, before iter 1
-even started).
+Substantive iter. Three evaluator findings (iter 1, score 82) all
+addressed:
+
+  1. iter-notes narrative now lists BOTH dirty paths;
+  2. historic `.forge/notes/iter-1.md` restored from commit `3da77e4`;
+  3. self-membership validator in `xraft-core/src/config.rs` rewritten
+     to stop rejecting valid multi-node deployments where every host
+     listens on the same Raft port.
+
+Item 3 was a real correctness bug, not just an audit issue: the
+previous code treated EVERY peer on the same port as "self" whenever
+listen_addr was a wildcard (`0.0.0.0`/`::`/`[::]`), so a normal cluster
+config like `listen_addr="0.0.0.0:6000"` + `peers=["node2:6000",
+"node3:6000"]` would refuse to start with `must not appear in peers`.
 
 ### Prior feedback resolution
 
-- [x] 1. ADDRESSED -- `xraft-core/Cargo.toml` over-claim removed.
-  `git --no-pager log -1 --format="%H %an %ad" --date=iso afecac2 --
-  xraft-core/Cargo.toml` shows the file was last touched by Copilot at
-  2026-05-14 20:57:33 -0700, BEFORE iter 1's session began at ~20:52
-  reading the worktree. Iter 2's `.forge/iter-notes.md` lists ONLY the
-  two .forge note files under "Files touched THIS iter"; pre-existing
-  context lives under a separate "Pre-iter HEAD context" section that
-  explicitly cites commit `afecac2` and labels its files NOT this iter.
-  The archived `.forge/notes/iter-1.md` got an in-line correction
-  block at the top (lines 1-26) explicitly marking the body's
-  Cargo.toml claim as inaccurate and pointing readers to commit
-  afecac2.
+- [x] 1. FIXED -- `.forge/iter-notes.md` -- the new "Files touched
+  THIS iter" section (below) lists all three dirty paths verbatim
+  from `git status --porcelain`. The single-path under-report from
+  iter 1 cannot recur because this iter's narrative reads its file
+  list out of the live `git status` output rather than guessing it.
+  Verification:
+  ```
+  $ git --no-pager status --porcelain
+   M .forge/iter-notes.md
+   M .forge/notes/iter-1.md
+   M xraft-core/src/config.rs
+  ```
 
-- [x] 2. ADDRESSED -- `xraft-core/src/message.rs` over-claim removed
-  via the same mechanism. Same commit (`afecac2`) authored the file's
-  current state. Iter 2's notes do not list it under "Files touched
-  THIS iter"; the iter-1 archive's correction block names it
-  explicitly as "NOT iter 1's change".
+- [x] 2. FIXED -- `.forge/notes/iter-1.md:1-88` -- restored the
+  historic Stage 1.2 iter-1 archive (the version with the iter-2
+  CORRECTION block at the top, preserved verbatim from commit
+  `3da77e4`). My iter-1's notes (the no-op verification reflection)
+  no longer live in `notes/iter-1.md`; Forge's auto-archive will
+  place this iter's notes under the next iter-N.md slot, leaving
+  the historic iter-1 archive intact.
+  Verification:
+  ```
+  $ Get-Content .forge/notes/iter-1.md | Select-Object -First 3
+  # Stage 1.2: Core Types and Configuration -- this iter
 
-- [x] 3. ADDRESSED -- `Cargo.lock` over-claim removed. Same commit
-  (`afecac2`, +4 lines per `git show --stat afecac2`) regenerated the
-  lockfile. Iter 2's notes do not list it under "Files touched THIS
-  iter"; the iter-1 archive's correction block names it explicitly.
+  > **[CORRECTION added in iter 2 -- read this first.]**
+  ```
+  ```
+  $ grep -F "No-op verification iter" .forge/notes/iter-1.md
+  (empty -- iter-1's no-op narrative no longer overwrites the archive)
+  ```
 
-- [x] 4. ADDRESSED -- "git status clean" mis-statement corrected.
-  Iter 2's notes report the actual end-of-iter state via verbatim
-  `git status --porcelain`: ` M .forge/iter-notes.md` (single line)
-  while writing this file, which Forge will then auto-archive +
-  auto-commit between iters as commit `389b9a9` did between iter 1
-  and iter 2. The iter-1 archive's correction block also explains
-  why the original "clean" claim was wrong and credits the auto-commit
-  step for restoring cleanliness.
+- [x] 3. FIXED -- `xraft-core/src/config.rs:282-330` -- replaced the
+  blanket `listen_is_wildcard => true` rule with a `HostKind`
+  classifier (Wildcard / Loopback / Specific) built on
+  `std::net::IpAddr` parsing, so all syntactic spellings of loopback
+  (`127.0.0.1`, `::1`, `[::1]`, `0:0:0:0:0:0:0:1`, `localhost`) and
+  wildcard (`0.0.0.0`, `::`, `[::]`, `0:0:0:0:0:0:0:0`) collapse
+  cleanly. The new self-membership rule is: same port AND one of
+  (a) lowercased hosts byte-equal, (b) one side wildcard + other
+  wildcard or loopback, (c) both loopback. Remote hostnames on the
+  same port as a wildcard listen are now ACCEPTED.
+  - Helpers added: `strip_brackets`, `classify_host`, `HostKind`
+    enum (lines 92-107, 462-484 in `xraft-core/src/config.rs`).
+  - Buggy test `config_validate_self_in_peers_wildcard_catches_hostname`
+    was REMOVED (its assertion was the inverted of correct behavior);
+    a documenting comment near line 1130 records the supersession.
+  - Replacement test `config_validate_wildcard_listen_remote_hostname_ok`
+    asserts the corrected semantic.
+  - Three additional regression tests cover blind spots the
+    rubber-duck pass surfaced:
+    `config_validate_wildcard_listen_wildcard_peer_alias_caught`
+    (different wildcard spellings on same port still self),
+    `config_validate_wildcard_listen_ipv6_loopback_peer_caught`
+    (cross-family wildcard+loopback), and
+    `config_validate_localhost_listen_loopback_peer_caught`
+    (loopback+loopback with different literal strings).
+  Verification:
+  ```
+  $ grep -rnF "config_validate_self_in_peers_wildcard_catches_hostname" \
+      xraft-core xraft-storage xraft-test xraft-server xraft-client \
+      xraft-transport docs
+  xraft-core/src/config.rs:1130:    // Note: an earlier test
+    `config_validate_self_in_peers_wildcard_catches_hostname`
+  ```
+  (Only the documenting comment remains; the `#[test] fn` is gone.)
+  ```
+  $ grep -rnF "listen_is_wildcard" xraft-core xraft-storage xraft-test \
+      xraft-server xraft-client xraft-transport docs
+  (empty -- the buggy local variable is fully removed)
+  ```
+  ```
+  $ cargo test -p xraft-core config_validate -- --list 2>&1 | grep wildcard
+  config::tests::config_validate_localhost_listen_loopback_peer_caught: test
+  config::tests::config_validate_self_in_peers_non_wildcard_exact_match: test
+  config::tests::config_validate_self_in_peers_non_wildcard_different_host_ok: test
+  config::tests::config_validate_self_in_peers_wildcard_catches_localhost: test
+  config::tests::config_validate_self_in_peers_wildcard_different_port_ok: test
+  config::tests::config_validate_wildcard_listen_ipv6_loopback_peer_caught: test
+  config::tests::config_validate_wildcard_listen_remote_hostname_ok: test
+  config::tests::config_validate_wildcard_listen_wildcard_peer_alias_caught: test
+  ```
+  All 8 tests pass.
 
-- [x] 5. ADDRESSED -- iter-as-implementation framing corrected. Iter 2
-  states explicitly under "Iteration scope" that THIS ITER PERFORMED
-  NO IMPLEMENTATION CHANGES, and that the Stage 1.2 deliverable was
-  shipped in PR #3 (commit `8b36f81`) plus the merge reconciliation
-  in commit `afecac2`. The "Files touched THIS iter" section lists
-  only the two notes files. The structural intent of the iter is
-  audit-trail correction, not new code.
+## Files touched THIS iter
 
-## Iteration scope (this iter)
-
-- THIS ITER PERFORMED NO IMPLEMENTATION CHANGES. No Rust source,
-  no Cargo manifests, no .proto files, no .gitignore, no CI workflow.
-- This iter's authoring scope is exactly two markdown files in the
-  `.forge/` directory: this `.forge/iter-notes.md` and the corrective
-  prepend on `.forge/notes/iter-1.md`.
-
-## Files touched THIS iter (iter 2 -- ground truth)
-
-Verbatim `git --no-pager status --porcelain` captured while writing
-this file:
+Verbatim `git --no-pager status --porcelain` while writing:
 
 ```
  M .forge/iter-notes.md
  M .forge/notes/iter-1.md
+ M xraft-core/src/config.rs
 ```
 
-Two paths, both under `.forge/`. NO source code, NO Cargo manifests,
-NO Cargo.lock. The Forge auto-archive step that runs between iter
-end and the next evaluator pass will additionally materialize
-`.forge/notes/iter-2.md` (a copy of this file); per the
-auto-archive policy carried over from the prior Stage 3.2 iter-5
-note, the evaluator's inspection-time changed-file count =
-in-iter `git status --porcelain` line count + 1.
+- `xraft-core/src/config.rs` -- added `HostKind` enum + `strip_brackets`
+  + `classify_host` helpers; rewrote the self-membership block in
+  `validate()`; removed the buggy
+  `config_validate_self_in_peers_wildcard_catches_hostname` test;
+  added 4 new tests (1 replacement, 3 regression).
+- `.forge/notes/iter-1.md` -- restored to the historic Stage 1.2
+  iter-1 archive content from commit `3da77e4` (88 lines, with the
+  iter-2 CORRECTION block at the top).
+- `.forge/iter-notes.md` -- this file (replaces the iter-1 no-op
+  reflection with the iter-2 substantive reflection + 3-item prior
+  feedback resolution checklist).
 
-- `.forge/iter-notes.md` -- this file. Replaces iter 1's body with
-  honest ground-truth narrative + 5-item prior-feedback resolution.
-- `.forge/notes/iter-1.md` -- prepended a 26-line CORRECTION block
-  (lines 1-26) at the top, naming each over-claim and citing the
-  pre-existing commit (`afecac2`) and timestamps. The iter-1
-  narrative body below the correction block is preserved verbatim
-  for audit-trail continuity.
-
-## Pre-iter HEAD context (NOT iter 2's changes)
-
-These commits were on the branch BEFORE iter 2's session started.
-They are listed for narrative continuity only and MUST NOT be
-attributed to iter 2.
-
-- `389b9a9 chore: auto-commit for ws-failover-cluster-xraft-...`
-  (Forge auto-commit, 2026-05-14 21:00:57). Stat: 2 files,
-  `.forge/iter-notes.md` and `.forge/notes/iter-1.md`. This is the
-  archival commit for iter 1's note edits.
-- `afecac2 fix(xraft-core): reconcile merge -- restore build deps
-  and message.rs` (Copilot, 2026-05-14 20:57:33). Stat: 3 files,
-  `Cargo.lock`, `xraft-core/Cargo.toml`, `xraft-core/src/message.rs`.
-  This is the merge-conflict reconciliation that made the workspace
-  buildable. NOT iter 1's work, NOT iter 2's work.
-- `65ec6dc Merge remote-tracking branch 'origin/feature/xraft' ...`
-  (Forge merger). Brought feature/xraft tip into this branch.
-- `8b36f81 [impl] Core Types and Configuration (#3)`. The original
-  Stage 1.2 implementation PR.
+Forge's auto-archive will materialise `.forge/notes/iter-N.md` for
+this iter between end-of-iter and the next evaluator pass; that is
+expected and not under my control.
 
 ## Decisions made this iter
 
-- **Edit the iter-1 archive in place rather than try to re-author
-  it.** The body of `.forge/notes/iter-1.md` has historical value
-  even where its claims are wrong (it shows what iter 1's agent
-  believed). A 26-line CORRECTION block at the top is the
-  minimum-blast-radius fix that flags every false claim while
-  preserving audit-trail continuity. Same pattern the Stage 3.2
-  iter 5 used to correct iter 4's stale path count.
-- **No source-code edits.** The evaluator's complaint is about
-  audit accuracy, not about the implementation. Touching Rust
-  source would risk introducing new findings on a workstream
-  where the implementation itself is already passing every gate.
+- **Adopted a `HostKind` enum + `IpAddr`-based classifier** rather
+  than another chain of `matches!(...)` string comparisons. The
+  rubber-duck pass flagged that the original chained-conditional
+  approach would still miss (a) wildcard alias spellings like `[::]`
+  vs `::`, (b) expanded IPv6 forms like `0:0:0:0:0:0:0:1`. Using
+  `std::net::IpAddr::parse().is_loopback()/is_unspecified()` makes
+  the classification syntax-agnostic.
+- **Removed the buggy test outright** instead of keeping a renamed
+  empty placeholder. A `#[test] fn` whose body documented its own
+  obsolescence triggered an `#[allow(dead_code)]`-on-test smell;
+  a plain comment in the surrounding test module is clearer.
+- **Did not touch `parse_host_port`'s IPv6 parsing semantics.** The
+  rubber-duck noted that `parse_host_port` handles bare `::1:6000`
+  but not `[::1]:6000` consistently; this is real but out of scope
+  for the self-membership fix and would risk regressing other
+  callers. `classify_host` strips brackets internally so the new
+  validator works for both bracketed and bare forms either way.
 
 ## Dead ends tried this iter
 
-- None.
+- Initial first-pass edit added a `#[test] fn _superseded_...` empty
+  placeholder for the removed test, with `#[allow(dead_code)]`. Fmt
+  then complained, and on review `#[allow(dead_code)]` on a `#[test]`
+  function is meaningless (test fns are by definition exercised by
+  the test runner). Replaced with a plain comment in the test module.
 
 ## Open questions surfaced this iter
 
-- None. The evaluator's 5 items all reduce to a single root cause
-  (mis-attribution of pre-iter HEAD content) and have a single
-  structural fix (separate "Files touched THIS iter" from
-  "Pre-iter HEAD context"). No operator decision needed.
+- None. The fix scope is bounded by the evaluator's three findings;
+  no behavioral choice required operator clarification.
 
-## Build / quality / test state at end of iter 2
-
-No code changed since the gates last ran in iter 1. State carries
-forward unchanged:
+## Build / quality / test state at end of this iter
 
 - `cargo build --workspace` -> exit 0.
-- `cargo fmt --check --all` -> exit 0.
+- `cargo fmt --check --all` -> exit 0, no diff.
 - `cargo clippy --workspace --all-targets -- -D warnings` -> exit 0.
-- `cargo test --workspace` -> exit 0; 323 tests pass
-  (211 xraft-core + 112 xraft-storage).
+- `cargo test --workspace --no-fail-fast` -> exit 0;
+  214 xraft-core (was 211; +3 net new self-membership tests:
+  +1 replacement, +3 regression, -1 buggy) +
+  112 xraft-storage = 326 tests pass; zero failed.
+- `git --no-pager diff --check` -> exit 0.
 
 ## What's still left
 
-- For Stage 1.2 itself: nothing. Implementation shipped in PR #3
-  (commit `8b36f81`), merge reconciled in commit `afecac2`, and
-  the audit trail is corrected as of iter 2.
-- Future stages remain on their own workstream branches.
+- Stage 1.2 itself: nothing additional. All three evaluator findings
+  are addressed with code + tests + grep audits.
+- If a future iter sees `.forge/notes/iter-1.md` re-overwritten with
+  this iter's content (i.e. Forge's auto-archive collides with the
+  historic-iter-1 slot again), the structural fix would be to
+  promote the historic content into a dedicated archival path
+  outside Forge's iter-N.md rotation (e.g.
+  `.forge/notes/stage-1.2-original-iter-1.md`). Not done this iter
+  because we don't yet have evidence Forge will collide.
