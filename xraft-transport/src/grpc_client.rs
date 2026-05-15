@@ -26,6 +26,16 @@
 //! simultaneously. Streaming `FetchSnapshot` only retries the initial RPC
 //! invocation; mid-stream errors are surfaced to the caller because
 //! re-running the entire stream from scratch would corrupt offset-tracking.
+//!
+//! Connect-time failures (peer unreachable, TLS handshake error) are
+//! folded into the *same* outer retry loop as RPC failures — each call
+//! to [`RaftGrpcClient::channel_for`] performs at most ONE connection
+//! attempt, and the surrounding RPC loop applies the shared
+//! [`max_retries`](RaftGrpcClientConfig::max_retries) /
+//! [`initial_backoff`](RaftGrpcClientConfig::initial_backoff) budget.
+//! This keeps the worst-case connection cost against a dead peer at
+//! `O(max_retries)` total attempts (rather than `O(max_retries²)` that
+//! a nested connect-retry would produce).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -76,6 +86,11 @@ pub struct RaftGrpcClientConfig {
     /// Per-RPC end-to-end timeout (applies separately to each retry attempt).
     pub rpc_timeout: Duration,
     /// Maximum retry attempts for unary RPCs after a transient failure.
+    ///
+    /// This budget is **shared** between connect failures and RPC
+    /// failures within a single send call. A peer that is unreachable
+    /// for the duration of the call therefore drives at most
+    /// `max_retries + 1` total connection attempts, not `max_retries²`.
     pub max_retries: usize,
     /// Initial backoff delay; doubles after each failed retry up to `max_backoff`.
     pub initial_backoff: Duration,
@@ -85,6 +100,28 @@ pub struct RaftGrpcClientConfig {
     pub max_message_size: usize,
     /// TLS configuration. When `None`, plaintext HTTP/2 is used.
     pub tls: Option<Arc<TlsTransportConfig>>,
+}
+
+/// Internal channel-acquisition outcome that distinguishes between
+/// *fatal* errors (caller must give up) and *retriable* connect failures
+/// (caller should back off and try the whole `channel_for` cycle again).
+#[derive(Debug)]
+enum ChannelError {
+    /// Configuration / endpoint-construction failure — no peer URL, an
+    /// invalid URL, or a TLS setup problem. Retrying cannot help.
+    Misconfigured(XRaftError),
+    /// Single-attempt TCP/TLS connect failed. The outer RPC retry loop
+    /// applies the shared backoff budget and re-enters `channel_for`.
+    Connect(String),
+}
+
+impl From<ChannelError> for XRaftError {
+    fn from(err: ChannelError) -> Self {
+        match err {
+            ChannelError::Misconfigured(e) => e,
+            ChannelError::Connect(msg) => XRaftError::Transport(msg),
+        }
+    }
 }
 
 /// gRPC client for outbound Raft RPCs to peers in the cluster.
@@ -133,8 +170,14 @@ impl RaftGrpcClient {
     }
 
     /// Get an existing pooled channel for `peer` or open a fresh one with
-    /// exponential-backoff retry on connection failure.
-    async fn channel_for(&self, peer: NodeId) -> XResult<Channel> {
+    /// a **single** connection attempt.
+    ///
+    /// On a connect failure, returns [`ChannelError::Connect`]. The
+    /// caller's RPC retry loop is responsible for deciding whether to
+    /// back off and retry; this avoids the nested retry loop that
+    /// previously caused a dead peer to consume `max_retries²`
+    /// connection attempts per RPC.
+    async fn channel_for(&self, peer: NodeId) -> Result<Channel, ChannelError> {
         // Fast path: read-lock and clone if cached.
         if let Some(channel) = self.pool.read().await.get(&peer).cloned() {
             return Ok(channel);
@@ -146,12 +189,17 @@ impl RaftGrpcClient {
             .get(&peer)
             .cloned()
             .ok_or_else(|| {
-                XRaftError::Transport(format!(
+                ChannelError::Misconfigured(XRaftError::Transport(format!(
                     "no endpoint configured for peer {peer:?}; check ClusterConfig.voters"
-                ))
+                )))
             })?;
-        let endpoint = self.build_endpoint(&url)?;
-        let channel = self.connect_with_backoff(endpoint, peer).await?;
+        let endpoint = self
+            .build_endpoint(&url)
+            .map_err(ChannelError::Misconfigured)?;
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|e| ChannelError::Connect(format!("connect to peer {}: {e}", peer.0)))?;
 
         // Slow path: take the write lock and double-check before inserting.
         let mut pool = self.pool.write().await;
@@ -159,31 +207,43 @@ impl RaftGrpcClient {
         Ok(entry)
     }
 
-    async fn connect_with_backoff(&self, endpoint: Endpoint, peer: NodeId) -> XResult<Channel> {
-        let mut backoff = self.config.initial_backoff;
-        let mut attempt: usize = 0;
-        loop {
-            match endpoint.clone().connect().await {
-                Ok(channel) => {
-                    if attempt > 0 {
-                        debug!(target: "xraft_transport::client", peer = peer.0, attempt, "connect succeeded after retries");
-                    }
-                    return Ok(channel);
-                }
-                Err(e) if attempt < self.config.max_retries => {
-                    warn!(target: "xraft_transport::client", peer = peer.0, attempt, "connect failed, backing off {backoff:?}: {e}");
-                    tokio::time::sleep(jittered_sleep_duration(backoff)).await;
-                    backoff = (backoff * 2).min(self.config.max_backoff);
-                    attempt += 1;
-                }
-                Err(e) => {
-                    return Err(XRaftError::Transport(format!(
-                        "connect to peer {} after {} attempts: {e}",
-                        peer.0,
-                        attempt + 1
-                    )));
-                }
+    /// Acquire a channel for one RPC attempt within the outer retry loop.
+    ///
+    /// Returns:
+    ///   - `Ok(Some(channel))` — got a channel, proceed with the RPC.
+    ///   - `Ok(None)` — connect failed but retries remain; this function
+    ///     has already slept for the jittered backoff and advanced
+    ///     `attempt` / `backoff`. The caller should `continue` the
+    ///     retry loop.
+    ///   - `Err(_)` — fatal misconfiguration, or connect failed and the
+    ///     retry budget is exhausted. The caller propagates this.
+    async fn channel_for_attempt(
+        &self,
+        peer: NodeId,
+        op: &'static str,
+        attempt: &mut usize,
+        backoff: &mut Duration,
+    ) -> XResult<Option<Channel>> {
+        match self.channel_for(peer).await {
+            Ok(channel) => Ok(Some(channel)),
+            Err(ChannelError::Connect(msg)) if *attempt < self.config.max_retries => {
+                warn!(
+                    target: "xraft_transport::client",
+                    peer = peer.0,
+                    attempt = *attempt,
+                    "{op} connect failed, backing off {backoff:?}: {msg}"
+                );
+                tokio::time::sleep(jittered_sleep_duration(*backoff)).await;
+                *backoff = (*backoff * 2).min(self.config.max_backoff);
+                *attempt += 1;
+                Ok(None)
             }
+            Err(ChannelError::Connect(msg)) => Err(XRaftError::Transport(format!(
+                "{op} connect to peer {} after {} attempts: {msg}",
+                peer.0,
+                *attempt + 1
+            ))),
+            Err(e @ ChannelError::Misconfigured(_)) => Err(e.into()),
         }
     }
 
@@ -224,7 +284,16 @@ impl RaftGrpcClient {
         let mut backoff = self.config.initial_backoff;
         let mut attempt: usize = 0;
         loop {
-            let channel = self.channel_for(peer).await?;
+            let channel = match self
+                .channel_for_attempt(peer, "Vote", &mut attempt, &mut backoff)
+                .await?
+            {
+                Some(ch) => ch,
+                None => continue,
+            };
+            if attempt > 0 {
+                debug!(target: "xraft_transport::client", peer = peer.0, attempt, "Vote attempt after retry");
+            }
             let mut client = self.typed_client(channel);
             let req = Request::new(proto.clone());
             match client.vote(req).await {
@@ -257,7 +326,16 @@ impl RaftGrpcClient {
         let mut backoff = self.config.initial_backoff;
         let mut attempt: usize = 0;
         loop {
-            let channel = self.channel_for(peer).await?;
+            let channel = match self
+                .channel_for_attempt(peer, "PreVote", &mut attempt, &mut backoff)
+                .await?
+            {
+                Some(ch) => ch,
+                None => continue,
+            };
+            if attempt > 0 {
+                debug!(target: "xraft_transport::client", peer = peer.0, attempt, "PreVote attempt after retry");
+            }
             let mut client = self.typed_client(channel);
             let req = Request::new(proto.clone());
             match client.pre_vote(req).await {
@@ -286,7 +364,16 @@ impl RaftGrpcClient {
         let mut backoff = self.config.initial_backoff;
         let mut attempt: usize = 0;
         loop {
-            let channel = self.channel_for(peer).await?;
+            let channel = match self
+                .channel_for_attempt(peer, "Fetch", &mut attempt, &mut backoff)
+                .await?
+            {
+                Some(ch) => ch,
+                None => continue,
+            };
+            if attempt > 0 {
+                debug!(target: "xraft_transport::client", peer = peer.0, attempt, "Fetch attempt after retry");
+            }
             let mut client = self.typed_client(channel);
             let req = Request::new(proto.clone());
             match client.fetch(req).await {
@@ -331,7 +418,16 @@ impl RaftGrpcClient {
         let mut backoff = self.config.initial_backoff;
         let mut attempt: usize = 0;
         let stream = loop {
-            let channel = self.channel_for(peer).await?;
+            let channel = match self
+                .channel_for_attempt(peer, "FetchSnapshot", &mut attempt, &mut backoff)
+                .await?
+            {
+                Some(ch) => ch,
+                None => continue,
+            };
+            if attempt > 0 {
+                debug!(target: "xraft_transport::client", peer = peer.0, attempt, "FetchSnapshot attempt after retry");
+            }
             let mut client = self.typed_client(channel);
             let req = Request::new(proto.clone());
             match client.fetch_snapshot(req).await {
@@ -404,5 +500,29 @@ mod tests {
         // the (degenerate) [0, 0] range.
         let d = jittered_sleep_duration(Duration::ZERO);
         assert_eq!(d, Duration::ZERO);
+    }
+
+    #[test]
+    fn channel_error_misconfigured_propagates_inner_error() {
+        let inner = XRaftError::Transport("invalid peer URL 'bad': parse error".to_string());
+        let err: XRaftError = ChannelError::Misconfigured(inner).into();
+        match err {
+            XRaftError::Transport(msg) => {
+                assert!(msg.contains("invalid peer URL"), "got: {msg}");
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_error_connect_wraps_message_in_transport() {
+        let err: XRaftError = ChannelError::Connect("connect to peer 7: refused".to_string()).into();
+        match err {
+            XRaftError::Transport(msg) => {
+                assert!(msg.contains("connect to peer 7"), "got: {msg}");
+                assert!(msg.contains("refused"), "got: {msg}");
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
     }
 }
