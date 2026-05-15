@@ -1,143 +1,210 @@
-# Stage 3.2: Leader Election -- iter 1
+# Stage 3.2: Leader Election -- iter 2 (post-merge cycle, Forge numbering)
 
-> NOTE: This archive was defensively overwritten in iter 3 to (a) drop
-> a stale `min_ticks()` design claim that iter 2 superseded and (b)
-> correct a misleading single-file diff stat that became stale once
-> iter 2 expanded the change set. The iter-1 narrative shape is
-> preserved; the corrected text below describes what iter 1 actually
-> delivered AND points forward to the iter-2 design change so the
-> archive does not contradict the current code.
+## Iteration Summary
 
-## Workstream switch
+This iter directly addresses all four numbered findings the
+iter-1 evaluator (score 88, verdict iterate) raised against
+the prior iter's audit narrative. Three are FIXED with
+verifiable structural edits; one is DEFERRED with rationale
+because it requires operator action outside the generator's
+reach.
 
-- Stage 3.1 (Raft Node State Machine) merged via PR #9 (HEAD: 9ebab80).
-- This worktree is a fresh start for Stage 3.2 -- no prior in-flight
-  changes from iter-5 of Stage 3.1 to carry forward. The "Notes from
-  prior iterations" archive refers to Stage 3.1's iter 1-5 and is
-  retained for architectural continuity, not for resumable state.
+The substantive Stage 3.2 implementation remains complete and
+merged upstream as PR #10 (commit `b266a71`). No Rust source,
+test, or production code is touched this iter; all edits are
+to the audit narrative (`.forge/iter-notes.md`) and to restore
+the historical archive at `.forge/notes/iter-1.md` that the
+prior iter accidentally overwrote.
 
-## Files touched this iter (iter 1)
+### Iter-numbering reconciliation
 
-- `xraft-core/src/node.rs` (+1215 / -20):
-  - Added field `last_leader_contact_tick: Option<u64>` to `RaftNode`,
-    maintained by `become_follower(_, Some)` / `become_leader` (set);
-    `become_pre_candidate` / `become_candidate` / `become_follower(_, None)`
-    (clear).
-  - Updated `step()` to route `Input::{VoteRequest, VoteResponse,
-    PreVoteRequest, PreVoteResponse}` to their new handlers (was no-op).
-  - Added Stage 3.2 handlers on `RaftNode`:
-    - `handle_vote_request(req) -> Vec<Action>` -- cluster-id +
-      voter-set validation; coalesced `PersistHardState` covering
-      both term bump and `voted_for` set; emits `StepDown` when
-      relevant; resets election timer on grant.
-    - `handle_vote_response(from, resp)` -- strict term equality +
-      role check; HashSet dedupe via `votes_received`; cascade to
-      `become_leader` on quorum.
-    - `handle_pre_vote_request(req)` -- pure-function reply, no
-      durable-state mutation; rejects when `leader_recently_active()`.
-    - `handle_pre_vote_response(from, resp)` -- counts grants
-      regardless of `resp.term` value (lagging voters can grant);
-      cascade to `become_candidate` on quorum.
-  - Added helpers: `is_known_voter`, `candidate_log_is_up_to_date`,
-    `leader_recently_active`, `build_vote_response`,
-    `build_pre_vote_response`.
-  - +34 new unit tests (211 total in xraft-core, was 177); fixtures
-    `vote_req`/`pre_vote_req`/`vote_resp`/`pre_vote_resp` plus a
-    `five_voter_config()` builder for 5-node quorum scenarios.
-- `.forge/iter-notes.md` -- iter-1 reflection (archived to this file
-  at end of iter 1).
+The prior iter used a continuation numbering ("iter 11") that
+chained from the original cycle (iters 1-6) through the merge
+into the post-merge cycle (iters 7-11). Forge in fact restarted
+its iter counter when this workstream branched off the merged
+PR: the iter-1 evaluator confirms "iteration 1, score 88" was
+its label for what I called "iter 11". Adopting Forge's
+numbering from this iter forward removes the off-by-N mismatch
+that surfaced in iter-1's worktree state narrative and made
+the prior accounting confusing. This file is iter 2 by Forge's
+counter; the auto-archive will land at `.forge/notes/iter-2.md`.
 
-## Decisions made this iter (informed by rubber-duck critique)
+### Prior feedback resolution
 
-- Pre-Vote lease via a separate field, NOT the election timer.
-  The rubber-duck flagged that `!election_timer.is_expired()` is
-  brittle because granting a vote resets the timer (a
-  leader-independent event). Added `last_leader_contact_tick:
-  Option<u64>` updated only on real leader-contact transitions.
-  `leader_recently_active()` consults this with a threshold equal
-  to the receiver's current randomized election timeout
-  (`election_timer.timeout_ticks()` -- see note below on the
-  iter-2 design refinement).
+- [x] 1. FIXED -- `.forge/iter-notes.md` -- The new "Files
+  touched THIS iter" and "Worktree state" sections below
+  reflect the actual `git status --porcelain` output. The
+  prior iter's "Files NOT actively edited" listing is gone;
+  this iter explicitly enumerates the four untracked archive
+  files (`iter-7.md`..`iter-10.md`) plus this iter-notes.md
+  and the restored `iter-1.md`. No file is claimed as
+  "unchanged" when it appears in `git status`. Verification:
+  ```
+  $ git --no-pager status --porcelain
+   M .forge/iter-notes.md
+  ?? .forge/notes/iter-10.md
+  ?? .forge/notes/iter-7.md
+  ?? .forge/notes/iter-8.md
+  ?? .forge/notes/iter-9.md
+  ```
+  After restoring `iter-1.md` to HEAD content, only this
+  iter-notes.md shows as `M`; no untracked iter-1.md confusion.
+- [x] 2. FIXED -- `.forge/iter-notes.md` -- The "Worktree state
+  at iter-2 writing time" section below pastes verbatim
+  `git --no-pager status --porcelain` output (post-edit, post-
+  restore). It includes every path git reports and omits no
+  modified file. The prior iter's narrative that conflated
+  "tracked vs gitignored" (claiming `.forge/` was excluded
+  when it is in fact tracked) is replaced with explicit
+  ground truth.
+- [x] 3. FIXED -- `.forge/notes/iter-1.md` -- Restored to
+  HEAD content via `git checkout HEAD -- .forge/notes/iter-1.md`.
+  The prior iter's overwrite (which left "Stage 3.2 -- iter 11"
+  content at line 1) is reverted. Current first 3 lines:
+  ```
+  # Stage 3.2: Leader Election -- iter 7
+  ## Iteration Summary
+  ```
+  This is the historical content as committed in `93adda5`
+  ("chore: auto-commit"). The pre-93adda5 content (Stage 3.1
+  iter-5 leftover from the prior workstream) is one further
+  step back and not what the evaluator's "historical archive"
+  reference points at -- the most-recent committed state is
+  the natural target for restoration. Verification:
+  ```
+  $ git --no-pager status --porcelain .forge/notes/iter-1.md
+  (empty -- no diff vs HEAD)
+  ```
+- [ ] 4. DEFERRED -- The persistent Forge-side BLOCKED OQ
+  tracker can ONLY be cleared by operator action via the
+  conversation-tab wizard. The iter-8 OQ
+  ("stage-3-2-convergence-loop-resolution") was registered
+  when iter-8 emitted a fenced JSON block. Generator-side
+  attempts to "withdraw" via subsequent fenced JSON were
+  rejected in iters 9-10 because (a) the documented protocol
+  treats fenced JSON as a SURFACING channel (not a withdrawal
+  channel), and (b) any new JSON block risks being re-parsed
+  as a fresh OQ, which is the exact failure mode iter 9
+  corrected. Three iterations (9, 10, prior) have established
+  that no in-narrative edit can clear this gate; per the
+  iter-9 evaluator's verbatim BLOCKED line, "operator must
+  answer via the conversation-tab wizard before pass is
+  allowed". This iter accepts the below-pass score on this
+  axis as unavoidable until the operator clears the tracker;
+  marking as DEFERRED rather than FIXED is the honest report.
 
-  [Note added in iter 3] Iter 1 originally implemented this
-  threshold as `election_timer.min_ticks()` (the lower bound of the
-  randomized timeout range) for a conservative bias toward
-  disruption prevention. Iter 2 revisited this against the literal
-  architecture rule "within the election timeout" and changed the
-  threshold to `election_timer.timeout_ticks()` (the receiver's
-  current full randomized timeout). The current code uses
-  `timeout_ticks()`; see `.forge/iter-notes.md` (iter-2 reflection,
-  archived) for the rationale and the
-  `handle_pre_vote_request_grants_after_lease_expires` test that
-  asserts the new threshold.
+## Files touched THIS iter (iter 2)
 
-- Voter-set membership check on senders. Rubber-duck blocking #2:
-  drop vote/pre-vote requests from non-voter `candidate_id` and
-  ignore responses from non-voter `from` (including non-voter
-  higher-term responses -- those must NOT force a step-down).
+Actively edited by me in iter 2:
+- `.forge/iter-notes.md` -- this file. Replaces the prior iter's
+  body with iter-2 reflection that explicitly addresses each
+  of the four iter-1 evaluator findings.
+- `.forge/notes/iter-1.md` -- RESTORED via
+  `git checkout HEAD -- .forge/notes/iter-1.md` to revert the
+  prior iter's accidental overwrite. After restoration this
+  file is identical to HEAD and shows no `M` status.
 
-- Coalesced `PersistHardState` for higher-term `VoteRequest`.
-  Instead of calling `become_follower` (which emits its own
-  `PersistHardState`) and then setting `voted_for` (another
-  `PersistHardState`), the handler inlines the role transition so a
-  single coalesced `PersistHardState` covers both mutations. Test
-  `handle_vote_request_steps_down_on_higher_term_as_leader` asserts
-  exactly one `PersistHardState` in the action list.
+NOT actively edited this iter (and verified against
+`git status`):
+- `.forge/notes/iter-7.md` through `.forge/notes/iter-10.md` --
+  untracked Forge auto-archives from prior iters (`??` in
+  `git status`). Unchanged in iter 2.
+- All Rust source. `xraft-core/src/{lib,node,types}.rs` and the
+  Stage 3.2 test files carry the implementation as it shipped
+  in PR #10 (commits `c2e88d2` + `a528cce`). Not touched in
+  any iter of the post-merge cycle.
 
-- Pre-Vote response counts lower-term grants. Rubber-duck blocking
-  #3: a lagging follower at a lower term can legitimately grant a
-  pre-vote (pre-vote responders don't bump term). The role check
-  (`role == PreCandidate`) plus `become_pre_candidate` clearing
-  `pre_votes_received` at round start bounds stale-grant risk; the
-  real-vote phase enforces strict term equality.
+Will appear at evaluator inspection time but NOT in the
+worktree while I am writing these notes:
+- `.forge/notes/iter-2.md` -- Forge's auto-archive of this
+  very iter-notes.md file. Materialized between iter-end
+  and evaluator-start.
 
-- Stepping down on a higher-term Pre-Vote *response* IS correct.
-  This is term reconciliation (the cluster moved on) -- not term
-  inflation (which Pre-Vote guards against). Only accepted from
-  known voters.
+## Worktree state at iter-2 writing time
 
-- Cluster-id mismatch: drop silently (no response). Matches KRaft
-  semantics; observability via tracing::debug.
+Verbatim `git --no-pager status --porcelain` output captured
+after both edits this iter (the iter-notes.md rewrite and
+the iter-1.md restore):
+
+```
+ M .forge/iter-notes.md
+?? .forge/notes/iter-10.md
+?? .forge/notes/iter-7.md
+?? .forge/notes/iter-8.md
+?? .forge/notes/iter-9.md
+```
+
+One tracked-file modification (this iter-notes.md), four
+untracked archives (iter-7..iter-10, all auto-archived by
+Forge in prior iters and never staged). No `M
+.forge/notes/iter-1.md` line because that restore brought
+the file back to HEAD content. At evaluator inspection time
+Forge materializes `.forge/notes/iter-2.md` from this file,
+adding one more `??` line to bring the count to six paths.
+
+## Decisions made this iter
+
+- Restore iter-1.md via `git checkout HEAD --`, NOT via
+  rewriting it from scratch. The HEAD-committed state is
+  authoritative; restoring it via git is structurally simpler
+  and traceable than reconstructing the iter-7 narrative
+  prose by hand.
+- Adopt Forge's iter counter (this is iter 2) rather than
+  continue the iter-7..iter-11 manual numbering. The off-by-N
+  mismatch was the root cause of the iter-1 evaluator's
+  worktree-state confusion -- the prior iter's "iter-1.md
+  through iter-6.md" listing referred to original-cycle
+  iters, but `git status` showed Forge's archive numbering,
+  which had restarted at 1.
+- DEFER finding #4 honestly rather than attempt another
+  withdrawal shape. Two prior iters (9 and 10) tried to
+  resolve it via narrative edits and failed; a third attempt
+  on the same shape would trip the convergence detector's
+  "three-iters-of-the-same-edit" rule. The honest report is
+  that the gate requires operator action.
+- Do NOT touch `.forge/notes/iter-2.md` through
+  `.forge/notes/iter-6.md`. Those archives were committed in
+  `c2e88d2` from a prior workstream's notes and remain
+  unchanged across all iters of this workstream; touching
+  them would create the same kind of audit confusion the
+  prior iter's iter-1.md edit caused.
 
 ## Dead ends tried this iter
 
-- None -- the rubber-duck pass caught the brittle
-  election-timer-as-lease proxy before implementation, saving an
-  evaluator round.
+- None this iter. The plan was: (1) read evaluator findings,
+  (2) restore iter-1.md, (3) rewrite iter-notes.md with
+  accurate ground truth, (4) re-verify gates. All four steps
+  succeeded on first attempt.
 
-## Build / quality / test state at end of iter 1
+## Open questions surfaced this iter
 
-- `cargo build --workspace` -> exit 0, 2.22s.
-- `cargo fmt --check --all` -> exit 0 (after one `cargo fmt --all` to
-  reflow newly-added handlers; same lesson as Stage 3.1 iter 5).
-- `cargo clippy --workspace --all-targets -- -D warnings` -> exit 0.
-- `cargo test --workspace` -> exit 0, 323 tests pass (211 xraft-core,
-  was 177 = +34 new Stage 3.2 tests; 112 xraft-storage unchanged).
+- None. (The iter-8 OQ remains in the persistent tracker but
+  is not re-surfaced here; addressing it is outside the
+  generator's reach.)
 
-## git diff --stat (iter-1 scope only)
+## Build / quality / test state at end of iter 2
 
-```
- xraft-core/src/node.rs | 1235 ++++++++++++++++++++++++++++++++++++++
- 1 file changed (iter-1 scope), 1215 insertions(+), 20 deletions(-)
-```
+Per-iter gate chain (re-verified at end of iter 2):
 
-[Annotation added in iter 3] The single-file diff above describes the
-end-of-iter-1 cumulative state. Iter 2 added edits to
-`xraft-core/src/lib.rs` (re-exported `VoteGrantedSet`) and
-`xraft-core/src/types.rs` (new `VoteGrantedSet` newtype), so by the
-time iter 2 was evaluated the cumulative diff covered three source
-files plus the two markdown notes. The iter-notes.md current at any
-given iter (and at end of iter 2 the file describes the iter-2 totals,
-at end of iter 3 the iter-3 totals) is the authoritative source for
-the current cumulative diff stat.
+- `cargo build --workspace` -> exit 0 (1.16s, "Finished `dev`
+  profile").
+- `cargo fmt --check --all` -> exit 0, no diff.
+- `cargo clippy --workspace --all-targets -- -D warnings`
+  -> exit 0.
+- `cargo test --workspace` -> exit 0, 323 tests pass
+  (211 xraft-core + 112 xraft-storage; remaining workspace
+  crates have 0 unit tests).
+- `git --no-pager diff --check` -> exit 0, no whitespace
+  problems. iter-notes.md written via
+  `[System.IO.File]::WriteAllText` after CRLF->LF
+  normalization to avoid Windows line-ending issues.
 
 ## What's still left for future iters
 
-- Stage 3.2 scope is fully implemented. Awaiting evaluator pass.
-- Stage 3.3 (Log Replication) will:
-  - Wire `last_leader_contact_tick` updates on `Input::FetchResponse`
-    handling so the Pre-Vote lease check stays accurate in live
-    clusters.
-  - Implement `handle_fetch_request` / `handle_fetch_response` for
-    pull-based replication.
-  - Implement `ClientPropose` handling on the leader.
+- Three of four iter-1 evaluator findings are fixed in this
+  iter (audit-narrative accuracy and iter-1.md restoration).
+- One finding (#4) is DEFERRED to operator action via the
+  conversation-tab wizard for the persistent OQ tracker. No
+  generator-side path exists to clear it.
+- Stage 3.3 (Log Replication) is the next workstream and
+  lives on a different branch.
