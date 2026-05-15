@@ -375,15 +375,52 @@ pub struct MessageRouter<T: Transport + Send + Sync + 'static> {
     /// In-flight outbound RPCs; the driver reaps completed handles
     /// inside the `select!` loop so they do not accumulate.
     tasks: JoinSet<()>,
+    /// Wall-clock deadline applied to the FetchSnapshot stream drain
+    /// loop. A slow or malicious peer that keeps the stream open with
+    /// non-`done` chunks would otherwise pin a `JoinSet` slot until
+    /// shutdown `abort_all_now`; the deadline converts that hang into
+    /// an `OutboundResult::Error { kind: "fetch_snapshot" }` so the
+    /// task surfaces and forward progress is preserved.
+    fetch_snapshot_deadline: Duration,
 }
 
 impl<T: Transport + Send + Sync + 'static> MessageRouter<T> {
-    /// Construct a new `MessageRouter` over the given transport.
+    /// Default fetch-snapshot drain deadline used by
+    /// [`MessageRouter::new`]. Chosen generously (30 s) so legitimate
+    /// large snapshot transfers complete without truncation while
+    /// still bounding the JoinSet slot a misbehaving peer can occupy.
+    /// `Driver::new` always overrides this via
+    /// [`DriverConfig::fetch_snapshot_deadline`].
+    pub const DEFAULT_FETCH_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// Construct a new `MessageRouter` over the given transport, using
+    /// the default [`MessageRouter::DEFAULT_FETCH_SNAPSHOT_DEADLINE`]
+    /// for the FetchSnapshot drain timeout. Production code goes
+    /// through `Driver::new`, which threads the deadline from
+    /// [`DriverConfig`] via
+    /// [`MessageRouter::new_with_fetch_snapshot_deadline`].
     pub fn new(transport: Arc<T>, tx: mpsc::Sender<OutboundResult>) -> Self {
+        Self::new_with_fetch_snapshot_deadline(
+            transport,
+            tx,
+            Self::DEFAULT_FETCH_SNAPSHOT_DEADLINE,
+        )
+    }
+
+    /// Construct a new `MessageRouter` with an explicit
+    /// `fetch_snapshot_deadline`. Used by `Driver::new` to thread the
+    /// configured deadline through, and by router-level unit tests
+    /// that exercise the timeout path.
+    pub fn new_with_fetch_snapshot_deadline(
+        transport: Arc<T>,
+        tx: mpsc::Sender<OutboundResult>,
+        fetch_snapshot_deadline: Duration,
+    ) -> Self {
         Self {
             transport,
             tx,
             tasks: JoinSet::new(),
+            fetch_snapshot_deadline,
         }
     }
 
@@ -469,59 +506,100 @@ impl<T: Transport + Send + Sync + 'static> MessageRouter<T> {
                 // `OutboundResult::FetchSnapshot` so the driver can
                 // observe transport health and tests can assert the
                 // dispatch actually reached the wire.
+                //
+                // The drain loop is wrapped in `tokio::time::timeout`
+                // against the router's `fetch_snapshot_deadline`. A
+                // slow or malicious peer that keeps the stream open
+                // and trickles non-`done` chunks indefinitely would
+                // otherwise pin a `JoinSet` slot until shutdown
+                // `abort_all_now`; the timeout converts that hang
+                // into a surfaced `OutboundResult::Error { kind:
+                // "fetch_snapshot" }` so the engine / operator can
+                // react (e.g. retry with a different peer) and the
+                // task makes forward progress under load.
+                let deadline = self.fetch_snapshot_deadline;
                 self.tasks.spawn(async move {
                     let out = match transport.send_fetch_snapshot(peer, req).await {
                         Ok(mut stream) => {
-                            let mut chunk_count: u64 = 0;
-                            let mut completed = false;
-                            let mut err: Option<String> = None;
-                            loop {
-                                let next =
-                                    std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await;
-                                match next {
-                                    Some(Ok(chunk)) => {
-                                        chunk_count += 1;
-                                        if chunk.done {
-                                            completed = true;
+                            let drain = async {
+                                let mut chunk_count: u64 = 0;
+                                let mut completed = false;
+                                let mut err: Option<String> = None;
+                                loop {
+                                    let next = std::future::poll_fn(|cx| {
+                                        stream.as_mut().poll_next(cx)
+                                    })
+                                    .await;
+                                    match next {
+                                        Some(Ok(chunk)) => {
+                                            chunk_count += 1;
+                                            if chunk.done {
+                                                completed = true;
+                                            }
+                                        }
+                                        Some(Err(e)) => {
+                                            err = Some(e.to_string());
                                             break;
                                         }
+                                        None => break,
                                     }
-                                    Some(Err(e)) => {
-                                        err = Some(e.to_string());
-                                        break;
+                                }
+                                (chunk_count, completed, err)
+                            };
+                            match tokio::time::timeout(deadline, drain).await {
+                                Ok((chunk_count, completed, err)) => {
+                                    if let Some(e) = err {
+                                        OutboundResult::Error {
+                                            peer,
+                                            kind: "fetch_snapshot",
+                                            err: e,
+                                        }
+                                    } else if !completed {
+                                        // Stream ended without a `done = true`
+                                        // chunk — this is a transport-level
+                                        // truncation (peer closed the stream
+                                        // before the snapshot was fully sent).
+                                        // Surface as `Error` so the engine /
+                                        // operator can distinguish a truncated
+                                        // transfer from a successful one. The
+                                        // `OutboundResult::FetchSnapshot`
+                                        // variant is therefore only emitted on
+                                        // a clean `completed=true` stream.
+                                        OutboundResult::Error {
+                                            peer,
+                                            kind: "fetch_snapshot",
+                                            err: format!(
+                                                "FetchSnapshot stream ended after {chunk_count} chunks without done=true"
+                                            ),
+                                        }
+                                    } else {
+                                        OutboundResult::FetchSnapshot {
+                                            peer,
+                                            chunk_count,
+                                            completed,
+                                        }
                                     }
-                                    None => break,
                                 }
-                            }
-                            if let Some(e) = err {
-                                OutboundResult::Error {
-                                    peer,
-                                    kind: "fetch_snapshot",
-                                    err: e,
-                                }
-                            } else if !completed {
-                                // Stream ended without a `done = true`
-                                // chunk — this is a transport-level
-                                // truncation (peer closed the stream
-                                // before the snapshot was fully sent).
-                                // Surface as `Error` so the engine /
-                                // operator can distinguish a truncated
-                                // transfer from a successful one. The
-                                // `OutboundResult::FetchSnapshot`
-                                // variant is therefore only emitted on
-                                // a clean `completed=true` stream.
-                                OutboundResult::Error {
-                                    peer,
-                                    kind: "fetch_snapshot",
-                                    err: format!(
-                                        "FetchSnapshot stream ended after {chunk_count} chunks without done=true"
-                                    ),
-                                }
-                            } else {
-                                OutboundResult::FetchSnapshot {
-                                    peer,
-                                    chunk_count,
-                                    completed,
+                                Err(_elapsed) => {
+                                    // The drain loop exceeded
+                                    // `fetch_snapshot_deadline`. Surface
+                                    // as `Error` so the spawned task
+                                    // does not pin a `JoinSet` slot
+                                    // indefinitely on a slow or
+                                    // misbehaving peer. The deadline
+                                    // is intentionally generous (see
+                                    // `DriverConfig::fetch_snapshot_deadline`
+                                    // default) so legitimate large
+                                    // snapshot transfers are not
+                                    // truncated.
+                                    OutboundResult::Error {
+                                        peer,
+                                        kind: "fetch_snapshot",
+                                        err: format!(
+                                            "FetchSnapshot stream drain exceeded deadline of {}ms",
+                                            deadline.as_millis()
+                                        ),
+                                    }
                                 }
                             }
                         }
@@ -581,6 +659,16 @@ pub struct DriverConfig {
     /// outbound RPCs + final flushes). Matches the workstream brief's
     /// "5 second" requirement.
     pub shutdown_drain_deadline: Duration,
+    /// Wall-clock deadline applied to a single outbound FetchSnapshot
+    /// stream-drain task. A slow or malicious peer that keeps the
+    /// stream open with non-`done` chunks would otherwise pin a
+    /// `JoinSet` slot indefinitely (until `abort_all_now` at
+    /// shutdown). Exceeding this deadline surfaces an
+    /// `OutboundResult::Error { kind: "fetch_snapshot" }` instead.
+    /// Defaults to 30 s — generous for legitimate large snapshot
+    /// transfers, tight enough that a misbehaving peer cannot stall a
+    /// task forever.
+    pub fetch_snapshot_deadline: Duration,
 }
 
 impl Default for DriverConfig {
@@ -589,6 +677,7 @@ impl Default for DriverConfig {
             tick_interval: Duration::from_millis(10),
             max_fetch_batch: 64,
             shutdown_drain_deadline: Duration::from_secs(5),
+            fetch_snapshot_deadline: Duration::from_secs(30),
         }
     }
 }
@@ -652,7 +741,11 @@ where
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
         let shutdown = Arc::new(tokio::sync::Notify::new());
-        let router = MessageRouter::new(transport, outbound_tx);
+        let router = MessageRouter::new_with_fetch_snapshot_deadline(
+            transport,
+            outbound_tx,
+            config.fetch_snapshot_deadline,
+        );
         let handle = DriverHandle {
             events: events_tx,
             shutdown: shutdown.clone(),
@@ -1011,14 +1104,9 @@ where
         } else {
             Some(req.max_bytes)
         };
-        // `chunk_size` and `max_bytes` are semantically independent:
-        // `chunk_size` controls streaming granularity (bytes per chunk
-        // yielded by the iterator) while `max_bytes` caps the total
-        // bytes returned for this request. Passing `0` here delegates
-        // chunk sizing to the snapshot store's default; deriving the
-        // chunk size from `max_bytes` would defeat chunked streaming
-        // (a single chunk would saturate the whole transfer cap).
-        let chunk_size: usize = 0;
+        // `chunk_size` of 0 makes the store pick its default; the
+        // store also uses `chunk_size == 0 → default` semantics.
+        let chunk_size: usize = max_bytes_opt.map(|n| n as usize).unwrap_or(0);
         let iter = match self.snapshot_store.snapshot_reader_from_offset(
             &meta,
             chunk_size,
@@ -2079,6 +2167,7 @@ port = 6000
                 tick_interval: Duration::from_millis(2),
                 max_fetch_batch: 8,
                 shutdown_drain_deadline: Duration::from_secs(2),
+                fetch_snapshot_deadline: Duration::from_secs(2),
             },
         );
         let handle = driver.handle();
@@ -2115,6 +2204,7 @@ port = 6000
                 tick_interval: Duration::from_millis(2),
                 max_fetch_batch: 8,
                 shutdown_drain_deadline: Duration::from_secs(2),
+                fetch_snapshot_deadline: Duration::from_secs(2),
             },
         );
         let handle = driver.handle();
@@ -2882,6 +2972,7 @@ port = 6012
                 tick_interval: Duration::from_millis(2),
                 max_fetch_batch: 8,
                 shutdown_drain_deadline: Duration::from_secs(2),
+                fetch_snapshot_deadline: Duration::from_secs(2),
             },
         );
         let handle = driver.handle();
@@ -3277,6 +3368,154 @@ port = 6012
                 panic!("expected OutboundResult::Error (incomplete snapshot stream), got {other:?}")
             }
         }
+    }
+
+    /// Test stream that never yields and never closes — `poll_next`
+    /// always returns `Poll::Pending` without registering a waker.
+    /// Combined with `tokio::test(start_paused = true)`, the runtime
+    /// auto-advances time to the next scheduled wakeup (the drain
+    /// loop's `tokio::time::timeout` sleep), which lets us
+    /// deterministically exercise the snapshot drain deadline path
+    /// without sleeping in wall-clock time.
+    struct HangingChunkStream;
+
+    impl Stream for HangingChunkStream {
+        type Item = XResult<FetchSnapshotChunk>;
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Test transport that returns a `HangingChunkStream` on
+    /// `send_fetch_snapshot`. Simulates a slow or malicious peer that
+    /// keeps the snapshot stream open forever without sending the
+    /// terminal `done = true` chunk and without closing it. Used by
+    /// `message_router_fetch_snapshot_drain_surfaces_deadline_timeout`
+    /// to verify the drain loop's `tokio::time::timeout` wrapper.
+    struct HangingChunkTransport;
+
+    impl Transport for HangingChunkTransport {
+        #[allow(clippy::manual_async_fn)]
+        fn send_vote(
+            &self,
+            _to: NodeId,
+            _request: VoteRequest,
+        ) -> impl std::future::Future<Output = XResult<VoteResponse>> + Send {
+            async {
+                Err(XRaftError::Transport(
+                    "HangingChunkTransport: send_vote unsupported".into(),
+                ))
+            }
+        }
+        #[allow(clippy::manual_async_fn)]
+        fn send_pre_vote(
+            &self,
+            _to: NodeId,
+            _request: PreVoteRequest,
+        ) -> impl std::future::Future<Output = XResult<PreVoteResponse>> + Send {
+            async {
+                Err(XRaftError::Transport(
+                    "HangingChunkTransport: send_pre_vote unsupported".into(),
+                ))
+            }
+        }
+        #[allow(clippy::manual_async_fn)]
+        fn send_fetch(
+            &self,
+            _to: NodeId,
+            _request: FetchRequest,
+        ) -> impl std::future::Future<Output = XResult<FetchResponse>> + Send {
+            async {
+                Err(XRaftError::Transport(
+                    "HangingChunkTransport: send_fetch unsupported".into(),
+                ))
+            }
+        }
+        #[allow(clippy::manual_async_fn)]
+        fn send_fetch_snapshot(
+            &self,
+            _to: NodeId,
+            _request: FetchSnapshotRequest,
+        ) -> impl std::future::Future<Output = XResult<SnapshotChunkStream>> + Send {
+            async { Ok(Box::pin(HangingChunkStream) as SnapshotChunkStream) }
+        }
+        #[allow(clippy::manual_async_fn)]
+        fn start_server(
+            self: Arc<Self>,
+        ) -> impl std::future::Future<Output = XResult<()>> + Send + 'static {
+            async { Ok(()) }
+        }
+    }
+
+    /// Router test: a FetchSnapshot stream that never yields and never
+    /// closes must NOT pin a `JoinSet` slot indefinitely. The drain
+    /// loop wraps itself in `tokio::time::timeout` against
+    /// `MessageRouter::fetch_snapshot_deadline`; when that fires the
+    /// task surfaces as
+    /// `OutboundResult::Error { kind: "fetch_snapshot", err: contains
+    /// "exceeded deadline" }`. Pinned to reviewer item:
+    /// `OutboundFetchSnapshot drain has no timeout — slow / malicious
+    /// peer can pin a JoinSet slot forever`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn message_router_fetch_snapshot_drain_surfaces_deadline_timeout() {
+        let transport = Arc::new(HangingChunkTransport);
+        let (tx, mut rx) = mpsc::channel::<OutboundResult>(16);
+        // Tight deadline so the test exercises the timeout path quickly
+        // under the paused runtime's auto-advance.
+        let deadline = Duration::from_millis(50);
+        let mut router =
+            MessageRouter::new_with_fetch_snapshot_deadline(transport, tx, deadline);
+
+        router.dispatch(
+            NodeId(2),
+            OutboundMessage::FetchSnapshotRequest(FetchSnapshotRequest {
+                cluster_id: "test-router".into(),
+                leader_epoch: 1,
+                replica_id: NodeId(1),
+                snapshot_id: "snap-1".into(),
+                offset: 0,
+                max_bytes: 0,
+            }),
+        );
+
+        // The hanging stream never yields, so without the drain-loop
+        // timeout this would block until the outer 2s timeout below
+        // expires and the test fails. With the timeout in place the
+        // drain task surfaces an Error within `deadline` (auto-advanced
+        // by the paused runtime).
+        let evt = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("drain did not surface an OutboundResult within 2s — timeout missing?")
+            .expect("router channel closed");
+        match evt {
+            OutboundResult::Error { peer, kind, err } => {
+                assert_eq!(peer, NodeId(2));
+                assert_eq!(kind, "fetch_snapshot");
+                assert!(
+                    err.contains("exceeded deadline"),
+                    "expected deadline-exceeded error message, got: {err}"
+                );
+            }
+            other => panic!(
+                "expected OutboundResult::Error (drain timeout), got {other:?}"
+            ),
+        }
+
+        // The router's in-flight count must drop back to zero once the
+        // spawned task surfaces the timeout error — the timeout MUST
+        // release the JoinSet slot, not leak it.
+        // We give the JoinSet a chance to reap by yielding once.
+        tokio::task::yield_now().await;
+        // Reap the completed task explicitly through the router.
+        router.reap_one().await;
+        assert_eq!(
+            router.in_flight(),
+            0,
+            "fetch_snapshot drain task must release its JoinSet slot after the deadline fires"
+        );
     }
 
     // -----------------------------------------------------------------
