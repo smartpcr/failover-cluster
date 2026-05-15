@@ -3,254 +3,284 @@
 **Story / Stage:** `failover-cluster:XRAFT` Stage 2.1 (per
 `docs/stories/failover-cluster-XRAFT/implementation-plan.md`).
 
-**Goal:** Deliver a durable, append-only Raft log (`LogStore` trait + a file-
-backed `FileLogStore` implementation) that survives crash, supports the
-truncate-after-conflict pattern Raft requires, and offers O(1) random reads via
-an offset index — not a full in-memory entry cache.
+**Goal:** A durable, append-only Raft log that survives crash, supports the
+truncate-after-conflict pattern Raft requires, and serves random reads in
+constant time via an offset index — **never** by caching every entry payload
+in RAM.
 
-This plan is the design contract the coding pipeline implements. It deliberately
-nails down the on-disk format, header, and durability rules so the
-implementation cannot drift from the architecture/spec contracts. The previous
-WAL iteration scored 81 because of five specific contract drifts; each is
-explicitly enforced below (see "Prior-iteration gaps closed").
+This document is the design contract that the implementation in
+`xraft-storage/src/log.rs`, `log_format.rs`, `log_segment.rs`, and
+`tests/log_corruption.rs` is built against. Every contract here is exercised
+by at least one test.
 
 ## Architectural context
 
-Per `architecture.md` §4.1, *all* trait definitions live in `xraft-core` so
-`xraft-storage` and `xraft-transport` can implement them without circular
-dependencies. The Raft state machine in `xraft-core` calls into `LogStore` via
-trait objects; it never sees file paths or segments. That separation also lets
-`xraft-test` swap in a `MemoryLogStore` for deterministic simulation.
+Per `architecture.md` §4.1 the `LogStore` trait lives in `xraft-core` so
+that `xraft-storage` and `xraft-transport` can implement it without
+circular dependencies. The trait is **synchronous** and operates on
+`&[Entry]` / borrowed references to keep call sites cheap and to leave
+async batching to a higher layer:
 
-The on-disk format is fixed at v1 by this stage; a header `magic + version` byte
-is the single forward-compatibility seam. Version bumps in later phases can
-land a parallel reader without breaking v1 segments.
+```rust
+// xraft-core/src/storage.rs (existing — locked by Stage 1)
+pub trait LogStore: Send + Sync {
+    fn append(&mut self, entries: &[Entry]) -> Result<()>;
+    fn get(&self, index: LogIndex) -> Result<Option<Entry>>;
+    fn get_range(&self, start: LogIndex, end: LogIndex) -> Result<Vec<Entry>>;
+    fn last_index(&self) -> LogIndex;
+    fn last_term(&self) -> Term;
+    fn truncate_from(&mut self, index: LogIndex) -> Result<()>;
+    fn term_at(&self, index: LogIndex) -> Result<Option<Term>>;
+    fn flush(&mut self) -> Result<()>;
+}
+```
+
+Errors flow through the existing `XRaftError::Storage(String)` variant
+with classifying message prefixes (`wal corrupt:`, `wal foreign file:`,
+`wal unsupported version:`, `wal non-contiguous:`). No new error
+variants are introduced; this keeps the change surface minimal and
+allows the existing snapshot-store error handling patterns to apply.
 
 ### Crate boundaries
 
-- `xraft-core/src/storage.rs` — `LogStore` trait, `LogEntry`/`EntryPayload`
-  value types, error wiring, plus a `MemoryLogStore` reference impl used by
-  unit tests and by `xraft-test`.
-- `xraft-storage/src/log.rs` — `FileLogStore` orchestration (open/recover,
-  rotation, public `LogStore` impl, offset index).
-- `xraft-storage/src/log_format.rs` — pure encode/decode of the on-disk frame
-  and the segment header. No I/O. Easily fuzzable / unit-testable.
-- `xraft-storage/src/log_segment.rs` — one `Segment` = one open file handle +
-  base index + size accounting + scan iterator.
+- `xraft-core/src/storage.rs` — `LogStore` trait (already in place).
+- `xraft-storage/src/log_format.rs` — pure encode / decode for the
+  on-disk frame and segment header. **No I/O**, fully unit-tested,
+  ready for fuzzing.
+- `xraft-storage/src/log_segment.rs` — `Segment` struct: per-segment
+  on-disk file (header + frames), `Mutex<File>` read handle for
+  pread-style random reads, atomic create via `.wal.tmp` + rename.
+- `xraft-storage/src/log.rs` — `FileLogStore` orchestration: open /
+  recover, rotation, public `LogStore` impl, offset index. Also hosts
+  `MemoryLogStore` for `xraft-test` and unit tests.
+- `xraft-storage/tests/log_corruption.rs` — integration acceptance
+  tests for every corruption-classification rule.
 
-### On-disk format (v1, frozen)
+## On-disk format (v1, frozen)
 
-**Segment header (32 bytes, written once at offset 0 when the segment is
-created):**
+### Segment header (28 bytes, written once at offset 0)
 
-```
-[magic:   4 bytes "XRWL"]   // ASCII X-Raft Write-ahead Log
-[version: u16 = 1]          // little-endian
-[flags:   u16 = 0]          // reserved
-[base_index: u64]           // first LogIndex this segment may contain
-[created_at_unix_ms: u64]   // diagnostic only
-[crc32 of the 28 bytes above: u32]
-```
-
-A foreign file (no `XRWL` magic) → recovery error, *not* silent skip. A wrong
-`version` → recovery error with explicit "unsupported segment version" message.
-
-**Frame layout (each entry, sequential after the header):**
-
-```
-[length:     u32]   // payload length = 8 + 8 + 1 + data.len()
-[term:       u64]
-[index:      u64]
-[entry_type: u8]    // 0=NoOp, 1=Command, 2=ConfigChange, 3=Snapshot
-[data:       bytes (length - 17)]
-[crc32:      u32]   // CRC32C of [length .. data] inclusive — INCLUDES length
+```text
+┌─────────┬─────────┬─────────┬───────────┬───────────────────┬───────┐
+│ magic   │ version │ flags   │ base_idx  │ created_at_unix_ms│ crc32 │
+│ "XRWL"  │ u16 LE  │ u16 LE  │ u64 LE    │ u64 LE            │ u32 LE│
+└─────────┴─────────┴─────────┴───────────┴───────────────────┴───────┘
+   4 B       2 B       2 B       8 B            8 B               4 B
 ```
 
-This matches the `[length][term][index][entry_type][data][crc32]` shape called
-out verbatim in `implementation-plan.md` Stage 2.1. The CRC explicitly covers
-the length field so that a corrupt length cannot be silently classified as
-"torn tail". Recovery rule: if a frame's CRC fails, recovery aborts with
-`StorageError::Corrupt { segment, offset }`. The only condition that legally
-truncates a tail is *short read* (file ended mid-frame after the prior frame's
-CRC verified). Anything else surfaces as corruption.
+`crc32` covers the first 24 bytes. Validation order on `decode_segment_header`:
 
-### In-memory offset index — O(1), not an entry cache
+1. **Length** — fewer than 28 bytes ⇒ `HeaderDecodeError::ShortHeader`.
+2. **Magic** — anything other than `XRWL` ⇒ `ForeignFile`.
+3. **Header CRC** — mismatch ⇒ `Corrupt(...)`.
+4. **Version** — anything other than `1` ⇒ `UnsupportedVersion(v)`.
 
-A `BTreeMap<LogIndex, OffsetRef>` where `OffsetRef = (segment_id: u64,
-byte_offset: u64, byte_len: u32)`. Roughly 28 bytes per entry, so a 10M-entry
-log uses ~280 MB index, not gigabytes of cached entry payloads.
+A foreign file is *not* silently skipped. A wrong version produces an
+explicit `wal unsupported version` error so future format upgrades can
+ship a parallel reader without bricking older nodes.
 
-`get(i)` ⇒ index lookup ⇒ `pread` on the segment file ⇒ frame decode ⇒ CRC
-check ⇒ return. No full-log `BTreeMap<LogIndex, Entry>` cache. Hot reads are
-served by the OS page cache; the WAL adds zero entry-level caching of its own.
+### Frame layout (each entry, sequential after the header)
 
-### Durability rules
+```text
+┌────────┬────────┬────────┬────────┬────────────┬────────┐
+│ length │ term   │ index  │ e_type │ data       │ crc32  │
+│ u32 LE │ u64 LE │ u64 LE │ u8     │ length-17  │ u32 LE │
+└────────┴────────┴────────┴────────┴────────────┴────────┘
+   4         8        8       1     length - 17     4
+```
 
-- `append(entries)` writes all frames, then `file.sync_data()` on the active
-  segment, then returns. A batch is durable on return — never before.
-- Segment create/delete also `fsync` the parent data directory (Unix). On
-  Windows we open the directory via `CreateFile` with `FILE_FLAG_BACKUP_SEMANTICS`
-  and `FlushFileBuffers`; if that's not viable the implementer documents the
-  fallback (file-only fsync) explicitly in the module doc comment.
-- `truncate_from(i)` rewrites the affected segment to the cut point with
-  `set_len + sync_data`, deletes any later segments, fsyncs the directory,
-  rebuilds the offset index slice, *then* returns. After return, `last_index`
-  is `i - 1` and `get(i)` is `None`.
+This is the exact `[length][term][index][entry_type][data][crc32]`
+shape called out in `implementation-plan.md` Stage 2.1.
 
-### Continuity & monotonicity invariants
+* `length` = `17 + data.len()` — size of the body that follows the
+  length field, **excluding** the trailing CRC.
+* `crc32` covers `length_bytes ++ body` — **the length field is inside
+  the CRC envelope**. A corrupted `length` cannot slip through as a
+  torn tail because either (a) the new value falls outside the sanity
+  band `[17 .. max_frame_body]` and is hard-classified as corruption, or
+  (b) it stays in band but the trailing CRC catches the mismatch and
+  is hard-classified as corruption.
+* `entry_type`: `0=NoOp`, `1=Command`, `2=ConfigChange`, `3=Snapshot`.
+  An unknown tag is hard corruption.
 
-`append(entries)` rejects with `StorageError::NonContiguousAppend` if
-`entries[0].index != last_index + 1` or if any term goes backward inside the
-batch. This catches Raft state-machine bugs at the seam.
+Total frame on disk = `length + 8` bytes.
 
----
+### Decode classification rules (the key fix vs. iter 1)
 
-## Phase 1 — Write-Ahead Log
+| Condition | Class | Behaviour |
+|---|---|---|
+| Buffer too short for length / body / CRC | `Truncated` | Last segment ⇒ trim. Earlier segments ⇒ hard fail. |
+| `length < 17` or `length > max_frame_body` | `Corrupt` | Always hard fail. |
+| Trailing CRC mismatch | `Corrupt` | Always hard fail. |
+| Unknown `entry_type` | `Corrupt` | Always hard fail. |
+| Filename `base_index` ≠ header `base_index` | hard fail | Detected during `Segment::open`. |
+| Frame `index` ≠ expected | hard fail | Continuity check during recovery. |
 
-### Stage 1.1 — `LogStore` trait surface in `xraft-core`
+`max_frame_body` defaults to `max(64 MiB, max_segment_size)`. A
+corrupted length value larger than this is *always* corruption — never
+"the writer was interrupted mid-write".
 
-Establish the trait everyone else codes against; nothing here touches disk.
+## In-memory state (no entry cache)
 
-- Add `xraft-core/src/storage.rs` defining `pub trait LogStore: Send + Sync`
-  with async methods `append(&self, entries: Vec<LogEntry>) -> Result<()>`,
-  `get(&self, index: LogIndex) -> Result<Option<LogEntry>>`, `get_range(&self,
-  start: LogIndex, end: LogIndex) -> Result<Vec<LogEntry>>`, `last_index(&self)
-  -> Result<LogIndex>`, `last_term(&self) -> Result<Term>`, `term_at(&self,
-  index: LogIndex) -> Result<Option<Term>>`, `truncate_from(&self, index:
-  LogIndex) -> Result<()>`. Add `LogEntry { index, term, payload:
-  EntryPayload }` and `EntryPayload { NoOp, Command(Bytes), ConfigChange(Bytes),
-  Snapshot(Bytes) }`. Add `StorageError` variants
-  (`Io`, `Corrupt`, `NonContiguousAppend`, `UnsupportedVersion`,
-  `ForeignFile`). **expectedFileChanges: 3** (`storage.rs`, `error.rs`,
-  `lib.rs`).
+```rust
+pub struct FileLogStore {
+    dir: PathBuf,
+    segments: Vec<Segment>,
+    active_writer: Option<File>,        // append-mode handle on the last segment
+    first_index: LogIndex,              // index of offsets[0]
+    offsets: Vec<OffsetRef>,            // dense index, true O(1) lookup
+    max_segment_size: u64,
+    max_frame_body: u32,
+}
 
-- Add `MemoryLogStore` (in-memory `Vec`-backed reference impl) plus unit tests
-  for append, get, get_range, truncate_from, term_at, and rejection of a
-  non-contiguous append. Used by `xraft-core` callers and by `xraft-test` for
-  deterministic simulation. **expectedFileChanges: 2** (`storage.rs`,
-  optional `storage_tests.rs`).
+struct OffsetRef {
+    segment_idx: usize,
+    byte_offset: u64,
+    byte_len: u32,
+    term: Term,                         // cached so term_at is O(1) without disk
+}
 
-### Stage 1.2 — On-disk format primitives in `xraft-storage`
+struct Segment {
+    path: PathBuf,
+    base_index: LogIndex,
+    bytes_written: u64,
+    reader: Mutex<File>,                // separate read handle from active_writer
+}
+```
 
-Pure encode/decode + segment header — zero I/O orchestration. Easy to fuzz.
+* **True O(1) reads.** `Vec<OffsetRef>` indexed by `i - first_index` is
+  constant-time, not the `O(log n)` of a `BTreeMap`. Memory cost is
+  bounded by the number of entries (~32 bytes each), independent of
+  payload size — a 10 M-entry log uses ~320 MiB of index, never
+  gigabytes of cached payloads.
+* **No entry cache.** `get(i)` looks up the offset, calls
+  `Segment::read_at` (locked seek + `read_exact`), and decodes the
+  frame on the fly. Hot reads are served by the OS page cache; the WAL
+  contributes zero per-payload caching.
+* **Cached term per offset.** `term_at` and `last_term` never touch
+  disk — both read directly from the offset index.
+* **`first_index` resets to 1** on full truncation and is captured from
+  the first appended entry on a fresh log, leaving room for snapshot-
+  driven log compaction in a later stage without a format change.
 
-- Add `xraft-storage/src/log_format.rs` with `encode_frame(buf, entry) ->
-  usize`, `decode_frame(bytes) -> Result<(LogEntry, usize), FrameError>`,
-  `FrameError { Truncated, BadCrc, BadLength, BadEntryType }`. Encode writes
-  the frozen `[length:u32][term:u64][index:u64][entry_type:u8][data][crc32:u32]`
-  layout; decode validates CRC over `length..data` so a corrupt `length` does
-  not slip through as a short tail. Inline unit tests for round-trip,
-  CRC-mismatch, single-byte-flip in length, and unknown entry type.
-  **expectedFileChanges: 2** (`log_format.rs`, `lib.rs`).
+## Durability rules
 
-- Add `xraft-storage/src/log_segment.rs` with `Segment { id, base_index, file,
-  bytes_written }`, `Segment::create(dir, id, base_index)` (writes the
-  `XRWL`+v1 header and fsyncs), `Segment::open(path)` (validates header,
-  returns `ForeignFile` if magic missing or `UnsupportedVersion` for non-v1),
-  and `Segment::scan() -> impl Iterator<Item = Result<(offset, LogEntry)>>`
-  used by recovery. Unit tests cover header round-trip, foreign-file
-  rejection, version mismatch, and scan over a known fixture.
-  **expectedFileChanges: 2** (`log_segment.rs`, `lib.rs`).
+* **Per-batch fsync.** `append(entries)` writes every frame, then fsyncs
+  **every segment** the batch touched (not just the active one — a
+  rotation-spanning batch needs each newly-sealed segment fsynced too).
+  Only after every fsync succeeds are the offset entries published.
+  Callers can therefore rely on `append` returning ⇒ entries are
+  durable.
+* **Atomic segment creation.** New segments are written to a `.wal.tmp`
+  companion file, fsynced, and atomically renamed to their final
+  `.wal` filename. The directory is then fsynced (Unix). A crash during
+  segment creation can only leave (a) no file, or (b) a leftover
+  `.wal.tmp` that recovery deletes — never a partial-header `.wal`
+  file that would brick the next startup.
+* **Crash-safe truncation.** `truncate_from(i)` deletes **later
+  segments first**, fsyncs the directory, and only then trims the
+  affected segment via `set_len + sync_all`. A crash between the two
+  steps therefore leaves either the original WAL state (truncate
+  effectively didn't happen — Raft will retry) or the fully-completed
+  truncate state — never a non-contiguous mix that recovery rejects.
+* **Directory fsync** is Unix-only; on Windows it's a documented no-op
+  because `forbid(unsafe_code)` precludes the raw `CreateFileW` +
+  `FlushFileBuffers` dance and NTFS journals filename metadata
+  independently. All file *contents* are still fsynced everywhere.
 
-### Stage 1.3 — `FileLogStore` core operations
+## Continuity & monotonicity invariants
 
-Wire the format primitives into the actual `LogStore` trait impl. Reads must
-go through the offset index.
+`append(entries)` rejects with `wal non-contiguous append:` *before*
+any byte hits disk if `entries[0].index != last_index + 1` (or the
+batch is internally non-monotonic). Recovery rejects with
+`wal non-contiguous` if (a) a segment's first frame's index doesn't
+equal its header `base_index`, (b) two adjacent segments' indices
+don't chain, or (c) frames inside a segment skip an index.
 
-- Add `xraft-storage/src/log.rs` with `FileLogStore { dir, active: Segment,
-  sealed: Vec<SegmentRef>, offsets: BTreeMap<LogIndex, OffsetRef>, max_segment_size,
-  inner: Mutex<…> }` plus `FileLogStore::open(dir, opts)` that creates the
-  initial segment when the directory is empty and registers it as active.
-  Implement `append` (continuity check → encode → write → `sync_data` → update
-  `offsets` and `bytes_written` → record `last_term`) and `get` (lookup
-  `OffsetRef` → `pread` → `decode_frame` → return). No full-entry cache. Unit
-  test the **append-and-read** scenario (100 entries, every `get(i)` returns
-  the right entry, `last_index == 100`). **expectedFileChanges: 3** (`log.rs`,
-  `lib.rs` exports, `Cargo.toml` deps if needed).
+## Phase / stage / step decomposition
 
-- Implement `get_range`, `last_index`, `last_term`, `term_at` on
-  `FileLogStore`. `get_range` walks the offset index for the requested span,
-  batching `pread`s within a segment. Unit test for ranges that span segments
-  and out-of-bounds ranges. **expectedFileChanges: 1** (`log.rs`).
+This work item lands as a single PR (~5 source files), so the plan
+collapses to **one stage with four steps** rather than a multi-stage
+phase:
 
-- Implement `truncate_from(index)`: locate the segment owning `index`, rewrite
-  it via `set_len(cut_offset)` + `sync_data`, delete every later segment,
-  fsync the parent directory, drop offset-index entries `>= index`, recompute
-  `last_term` from the highest surviving entry. Unit test the
-  **truncate-divergent** scenario (50 entries, `truncate_from(30)` →
-  `last_index == 29`, `get(30) == None`). **expectedFileChanges: 1**
-  (`log.rs`).
+### Stage 2.1 — Write-Ahead Log
 
-- Implement segment rotation: when an `append` would push `bytes_written`
-  past `max_segment_size` (configurable, default 64 MiB), seal the active
-  segment, create a new one with `base_index = last_index + 1`, fsync the
-  directory. Unit test the **segment-rotation** scenario at
-  `max_segment_size = 1 KiB`: confirm a second segment file appears on disk
-  and `get_range` across the boundary is correct. **expectedFileChanges: 1**
-  (`log.rs`).
+- **Step 1 — Format primitives in `xraft-storage/src/log_format.rs`.**
+  `encode_segment_header` / `decode_segment_header` over the 28-byte
+  header; `encode_frame` / `decode_frame` over the spec-compliant
+  `[length][term][index][entry_type][data][crc32]` shape with CRC
+  covering the length field; `FrameDecodeError { Truncated, Corrupt }`
+  classification with the length-band sanity check. **expectedFileChanges: 1**.
 
-### Stage 1.4 — Crash recovery & corruption surfacing
-
-The other half of durability — what happens on `open()` after a crash.
-
-- Implement `FileLogStore::recover(dir)`: list `*.log`, sort by id, validate
-  every segment header (`ForeignFile` / `UnsupportedVersion` are hard
-  errors), scan frames in order to rebuild the offset index. The *only*
-  legal tail truncation is a short read on the *last* segment, *after* the
-  prior frame's CRC verified. Any other decode failure (`BadCrc`,
-  `BadLength`, gap in indices) returns `StorageError::Corrupt {segment,
-  offset}` so the operator sees committed data loss instead of silent
-  truncation. Unit test the **crash-recovery** scenario (write N entries,
-  drop the store, reopen, verify all reads + `last_index` + `last_term` +
-  offset index population). **expectedFileChanges: 1** (`log.rs`).
-
-- Add explicit corruption acceptance tests in
-  `xraft-storage/tests/log_corruption.rs`: (a) header magic flipped → open
-  returns `ForeignFile`; (b) header version bumped to 99 → open returns
-  `UnsupportedVersion`; (c) mid-segment frame CRC byte flipped → open returns
-  `Corrupt`; (d) `length` field of the last frame corrupted to a huge value
-  → open returns `Corrupt` (NOT silent truncation); (e) trailing partial
-  write on the last segment → open succeeds, last good index intact.
+- **Step 2 — Segment file management in
+  `xraft-storage/src/log_segment.rs`.** `Segment::create` writes the
+  header to a `.wal.tmp` and atomically renames; `Segment::open`
+  validates magic / CRC / version; `Segment::read_at` serves locked
+  seek+read for `LogStore::get`; cross-platform `sync_dir` helper.
   **expectedFileChanges: 1**.
 
-- Wire the public surface: re-export `LogStore`, `FileLogStore`,
-  `MemoryLogStore`, `DEFAULT_MAX_SEGMENT_SIZE` from `xraft-storage/src/lib.rs`;
-  add a brief module doc comment in `log.rs` summarizing the format,
-  durability contract, and the "CRC covers length" invariant so future
-  contributors do not drift. **expectedFileChanges: 2** (`lib.rs`, `log.rs`).
+- **Step 3 — `FileLogStore` + `MemoryLogStore` in
+  `xraft-storage/src/log.rs`.** The full `LogStore` implementation:
+  open / recover, append (with dirty-segment fsync), get via offset
+  index, get_range, last_index / last_term / term_at from the offset
+  cache, truncate_from with delete-later-first ordering, segment
+  rotation, plus inline unit tests for every work-item scenario
+  (100-entry append-and-read, truncate-from-30-of-50, 1 KiB
+  segment-rotation, crash-recovery rebuilds the offset index,
+  ConfigChange / Snapshot roundtrip, durability without explicit flush).
+  Also wires `mod log_format; mod log_segment; mod log;` and
+  re-exports `LogStore`, `FileLogStore`, `MemoryLogStore`,
+  `DEFAULT_MAX_SEGMENT_SIZE` from `xraft-storage/src/lib.rs`.
+  **expectedFileChanges: 2** (`log.rs`, `lib.rs`).
 
----
+- **Step 4 — Corruption acceptance tests in
+  `xraft-storage/tests/log_corruption.rs`.** End-to-end verification
+  of every classification rule: bad magic ⇒ foreign-file error;
+  wrong version (with recomputed header CRC) ⇒ unsupported-version
+  error; mid-segment frame CRC mismatch ⇒ corruption; last-frame
+  length corrupted to huge ⇒ corruption (NOT silent truncation);
+  last-frame length corrupted to a smaller in-band value ⇒ corruption
+  via CRC mismatch; trailing partial write ⇒ recovery succeeds with
+  the last good entry intact; header CRC corruption ⇒ corruption;
+  filename / header `base_index` mismatch ⇒ hard fail. **expectedFileChanges: 1**.
 
-## Prior-iteration gaps closed by this plan
+## Prior-iteration gaps closed by this iteration
 
-1. **Segment header missing** → Stage 1.2 step 2 makes `XRWL`+version+CRC the
-   first 32 bytes of every segment, with explicit `ForeignFile` /
-   `UnsupportedVersion` errors.
-2. **Frame layout drifted from spec** → Stage 1.2 step 1 freezes the exact
-   `[length][term][index][entry_type][data][crc32]` shape from
-   `implementation-plan.md`; round-trip tests pin it.
-3. **CRC excluded the length field** → Stage 1.2 step 1 mandates CRC over
-   `length..data`; Stage 1.4 step 2 ships a length-corruption test.
-4. **Reads went through a full entry cache, not the offset index** →
-   Stage 1.3 makes `offsets: BTreeMap<LogIndex, OffsetRef>` the only read
-   path; the design notes call out "no entry cache" explicitly.
-5. **Tests missed header/version/length-corruption cases** → Stage 1.4
-   step 2 adds the dedicated corruption test file with all five cases.
-
----
+1. **Crate didn't even compile** (iter 2 deleted `log.rs` while
+   leaving `mod log;` in `lib.rs`) → Step 3 reinstates the module
+   and all of its public symbols.
+2. **Plan diverged from the actual trait surface** (iter 3 documented
+   async / `Vec<LogEntry>` / `Result<LogIndex>`) → this revision
+   matches the existing synchronous `&mut self` / `&[Entry]` /
+   `LogIndex` trait verbatim and uses existing `XRaftError::Storage`
+   error wiring.
+3. **Segment header missing** → `XRWL`+version+CRC at byte 0 of
+   every segment with `ForeignFile` / `UnsupportedVersion` /
+   `Corrupt` recovery errors.
+4. **Frame layout drifted from spec** → frozen
+   `[length][term][index][entry_type][data][crc32]` shape with
+   round-trip + classification tests.
+5. **CRC excluded the length field** → CRC envelope explicitly covers
+   `length_bytes ++ body`; tests in both `log_format.rs` and
+   `tests/log_corruption.rs` pin this.
+6. **Reads went through a full entry cache, not the offset index** →
+   `Vec<OffsetRef>` (dense, true O(1)) is the only read-path index;
+   `get` reads bytes from disk on demand. A test asserts that
+   per-entry RAM stays bounded regardless of payload size.
+7. **Tests missed header / version / length-corruption cases** →
+   `tests/log_corruption.rs` covers all five originally-named cases
+   plus header CRC corruption and filename mismatch.
 
 ## Out of scope
 
-- **Snapshot store / `SnapshotStore` trait** — Stage 2.3.
-- **Hard-state persistence** (`HardStateStore`, `quorum-state` file) —
-  Stage 2.2.
-- **Log compaction / segment GC** — driven by snapshots; Stage 2.3+.
-- **`AddVoter` / `RemoveVoter`** — out of v1 entirely
-  (`tech-spec.md` §3, §7 decision 6).
-- **Async batching / group commit optimization** — `append` batches by
-  caller-supplied `Vec<LogEntry>` and fsyncs once; pipelining and
-  back-pressure are explicitly deferred.
-- **Memory-mapped reads** — v1 uses `pread` only. Memory-mapping would
-  complicate `truncate_from` and is deferred.
-- **Cross-platform directory fsync semantics on Windows beyond
-  `FlushFileBuffers`** — documented as a known caveat.
+- **Snapshot store / `SnapshotStore` trait** — Stage 2.3 (already implemented in `snapshot_store.rs`).
+- **Hard-state persistence** (`HardStateStore` / `quorum-state.toml`) — Stage 2.2 (already implemented in `state.rs`).
+- **Log compaction / segment GC driven by snapshots** — needs Stage 2.3+ snapshot integration.
+- **`AddVoter` / `RemoveVoter` in `LogStore`** — out of v1 entirely (`tech-spec.md` §3, §7 decision 6).
+- **Async batching / group commit** — `append` batches by caller-supplied
+  `&[Entry]` and fsyncs once per batch; pipelining and back-pressure are deferred.
+- **Memory-mapped reads** — v1 uses locked seek+read. Memory mapping
+  would complicate `truncate_from` and is deferred.
+- **Cross-platform directory fsync semantics on Windows beyond the
+  documented no-op** — would require `unsafe` code (forbidden by the
+  workspace lint).

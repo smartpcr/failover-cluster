@@ -1,4 +1,6 @@
 mod log;
+mod log_format;
+mod log_segment;
 mod snapshot_store;
 
 // Re-export the trait from where it actually lives. Trying to re-export
