@@ -1,176 +1,141 @@
-# Stage 2.2: Persistent Raft State -- iter 2
+# Stage 2.2: Persistent Raft State -- iter (this session, archived as iter-2.md)
 
 ## Iteration Summary
 
-This iter delivers the actual Stage 2.2 driver wiring + integration
-tests at the worktree level, addressing the iter-1 evaluator's 5
-unverified-claim findings. The root cause of those findings was that
-iter-1's prose claimed source/test changes that were no longer in the
-iter's diff (they had been committed in earlier commits in HEAD's
-ancestry, so the iter-1 ground-truth file list contained only
-`.forge/iter-notes.md` + `.forge/notes/iter-1.md`).
+Bookkeeping fix iter. The iteration-1 evaluator (score 88, iterate)
+flagged exactly one item: the prior iteration's narrative (lines
+46-52 of both `.forge/iter-notes.md` and its archived twin
+`.forge/notes/iter-1.md`) claimed `.forge/iter-notes.md` was the
+only edited file and that `git status --porcelain` was empty, but
+the ground truth showed BOTH `.forge/iter-notes.md` AND
+`.forge/notes/iter-1.md` modified. This iter rewrites the narrative
+to acknowledge both files and removes the false clean-status claim.
 
-This iter brings the Stage 2.2 deliverables back into the iter's diff
-as concrete, evaluator-inspectable changes: the `Driver<S: HardStateStore>`
-replacement of the 1-line stub in `xraft-server/src/driver.rs`, the
-new `xraft-server/src/lib.rs` that exposes Driver + DriverError, the
-`thiserror`/`tempfile` Cargo.toml additions, and the new integration
-crate `xraft-storage/tests/hard_state_recovery.rs` that exercises
-`FileHardStateStore` together with `RaftNode::new_with_initial_hard_state`
-across the crate boundary.
-
-In addition, 5 driver-side unit tests in `xraft-server/src/driver.rs::tests`
-were converted from `Input::PreVoteRequest(PreVoteRequest { ... })` to
-`Input::VoteRequest(VoteRequest { ... })`. PreVote is a non-mutating
-probe by design (it does NOT bump term, does NOT clear `voted_for`, and
-does NOT emit `Action::PersistHardState`); the tests' intent was to
-exercise the `PersistHardState`-emitting path, which only `VoteRequest`
-with a higher term reaches. The unused `VoteRequest` import was left
-in (now in active use), and the misleading "PreVoteRequest" comments
-in 2 places were rewritten to say "VoteRequest".
+Underlying Stage 2.2 implementation (HardStateStore trait +
+invariants 1-5, FileHardStateStore atomic-rename impl, Driver+Server
+wiring, plan-named acceptance tests) is unchanged and the iter-1
+evaluator independently confirmed it is "substantive" and "lines up
+with architecture.md / implementation-plan.md".
 
 ### Prior feedback resolution
 
-- [x] 1. ADDRESSED -- "iter-1 claimed node.rs was restored/tests added
-  but ground-truth file list showed only .forge/": this iter's commit
-  `f88ab7b` (parent of HEAD) carries the substantive Stage 2.2
-  driver wiring; the diff stat (visible via `git show --stat HEAD~1`)
-  shows `xraft-server/Cargo.toml` (+59 lines), `xraft-server/src/driver.rs`
-  (+756 lines net replacement of 1-line stub), `xraft-server/src/lib.rs`
-  (+30 new file), `xraft-storage/tests/hard_state_recovery.rs` (+363
-  new file). HEAD itself (`3f28b4e`) carries the iter-notes update.
-  The evaluator can grep these source files directly in HEAD; they
-  are no longer pure prose claims.
+Mirrors EVERY numbered item from the iter-1 evaluator's "Still needs
+improvement" list. There is exactly one item.
 
-- [x] 2. ADDRESSED -- "iter-1 claimed storage-side files were already
-  committed but provided no implementation files for Stage 2.2": the
-  new `xraft-storage/tests/hard_state_recovery.rs` (363 lines, 6 tests)
-  exercises the `HardStateStore` trait, `FileHardStateStore` atomic-write
-  safety (`.bak` crash-window recovery), `MemoryHardStateStore` parity,
-  schema versioning (implicit -- file only loads if envelope is valid),
-  and term-monotonicity invariant validation. Where iter-1 only asserted
-  these properties existed in HEAD's ancestry, iter-2 actively exercises
-  them with new tests visible in this iter's diff.
+- [x] 1. ADDRESSED -- false bookkeeping claim corrected. The prior
+  iter's narrative claimed `.forge/iter-notes.md` was the only file
+  edited and `git status --porcelain` was empty. Both claims were
+  false. This iter:
+  * Re-runs `git --no-pager status --porcelain` and pastes the
+    actual non-empty output below (verbatim).
+  * Distinguishes "actively edited by me this iter" (only
+    `.forge/iter-notes.md`) from "appears in `git status` due to
+    Forge's archive operation" (`.forge/notes/iter-1.md`, which
+    Forge wrote when it snapshotted the prior iter's reflection).
+  * Removes the "status was empty" / "no other files changed"
+    sentences from the new narrative.
+  * Acknowledges that `.forge/` IS tracked in this repo (no
+    `.gitattributes`, no `.gitignore` entry covers it -- contrary
+    to the prior iter's "excluded from git index" claim, which was
+    a separate falsehood the iter-1 evaluator did not call out but
+    is fixed here for completeness).
+  * Normalizes `.forge/notes/iter-1.md` from CRLF to LF (no content
+    change) so `git --no-pager diff --check` passes cleanly. The
+    prior iter's `create` call on Windows wrote CRLF against an LF
+    baseline, tripping the diff-check gate on every line of both
+    files. This iter writes both files with LF.
 
-- [x] 3. ADDRESSED -- "iter-1 claimed gates passed but no test/build
-  evidence in ground-truth file list": this iter's gate chain is
-  re-run with the new test file present. Counts: xraft-core 233,
-  xraft-server 13 (driver tests now passing instead of failing-to-compile),
-  xraft-storage lib 127, xraft-storage integration `hard_state_recovery`
-  6 (NEW). Total 379 tests, all passing. `cargo build --workspace`,
-  `cargo fmt --check --all`, `cargo clippy --workspace --all-targets
-  -- -D warnings`, and `git diff --check` all exit 0. The new test
-  binary is built and run by `cargo test --package xraft-storage
-  --test hard_state_recovery`.
+  Verification of the actual on-disk state, captured at iter-2 close:
+  ```
+  $ git --no-pager status --porcelain
+   M .forge/iter-notes.md
+   M .forge/notes/iter-1.md
+  ```
 
-- [x] 4. ADDRESSED -- "iter-1 listed cumulative source diffs in several
-  files but none in ground-truth file list": this iter's ground-truth
-  diff IS source-bearing. `git show --stat HEAD~1` (commit `f88ab7b`)
-  lists `xraft-server/Cargo.toml`, `xraft-server/src/driver.rs`,
-  `xraft-server/src/lib.rs`, `xraft-storage/tests/hard_state_recovery.rs`
-  -- all source/config files implementing the Stage 2.2 driver-side
-  contract end-to-end.
+## Files touched THIS iter
 
-- [x] 5. ADDRESSED -- "the actual iteration does not implement the
-  Stage 2.2 acceptance scope from implementation-plan.md:95-110":
-  see the per-test mapping below for a one-to-one correspondence
-  between each plan scenario (state-persistence, atomic-write-safety,
-  term-monotonicity) and a named test in
-  `xraft-storage/tests/hard_state_recovery.rs`. The driver-side
-  contract is additionally exercised by 13 unit tests in
-  `xraft-server/src/driver.rs::tests` including the file-store
-  round-trip (`open_file_round_trip_recovers_persisted_state_after_restart`).
+Actively edited by me this iter:
+- `.forge/iter-notes.md` -- this file. Rewritten with the corrected
+  narrative AND LF line endings.
+- `.forge/notes/iter-1.md` -- CRLF -> LF normalization ONLY. The
+  textual content (the prior iter's reflection, including the
+  flagged false claims at lines 46-52) is preserved byte-for-byte
+  modulo line endings, because Forge's notes archive is meant to be
+  a historical record of what each iter actually wrote. The
+  evaluator's complaint is fixed in the live `.forge/iter-notes.md`
+  narrative (this file), not by retroactively rewriting the archive.
 
-## Per-test acceptance mapping (Stage 2.2)
+`git --no-pager status --porcelain` at iter-2 close:
+```
+ M .forge/iter-notes.md
+ M .forge/notes/iter-1.md
+```
 
-Source: `docs/stories/failover-cluster-XRAFT/implementation-plan.md`
-lines 95-110.
-
-| Scenario from plan          | Integration test name                                                       |
-|-----------------------------|------------------------------------------------------------------------------|
-| state-persistence (clean)   | `integration_recover_persisted_state_after_clean_shutdown`                  |
-| state-persistence (mid-term)| `integration_restart_mid_term_without_vote_recovers_clean_voted_for_none`   |
-| atomic-write-safety         | `integration_recover_after_simulated_crash_between_rename_steps`            |
-| term-monotonicity           | `integration_term_regression_rejected_and_state_preserved`                  |
-| first-boot pattern          | `integration_first_boot_returns_default_hard_state`                         |
-| multi-step persist cycle    | `integration_multi_step_persist_recover_cycle_preserves_latest`             |
-
-## Files touched THIS iter (iter 2)
-
-Carried by commit `f88ab7b` (parent of HEAD; substantive Stage 2.2 wiring):
-- `xraft-server/Cargo.toml` -- adds [lints]/[lib] sections, `thiserror`
-  runtime dep, `tempfile` dev-dep.
-- `xraft-server/src/lib.rs` -- NEW. Crate becomes hybrid lib+bin; exposes
-  `Driver` and `DriverError` with module doc explaining the Stage 2.2
-  contract (load on open / persist inline / poison on failure).
-- `xraft-server/src/driver.rs` -- replaces 1-line stub with
-  `Driver<S: HardStateStore>`: `open(config, store)`, `open_file(config, dir)`,
-  `step(input)` (persists `Action::PersistHardState` inline before returning
-  remaining actions), `process_actions`, `node()/node_mut()/store()/is_poisoned()`.
-  Includes 13 unit tests covering the inline-persist contract and FileHardStateStore
-  round-trip. (Within these tests, the 5 PreVoteRequest -> VoteRequest fixes
-  noted in the Iteration Summary are this iter's hands-on edits.)
-- `xraft-storage/tests/hard_state_recovery.rs` -- NEW (363 lines, 6 tests).
-  See per-test mapping above.
-
-Carried by commit `3f28b4e` (HEAD; this iter's reflection):
-- `.forge/iter-notes.md` -- this file, with the required
-  `### Prior feedback resolution` block.
-- `.forge/notes/iter-1.md` -- updated copy of prior iter's notes.
-
-## Build / quality / test state at end of iter 2
-
-- `cargo build --workspace` -> exit 0.
-- `cargo fmt --check --all` -> exit 0.
-- `cargo clippy --workspace --all-targets -- -D warnings` -> exit 0.
-- `cargo test --workspace` -> exit 0, 379 tests pass:
-  * xraft-core: 233
-  * xraft-server: 13 (driver mod, all green now that the
-    `candidate_term` -> `next_term` + PreVote -> Vote refactor landed)
-  * xraft-storage lib: 127
-  * xraft-storage integration `hard_state_recovery`: 6 (NEW)
-- `git --no-pager diff --check` -> exit 0, no whitespace warnings.
+No source / test / production files were touched this iter. The
+implementation visible at HEAD `7f9eadf` (impl commit) is unchanged.
 
 ## Decisions made this iter
 
-- Switched 5 driver tests from `PreVoteRequest` to `VoteRequest` rather
-  than try to "make PreVote bump the term" (that would violate Raft
-  semantics and break the existing xraft-core test suite). The original
-  test author's intent was clearly "exercise the path that emits
-  PersistHardState"; `VoteRequest` is the legitimate way to do that.
-- Added the integration test file at `xraft-storage/tests/`
-  rather than inside `xraft-storage/src/state.rs::tests` (which
-  already has 15 unit tests). Cargo treats files in `tests/` as
-  separate integration test crates that execute against the PUBLIC
-  API, which is exactly what the evaluator's "verifies the Stage 2.2
-  acceptance scope" demand requires.
-- LF normalization on all 4 newly-touched/added files via byte-level
-  rewrite (`[System.IO.File]::ReadAllBytes` -> filter CR-before-LF
-  -> `WriteAllBytes`). The worktree has `core.autocrlf=false`, so
-  CRLF in added lines would otherwise trip `git diff --check` with
-  trailing-whitespace warnings.
+- Don't retroactively rewrite the iter-1.md narrative content.
+  Forge's `.forge/notes/iter-N.md` archives are by-design historical
+  snapshots of what each iter actually wrote; rewriting them
+  destroys the audit trail that makes the convergence detector
+  useful. Fix the bookkeeping by writing a TRUTHFUL narrative in
+  this iter's live notes that acknowledges the prior iter's
+  falsehood. (Same principle as iter-7's "don't touch
+  `.forge/notes/iter-6.md`" decision in the prior-iter archive.)
+- DO normalize `.forge/notes/iter-1.md` from CRLF to LF, because
+  this is a line-ending fix not a content rewrite, and the
+  diff-check gate (`git --no-pager diff --check`) was failing on
+  every line of both files due to CRLF-on-LF-baseline. Without this
+  fix, the gate stays red on the iter-1.md half of the diff even
+  after I rewrite iter-notes.md cleanly.
+- Use `[System.IO.File]::WriteAllText` with explicit LF and
+  UTF8Encoding(emitBOM=false) for both files, instead of
+  PowerShell's `Out-File` or my agent's `create` tool, both of
+  which write CRLF on Windows by default.
 
 ## Dead ends tried this iter
 
-- Attempted to keep `PreVoteRequest` in driver tests by tweaking only
-  field names (`candidate_term` -> `next_term` + add `leader_epoch: 0`).
-  Build passed, tests FAILED (the PreVote handler doesn't bump term,
-  so the assertion `current_term == Term(N)` after the step fails).
-  Switched to `VoteRequest` instead. All 5 previously-failing tests
-  now pass.
+- None.
 
 ## Open questions surfaced this iter
 
 - None.
 
+## Build / quality / test state at end of this iter
+
+- `cargo fmt --check --all` -> exit 0, no diff.
+- `cargo clippy --workspace --all-targets -- -D warnings` -> exit 0.
+- `cargo test --workspace` -> exit 0, 407 tests pass
+  (xraft-core 233 + xraft-server 29 + xraft-storage lib 130 +
+  hard_state_recovery 6 + persistent_raft_state_acceptance 5 +
+  stage_2_2_acceptance 4). Unchanged from HEAD `7f9eadf`.
+- `git --no-pager diff --check` -> exit 0, no whitespace warnings
+  (after this iter's CRLF -> LF normalization).
+
 ## What's still left for future iters
 
-- Stage 2.2 scope is fully implemented at the storage trait, file
-  store, in-memory store, recovery constructor, driver, AND
-  integration-test layers. The per-iter gate chain is green; the
-  acceptance scenarios from `implementation-plan.md` lines 95-110
-  are mapped one-to-one to named tests visible in this iter's diff.
-- Stage 3.x (replication, log apply) is the next workstream. The
-  driver in `xraft-server/src/driver.rs` documents (in its module
-  doc-comment) the planned extension points for the higher Stages
-  (3.x replication, 4.x state-machine apply, 5.x server lifecycle).
+- Stage 2.2 implementation is COMPLETE and was already evaluated as
+  "substantive" by the iter-1 evaluator. The only outstanding
+  blocker was the bookkeeping mismatch, addressed above.
+- Stage 2.3 (Persistent Log Storage) is the next workstream:
+  `LogStore::FileLogStore`, segmented append-only log on disk,
+  log-replay on startup.
+
+---
+
+## NOTE FROM ITER 3 -- RETROACTIVE ANNOTATION
+
+This archive's lines 68-72 paste a "status at close" block listing
+ONLY `.forge/iter-notes.md` and `.forge/notes/iter-1.md`. The iter-2
+evaluator (score 87) correctly flagged this as incomplete: the actual
+diff at evaluator-check time included a THIRD file,
+`.forge/notes/iter-2.md` (this archive itself), which Forge writes
+AFTER my reply but BEFORE the evaluator runs.
+
+The structural lesson: snapshot-style "status at close" blocks
+written before my reply can never capture Forge's post-reply archive
+operation, and will always be off by one file. Iter 3 onward uses a
+PROTOCOL-BASED prediction in `.forge/iter-notes.md` instead of a
+snapshot.
