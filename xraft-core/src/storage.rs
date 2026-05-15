@@ -49,10 +49,25 @@ pub trait LogStore: Send + Sync {
 /// 3. **Atomic write** -- a crash mid-`persist` MUST leave the previously
 ///    durable state intact and loadable. Implementations achieve this
 ///    via tmp-file + atomic-replace + recovery-on-open semantics
-///    (see [`xraft_storage::FileHardStateStore`]).
+///    (see `xraft-storage::FileHardStateStore` in the sibling crate;
+///    intentionally not an intra-doc link because `xraft-core` does
+///    not depend on `xraft-storage`).
 /// 4. **First-boot semantics** -- before any successful `persist`, `load`
 ///    MUST return `Ok(None)`. Drivers map that to `HardState::default()`
 ///    (Term(0), no vote) when constructing a `RaftNode`.
+/// 5. **Single vote per term** -- per `implementation-plan.md` line 102
+///    ("voted_for is only set once per term"), within a single
+///    `current_term` the persisted `voted_for` may transition
+///    `None -> Some(node_a)` exactly once and may then only be
+///    re-persisted as `Some(node_a)` (idempotent retries are allowed).
+///    Persisting `Some(node_b)` where `b != a` at the same term MUST
+///    be rejected; clearing the vote (`Some(node_a) -> None`) within
+///    the same term MUST also be rejected. A strictly-greater
+///    `current_term` resets vote eligibility (any `voted_for` is then
+///    allowed). The `xraft-storage` tests cover this in
+///    `memory_store_enforces_invariants`,
+///    `file_store_enforces_invariants`, and the plan-named
+///    `stage_2_2_acceptance_term_monotonicity_and_vote_invariants_match_plan`.
 ///
 /// Both `xraft-storage::FileHardStateStore` (production) and
 /// `xraft-storage::MemoryHardStateStore` (test) implement these
@@ -60,12 +75,14 @@ pub trait LogStore: Send + Sync {
 /// `xraft-storage/tests/persistent_raft_state_acceptance.rs`
 /// (`plan_state_persistence_term_5_voted_for_3`,
 /// `plan_atomic_write_safety_quorum_state_recoverable`,
-/// `plan_term_monotonicity_term_5_then_3_errors`).
+/// `plan_term_monotonicity_term_5_then_3_errors`,
+/// `plan_first_boot_load_returns_none_on_empty_dir`).
 pub trait HardStateStore: Send + Sync {
     /// Persist the hard state to durable storage.
     ///
     /// MUST be atomic with respect to crashes (see trait-level docs,
-    /// invariant 3) and MUST reject term regressions (invariant 2).
+    /// invariant 3), MUST reject term regressions (invariant 2), and
+    /// MUST reject same-term vote conflicts (invariant 5).
     fn persist(&mut self, state: &HardState) -> Result<()>;
     /// Load the most recently persisted hard state.
     ///
