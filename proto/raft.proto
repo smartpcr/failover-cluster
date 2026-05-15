@@ -74,10 +74,14 @@ message FetchResponse {
 // Log entries
 // ---------------------------------------------------------------------------
 
+// proto3 best practice: zero must be an explicit "unspecified" sentinel so a
+// missing/default-encoded enum field never silently decodes as a valid type.
+// Conversion code in xraft-core/src/message.rs rejects ENTRY_TYPE_UNSPECIFIED.
 enum EntryType {
-  COMMAND  = 0;
-  NO_OP    = 1;
-  CONFIG   = 2;
+  ENTRY_TYPE_UNSPECIFIED = 0;
+  ENTRY_TYPE_COMMAND     = 1;
+  ENTRY_TYPE_NO_OP       = 2;
+  ENTRY_TYPE_CONFIG      = 3;
 }
 
 message LogEntry {
@@ -109,6 +113,9 @@ message VoterSet {
 message SnapshotMetadata {
   uint64   last_included_index = 1;
   uint64   last_included_term  = 2;
+  // Required: every snapshot must carry the voter set in effect at
+  // last_included_index. The Rust wire conversion in xraft-core/src/message.rs
+  // rejects messages where voter_set is missing or contains zero voters.
   VoterSet voter_set           = 3;
   string   snapshot_id         = 4;
 }
@@ -128,3 +135,12 @@ message FetchSnapshotChunk {
   bool   done                  = 5;
   optional SnapshotMetadata metadata = 6;
 }
+
+// NOTE: The Raft gRPC service definition is intentionally omitted from this
+// stage. Stage 1.3 ("RPC Message Definitions") owns wire *messages* only.
+// The transport layer (introduced in a later stage) will own the gRPC service
+// contract and its tonic-build configuration, at which point a `service
+// RaftService { ... }` definition will live in the transport crate's proto
+// (or be added back here once the transport crate enables client/server
+// generation). Declaring a service here while xraft-core/build.rs disables
+// both `build_server` and `build_client` would produce dead wire surface.

@@ -3,8 +3,13 @@
 //! These are the in-memory representations used by the consensus engine.
 //! The `proto` submodule re-exports generated protobuf types; conversion
 //! traits (`From`/`TryFrom`) bridge the wire format and the canonical Rust
-//! types. Conversions that can fail (e.g. `Entry` → `proto::LogEntry`,
-//! which rejects the in-memory-only `Snapshot` variant) use `TryFrom`.
+//! types. Conversions that can fail use `TryFrom`. Failure cases include:
+//!
+//! * `Entry` → `proto::LogEntry` rejects the in-memory-only `Snapshot` variant.
+//! * `proto::LogEntry` → `Entry` rejects unknown discriminants and the
+//!   proto3 `ENTRY_TYPE_UNSPECIFIED` zero/default sentinel.
+//! * `SnapshotMeta` ↔ `proto::SnapshotMetadata` rejects missing/empty
+//!   `voter_set` in either direction (see proto/raft.proto).
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -405,6 +410,16 @@ impl TryFrom<proto::LogEntry> for Entry {
         let entry_type = proto::EntryType::try_from(p.entry_type)
             .map_err(|_| format!("unknown entry_type discriminant: {}", p.entry_type))?;
         let payload = match entry_type {
+            // Reject the proto3 zero/default sentinel: a missing or
+            // default-encoded entry_type field MUST NOT silently decode as a
+            // valid log entry. See proto/raft.proto::EntryType.
+            proto::EntryType::Unspecified => {
+                return Err(
+                    "LogEntry entry_type is ENTRY_TYPE_UNSPECIFIED (default/missing); \
+                     refusing to decode an unspecified entry kind"
+                        .to_string(),
+                );
+            }
             proto::EntryType::Command => EntryPayload::Command(Bytes::from(p.data)),
             proto::EntryType::NoOp => EntryPayload::NoOp,
             proto::EntryType::Config => {
@@ -458,35 +473,56 @@ impl TryFrom<proto::FetchResponse> for FetchResponse {
 }
 
 // --- SnapshotMetadata / SnapshotMeta ---
+//
+// Wire contract: `SnapshotMetadata.voter_set` is REQUIRED (per proto/raft.proto
+// and `SnapshotStore` semantics in xraft-core/src/storage.rs). Both directions
+// of the conversion reject missing or empty voter sets so the failure surfaces
+// at the wire boundary rather than later inside snapshot installation.
+//
+// The Rust-side `SnapshotMeta::voter_set` remains `Option<VoterSet>` to support
+// in-memory bootstrap markers that never cross the wire (e.g.
+// `EntryPayload::Snapshot` compaction sentinels).
 
-impl From<&SnapshotMeta> for proto::SnapshotMetadata {
-    fn from(m: &SnapshotMeta) -> Self {
-        let voter_set = m.voter_set.as_ref().map(|vs| {
-            proto::VoterSet {
-                voters: vs
-                    .voters()
-                    .iter()
-                    .map(|vr| proto::VoterRecord {
-                        node_id: vr.node_id.0,
-                        directory_id: vr.directory_id.0.to_string(),
-                        endpoints: vr
-                            .endpoints
-                            .iter()
-                            .map(|ep| proto::Endpoint {
-                                host: ep.host.clone(),
-                                port: ep.port as u32,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            }
-        });
-        Self {
+impl TryFrom<&SnapshotMeta> for proto::SnapshotMetadata {
+    type Error = String;
+
+    fn try_from(m: &SnapshotMeta) -> Result<Self, Self::Error> {
+        let vs = m.voter_set.as_ref().ok_or_else(|| {
+            "SnapshotMeta.voter_set is None; wire SnapshotMetadata requires a \
+             non-empty voter set"
+                .to_string()
+        })?;
+        if vs.voters().is_empty() {
+            return Err(
+                "SnapshotMeta.voter_set is empty; wire SnapshotMetadata requires \
+                 at least one voter"
+                    .to_string(),
+            );
+        }
+        let voter_set = proto::VoterSet {
+            voters: vs
+                .voters()
+                .iter()
+                .map(|vr| proto::VoterRecord {
+                    node_id: vr.node_id.0,
+                    directory_id: vr.directory_id.0.to_string(),
+                    endpoints: vr
+                        .endpoints
+                        .iter()
+                        .map(|ep| proto::Endpoint {
+                            host: ep.host.clone(),
+                            port: ep.port as u32,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
+        Ok(Self {
             last_included_index: m.last_included_index.0,
             last_included_term: m.last_included_term.0,
-            voter_set,
+            voter_set: Some(voter_set),
             snapshot_id: m.id.clone(),
-        }
+        })
     }
 }
 
@@ -494,49 +530,49 @@ impl TryFrom<proto::SnapshotMetadata> for SnapshotMeta {
     type Error = String;
 
     fn try_from(p: proto::SnapshotMetadata) -> Result<Self, Self::Error> {
-        let voter_set = match p.voter_set {
-            None => None,
-            Some(vs) => {
-                let records: Result<Vec<crate::types::VoterRecord>, String> = vs
-                    .voters
-                    .into_iter()
-                    .map(|vr| {
-                        let directory_id = uuid::Uuid::parse_str(&vr.directory_id)
-                            .map_err(|e| format!("invalid directory_id UUID: {e}"))?;
-                        Ok(crate::types::VoterRecord {
-                            node_id: NodeId(vr.node_id),
-                            directory_id: crate::types::DirectoryId(directory_id),
-                            endpoints: vr
-                                .endpoints
-                                .into_iter()
-                                .map(|ep| {
-                                    let port = u16::try_from(ep.port)
-                                        .map_err(|_| format!("port {} out of range", ep.port))?;
-                                    Ok(crate::types::Endpoint {
-                                        host: ep.host,
-                                        port,
-                                    })
-                                })
-                                .collect::<Result<Vec<_>, String>>()?,
+        let vs = p.voter_set.ok_or_else(|| {
+            "SnapshotMetadata.voter_set is missing; wire SnapshotMetadata \
+             requires the voter set in effect at last_included_index"
+                .to_string()
+        })?;
+        if vs.voters.is_empty() {
+            return Err(
+                "SnapshotMetadata.voter_set contains zero voters; refusing to \
+                 decode a snapshot with no voter set"
+                    .to_string(),
+            );
+        }
+        let records: Result<Vec<crate::types::VoterRecord>, String> = vs
+            .voters
+            .into_iter()
+            .map(|vr| {
+                let directory_id = uuid::Uuid::parse_str(&vr.directory_id)
+                    .map_err(|e| format!("invalid directory_id UUID: {e}"))?;
+                Ok(crate::types::VoterRecord {
+                    node_id: NodeId(vr.node_id),
+                    directory_id: crate::types::DirectoryId(directory_id),
+                    endpoints: vr
+                        .endpoints
+                        .into_iter()
+                        .map(|ep| {
+                            let port = u16::try_from(ep.port)
+                                .map_err(|_| format!("port {} out of range", ep.port))?;
+                            Ok(crate::types::Endpoint {
+                                host: ep.host,
+                                port,
+                            })
                         })
-                    })
-                    .collect();
-                let records = records?;
-                if records.is_empty() {
-                    None
-                } else {
-                    Some(
-                        crate::types::VoterSet::try_new(records)
-                            .map_err(|e| format!("invalid voter set: {e}"))?,
-                    )
-                }
-            }
-        };
+                        .collect::<Result<Vec<_>, String>>()?,
+                })
+            })
+            .collect();
+        let voter_set = crate::types::VoterSet::try_new(records?)
+            .map_err(|e| format!("invalid voter set: {e}"))?;
         Ok(Self {
             last_included_index: LogIndex(p.last_included_index),
             last_included_term: Term(p.last_included_term),
             id: p.snapshot_id,
-            voter_set,
+            voter_set: Some(voter_set),
         })
     }
 }
@@ -567,16 +603,22 @@ impl From<proto::FetchSnapshotRequest> for FetchSnapshotRequest {
 
 // --- FetchSnapshotChunk ---
 
-impl From<&FetchSnapshotChunk> for proto::FetchSnapshotChunk {
-    fn from(c: &FetchSnapshotChunk) -> Self {
-        Self {
+impl TryFrom<&FetchSnapshotChunk> for proto::FetchSnapshotChunk {
+    type Error = String;
+
+    fn try_from(c: &FetchSnapshotChunk) -> Result<Self, Self::Error> {
+        let metadata = match c.metadata.as_ref() {
+            Some(m) => Some(proto::SnapshotMetadata::try_from(m)?),
+            None => None,
+        };
+        Ok(Self {
             cluster_id: c.cluster_id.clone(),
             leader_epoch: c.leader_epoch,
             chunk_index: c.chunk_index,
             data: c.data.clone(),
             done: c.done,
-            metadata: c.metadata.as_ref().map(proto::SnapshotMetadata::from),
-        }
+            metadata,
+        })
     }
 }
 
@@ -905,7 +947,7 @@ mod tests {
             id: "snap-42".into(),
             voter_set: Some(vs.clone()),
         };
-        let proto_meta = proto::SnapshotMetadata::from(&meta);
+        let proto_meta = proto::SnapshotMetadata::try_from(&meta).unwrap();
         let mut buf = Vec::new();
         proto_meta.encode(&mut buf).unwrap();
         let decoded = proto::SnapshotMetadata::decode(buf.as_slice()).unwrap();
@@ -917,21 +959,60 @@ mod tests {
     }
 
     #[test]
-    fn proto_roundtrip_snapshot_metadata_no_voter_set() {
+    fn snapshot_metadata_serialise_rejects_none_voter_set() {
+        // Wire SnapshotMetadata REQUIRES voter_set; a Rust SnapshotMeta with
+        // voter_set: None (e.g. an in-memory bootstrap marker) must NOT be
+        // silently serialised onto the wire.
         let meta = SnapshotMeta {
             last_included_index: LogIndex(50),
             last_included_term: Term(3),
             id: "snap-empty".into(),
             voter_set: None,
         };
-        let proto_meta = proto::SnapshotMetadata::from(&meta);
-        let mut buf = Vec::new();
-        proto_meta.encode(&mut buf).unwrap();
-        let decoded = proto::SnapshotMetadata::decode(buf.as_slice()).unwrap();
-        let rt = SnapshotMeta::try_from(decoded).unwrap();
-        assert_eq!(rt.last_included_index, LogIndex(50));
-        assert_eq!(rt.id, "snap-empty");
-        assert!(rt.voter_set.is_none());
+        let result = proto::SnapshotMetadata::try_from(&meta);
+        assert!(result.is_err(), "expected serialisation error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("voter_set is None"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_metadata_decode_rejects_missing_voter_set() {
+        // Decoding a wire SnapshotMetadata whose voter_set field is absent
+        // (e.g. produced by a buggy/malicious peer or a default-constructed
+        // proto) MUST surface as an error at the wire boundary.
+        let p = proto::SnapshotMetadata {
+            last_included_index: 50,
+            last_included_term: 3,
+            voter_set: None,
+            snapshot_id: "snap-missing".into(),
+        };
+        let result = SnapshotMeta::try_from(p);
+        assert!(result.is_err(), "expected decode error");
+        let err = result.unwrap_err();
+        assert!(err.contains("voter_set is missing"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn snapshot_metadata_decode_rejects_empty_voter_set() {
+        // A decoded SnapshotMetadata whose voter_set is present but empty
+        // (zero voters) is also invalid and must be rejected at the wire
+        // boundary, not silently coerced to None.
+        let p = proto::SnapshotMetadata {
+            last_included_index: 50,
+            last_included_term: 3,
+            voter_set: Some(proto::VoterSet { voters: vec![] }),
+            snapshot_id: "snap-empty".into(),
+        };
+        let result = SnapshotMeta::try_from(p);
+        assert!(result.is_err(), "expected decode error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("zero voters"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -970,7 +1051,7 @@ mod tests {
             done: false,
             metadata: Some(meta.clone()),
         };
-        let proto_chunk = proto::FetchSnapshotChunk::from(&chunk);
+        let proto_chunk = proto::FetchSnapshotChunk::try_from(&chunk).unwrap();
         let mut buf = Vec::new();
         proto_chunk.encode(&mut buf).unwrap();
         let decoded = proto::FetchSnapshotChunk::decode(buf.as_slice()).unwrap();
@@ -994,13 +1075,34 @@ mod tests {
             done: true,
             metadata: None,
         };
-        let proto_chunk = proto::FetchSnapshotChunk::from(&chunk);
+        let proto_chunk = proto::FetchSnapshotChunk::try_from(&chunk).unwrap();
         let mut buf = Vec::new();
         proto_chunk.encode(&mut buf).unwrap();
         let decoded = proto::FetchSnapshotChunk::decode(buf.as_slice()).unwrap();
         let rt = FetchSnapshotChunk::try_from(decoded).unwrap();
         assert!(rt.done);
         assert!(rt.metadata.is_none());
+    }
+
+    #[test]
+    fn fetch_snapshot_chunk_serialise_propagates_metadata_error() {
+        // A chunk carrying a SnapshotMeta with no voter_set must fail to
+        // serialise so the bad metadata cannot leak onto the wire.
+        let chunk = FetchSnapshotChunk {
+            cluster_id: "c".into(),
+            leader_epoch: 3,
+            chunk_index: 0,
+            data: vec![1, 2, 3],
+            done: false,
+            metadata: Some(SnapshotMeta {
+                last_included_index: LogIndex(1),
+                last_included_term: Term(1),
+                id: "bad".into(),
+                voter_set: None,
+            }),
+        };
+        let result = proto::FetchSnapshotChunk::try_from(&chunk);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1042,6 +1144,53 @@ mod tests {
         let result = Entry::try_from(bad_entry);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown entry_type discriminant: 99"));
+    }
+
+    #[test]
+    fn log_entry_default_entry_type_returns_error() {
+        // proto3 zero-value safety: a LogEntry whose entry_type field is
+        // missing (default-initialised to 0 = ENTRY_TYPE_UNSPECIFIED) MUST be
+        // rejected. Otherwise a malformed/truncated message would silently
+        // decode as a valid Command/NoOp/Config entry.
+        let bad_entry = proto::LogEntry {
+            index: 1,
+            term: 1,
+            entry_type: 0, // ENTRY_TYPE_UNSPECIFIED — proto3 default
+            data: vec![],
+        };
+        let result = Entry::try_from(bad_entry);
+        assert!(result.is_err(), "default entry_type must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("ENTRY_TYPE_UNSPECIFIED"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn entry_type_unspecified_is_zero_discriminant() {
+        // Lock in the proto3-safe wire layout: the unspecified sentinel must
+        // occupy the zero slot so a default/missing field never decodes as
+        // a real entry kind.
+        assert_eq!(proto::EntryType::Unspecified as i32, 0);
+        assert_ne!(proto::EntryType::Command as i32, 0);
+        assert_ne!(proto::EntryType::NoOp as i32, 0);
+        assert_ne!(proto::EntryType::Config as i32, 0);
+    }
+
+    #[test]
+    fn log_entry_default_proto_decode_is_rejected() {
+        // End-to-end check: a fully default-encoded LogEntry on the wire
+        // (all fields at their proto3 zero values) must fail to decode into
+        // a Rust `Entry`. This guards against truncated frames or a peer
+        // sending a zero-initialised message.
+        let default = proto::LogEntry::default();
+        let mut buf = Vec::new();
+        default.encode(&mut buf).unwrap();
+        let decoded = proto::LogEntry::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.entry_type, 0);
+        let result = Entry::try_from(decoded);
+        assert!(result.is_err(), "default-encoded LogEntry must not decode");
     }
 
     #[test]
