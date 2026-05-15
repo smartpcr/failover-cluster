@@ -395,16 +395,20 @@ impl RaftNode {
     /// Returns a list of [`Action`]s the driver must execute (persist state,
     /// send messages, apply entries, etc.).
     ///
-    /// Stage 3.1 only implements the [`Input::Tick`] handler. The remaining
-    /// variants (vote and fetch traffic, client proposals) are accepted so
-    /// the driver can be wired without crashing on out-of-stage inputs, but
-    /// they are **dropped with a `tracing::debug!` breadcrumb** instead of
-    /// being swallowed silently. That breadcrumb is intentional: if an
-    /// integration starts pumping `VoteRequest`/`FetchRequest`/... before
-    /// the matching stage lands (Stage 3.2 for vote handlers, Stage 3.3 for
-    /// fetch handlers), the operator sees an obvious "input not yet handled"
-    /// signal at debug level — not a silent black hole that takes hours to
-    /// diagnose.
+    /// Stage 3.1 wires the [`Input::Tick`] handler. Stage 3.2 (Leader
+    /// Election) wires the four vote-traffic variants — [`Input::VoteRequest`],
+    /// [`Input::VoteResponse`], [`Input::PreVoteRequest`], and
+    /// [`Input::PreVoteResponse`] — through to their dedicated handlers so
+    /// the driver can drive the full Pre-Vote → Vote → Leader cascade
+    /// across a real cluster by simply pumping `Input`s into `step()`.
+    ///
+    /// Stage 3.3 territory (fetch traffic and client proposals) is still
+    /// **accept-and-drop with a `tracing::debug!` breadcrumb** so the
+    /// driver can be wired without crashing on out-of-stage inputs while
+    /// the drop remains observable. If an integration starts pumping
+    /// `FetchRequest`/`FetchResponse`/`ClientPropose` before the matching
+    /// stage lands, the operator sees an obvious "input not yet handled"
+    /// signal at debug level rather than a silent black hole.
     ///
     /// The match deliberately enumerates each placeholder variant rather
     /// than using a `_` wildcard. Rust's exhaustiveness checker will then
@@ -415,26 +419,27 @@ impl RaftNode {
     pub fn step(&mut self, input: Input) -> Vec<Action> {
         match input {
             Input::Tick => self.handle_tick(),
-            // Stage 3.2 / 3.3 territory — accept-and-drop so the driver can
-            // be wired without crashing on out-of-stage inputs, but emit a
+            Input::VoteRequest(req) => self.handle_vote_request(req),
+            Input::VoteResponse { from, response } => self.handle_vote_response(from, response),
+            Input::PreVoteRequest(req) => self.handle_pre_vote_request(req),
+            Input::PreVoteResponse { from, response } => {
+                self.handle_pre_vote_response(from, response)
+            }
+            // Stage 3.3 territory — accept-and-drop so the driver can be
+            // wired without crashing on out-of-stage inputs, but emit a
             // `tracing::debug!` so the drop is observable. `input @ (..)`
             // binds the value through the disjunctive pattern so the trace
             // can record the actual variant; this preserves the explicit
             // per-variant enumeration (no wildcard) so the compiler still
             // forces a decision on any future `Input` variant.
-            input @ (Input::VoteRequest(_)
-            | Input::VoteResponse { .. }
-            | Input::PreVoteRequest(_)
-            | Input::PreVoteResponse { .. }
-            | Input::FetchRequest(_)
-            | Input::FetchResponse(_)
-            | Input::ClientPropose(_)) => {
+            input
+            @ (Input::FetchRequest(_) | Input::FetchResponse(_) | Input::ClientPropose(_)) => {
                 tracing::debug!(
                     node_id = %self.id,
                     role = ?self.role,
                     current_term = %self.hard_state.current_term,
                     ?input,
-                    "input not yet handled (Stage 3.2/3.3 placeholder); dropping"
+                    "input not yet handled (Stage 3.3 placeholder); dropping"
                 );
                 Vec::new()
             }
