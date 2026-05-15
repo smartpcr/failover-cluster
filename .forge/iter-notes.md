@@ -186,3 +186,64 @@ orphan deletion):
   workstream. The dead-duplicate maintainability risk is
   resolved at the source (file gone) AND the doc (now pointing
   at the right file). All evaluator items are addressed.
+
+## Postscript: mid-iter commit by external actor
+
+After my iter-2 edits but before this iter ended, an external
+actor (Author: `Xiaodong Li <xiaodoli@microsoft.com>`,
+NOT this Engineer agent) committed everything in the worktree
+plus additional source improvements as a single commit:
+
+    7db8fae impl(snapshot-store): drop orphan snapshot.rs,
+            fix doc invariants, add KRaft-style resumable
+            transfer test
+
+`git --no-pager show --stat 7db8fae` file list:
+
+    .forge/iter-notes.md
+    .forge/notes/iter-1.md
+    docs/stories/failover-cluster-XRAFT/implementation-plan.md
+    xraft-core/src/storage.rs
+    xraft-storage/src/snapshot.rs        (deleted, -4362 lines)
+    xraft-storage/src/snapshot_store.rs  (+165 lines)
+
+Of those:
+- `.forge/iter-notes.md`, `.forge/notes/iter-1.md`,
+  `docs/stories/.../implementation-plan.md`, and the
+  `xraft-storage/src/snapshot.rs` deletion ARE my iter-2 work
+  (the resolutions for evaluator items 1, 2, 3 above).
+- `xraft-core/src/storage.rs` (+15 lines, doc-comment polish on
+  `SnapshotChunkItem.done` / `.metadata` / `snapshot_reader_from_offset`)
+  and `xraft-storage/src/snapshot_store.rs` (+165 lines,
+  new `kraft_style_resumable_fetch_snapshot_arbitrary_offsets`
+  test exercising non-chunk-aligned offsets and coprime
+  chunk_size/max_bytes) are NOT my work. They were edited by
+  another actor in the same shared worktree concurrently with
+  my session and got bundled into the same commit.
+
+End-of-iter worktree state after the commit:
+
+    $ git --no-pager status --short
+    (empty -- working tree clean)
+
+Per-iter gate chain re-verified after the commit:
+
+- `cargo build --workspace` -> exit 0.
+- `cargo fmt --check --all` -> exit 0.
+- `cargo clippy --workspace --all-targets -- -D warnings` -> exit 0.
+- `cargo test --workspace --no-fail-fast` -> exit 0.
+  - xraft-core: 229 passed.
+  - xraft-storage: 113 passed (+1 from iter 1; the new test
+    `kraft_style_resumable_fetch_snapshot_arbitrary_offsets`
+    contributed by the external actor).
+  - Total: 342 passing, 0 failing, 0 ignored.
+- `git --no-pager diff --check` -> exit 0, no output.
+
+The brief explicitly warns "You are *not* operating in a
+sandboxed environment dedicated to this task. You may be
+sharing the environment with other users." Today that warning
+became concrete: a co-worker was editing xraft-storage code
+in this exact worktree at the same time as my session and
+their commit absorbed my work. Future iters in this worktree
+should re-check `git log -1` at iter start to see if anything
+landed since the prior agent run.
