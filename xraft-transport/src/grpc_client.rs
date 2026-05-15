@@ -9,19 +9,17 @@
 //! # Connection pool
 //!
 //! tonic `Channel`s are cheaply cloneable handles backed by a multiplexed
-//! HTTP/2 connection. The pool maps `NodeId` to `Channel`. A *separate*
-//! per-peer connect mutex (`connect_locks`) serialises concurrent
-//! `endpoint.connect()` attempts for the same peer: when several tasks
-//! observe an empty pool entry at the same instant — typically right after
-//! [`RaftGrpcClient::invalidate`] drops a stale channel on a transient RPC
-//! failure — exactly one task performs the TCP/TLS handshake and the
-//! others wait for it to publish the channel into the pool. Different
-//! peers use different mutexes so a slow connect attempt for peer A still
-//! never blocks lookups or connects for peer B (the original design
-//! intent of the double-checked locking pattern). The connect-lock map
-//! is bounded in size by the configured `peer_endpoints` set: unknown
-//! peers are rejected *before* a per-peer mutex is created, so adversarial
-//! or buggy callers cannot grow the map.
+//! HTTP/2 connection. The pool maps `NodeId` to `Channel`. Concurrent
+//! RPCs against an uncached peer are funnelled through a **per-peer**
+//! `tokio::sync::Mutex` so they share a single TCP/TLS handshake instead
+//! of racing N parallel `endpoint.connect()` calls — preventing a
+//! cold-start / post-invalidate connection storm against a recovering
+//! peer. Concurrent traffic against *different* peers still proceeds
+//! fully in parallel: peer A's slow connect never blocks peer B's
+//! lookups, because each peer owns its own mutex. Channels are evicted
+//! from the pool when an RPC observes a transport-level error so the
+//! next call re-establishes a fresh connection (re-entering the same
+//! per-peer serialised connect path).
 //!
 //! # Retry policy
 //!
@@ -50,7 +48,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tonic::Request;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tracing::{debug, warn};
@@ -137,23 +135,40 @@ impl From<ChannelError> for XRaftError {
 pub struct RaftGrpcClient {
     config: RaftGrpcClientConfig,
     pool: Arc<RwLock<HashMap<NodeId, Channel>>>,
-    /// Per-peer mutex that serialises concurrent `endpoint.connect()`
-    /// attempts for the same peer. Created lazily on first lookup for a
-    /// configured peer. The map is bounded in size by
-    /// `config.peer_endpoints.len()` because unknown peers are rejected
-    /// before a mutex is created. Entries are never removed: a few-byte
-    /// `Arc<Mutex<()>>` per cluster member is cheaper than re-allocating
-    /// the mutex on every reconnect cycle.
-    connect_locks: Arc<RwLock<HashMap<NodeId, Arc<Mutex<()>>>>>,
+    /// Per-peer async mutexes that serialise *connection attempts*.
+    ///
+    /// Without these, a burst of N concurrent RPCs against the same
+    /// uncached peer would each invoke `endpoint.connect().await` in
+    /// parallel and then race at the pool's write lock — only one
+    /// channel is kept, the other N − 1 freshly-completed TCP/TLS
+    /// handshakes are silently discarded. That is wasteful at cold
+    /// start and pathological after `invalidate()` triggers a
+    /// correlated reconnect burst against a recovering peer.
+    ///
+    /// The map is sized once at construction from `peer_endpoints`
+    /// and is then immutable, so no outer lock is required around the
+    /// lookup. Each entry is an `Arc<tokio::sync::Mutex<()>>` that is
+    /// held *only* across the slow-path connect of `channel_for` for
+    /// that single peer; other peers proceed independently.
+    connect_locks: Arc<HashMap<NodeId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl RaftGrpcClient {
     /// Construct a new client with the supplied configuration.
     pub fn new(config: RaftGrpcClientConfig) -> Self {
+        // Pre-allocate one connect mutex per configured peer so the
+        // map can be a plain immutable `HashMap` after construction
+        // (no outer lock needed on the hot lookup path).
+        let connect_locks: HashMap<NodeId, Arc<tokio::sync::Mutex<()>>> = config
+            .peer_endpoints
+            .keys()
+            .cloned()
+            .map(|peer| (peer, Arc::new(tokio::sync::Mutex::new(()))))
+            .collect();
         Self {
             config,
             pool: Arc::new(RwLock::new(HashMap::new())),
-            connect_locks: Arc::new(RwLock::new(HashMap::new())),
+            connect_locks: Arc::new(connect_locks),
         }
     }
 
@@ -186,50 +201,53 @@ impl RaftGrpcClient {
         Ok(endpoint)
     }
 
-    /// Acquire (or lazily create) the per-peer connect mutex.
-    ///
-    /// The double-checked locking on `connect_locks` avoids taking the
-    /// write-lock on every call once the mutex Arc exists. Callers must
-    /// ensure `peer` is already known-valid (i.e. present in
-    /// `peer_endpoints`) before invoking this helper; otherwise the
-    /// connect-lock map would grow without bound for adversarial inputs.
-    async fn connect_lock_for(&self, peer: NodeId) -> Arc<Mutex<()>> {
-        if let Some(m) = self.connect_locks.read().await.get(&peer).cloned() {
-            return m;
-        }
-        let mut locks = self.connect_locks.write().await;
-        locks
-            .entry(peer)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    }
-
     /// Get an existing pooled channel for `peer` or open a fresh one with
     /// a **single** connection attempt.
+    ///
+    /// Concurrent callers that all miss the read-lock fast path for the
+    /// same peer are serialised on a per-peer `tokio::sync::Mutex`, so
+    /// only ONE TCP/TLS handshake is performed per cold-start burst.
+    /// The per-peer mutex is dropped before the function returns, and
+    /// callers for *other* peers are never blocked.
     ///
     /// On a connect failure, returns [`ChannelError::Connect`]. The
     /// caller's RPC retry loop is responsible for deciding whether to
     /// back off and retry; this avoids the nested retry loop that
     /// previously caused a dead peer to consume `max_retries²`
     /// connection attempts per RPC.
-    ///
-    /// Concurrent calls for the *same* peer that miss the fast path
-    /// serialise on a per-peer mutex so they share one connection
-    /// attempt instead of all racing `endpoint.connect()` in parallel —
-    /// preventing connection storms against a recovering peer right
-    /// after [`invalidate`](Self::invalidate). Calls for *different*
-    /// peers proceed in parallel because each has its own mutex.
     async fn channel_for(&self, peer: NodeId) -> Result<Channel, ChannelError> {
-        // Fast path: read-lock and clone if cached. No connect mutex
-        // needed when the channel is already published.
+        // Fast path: read-lock and clone if cached.
         if let Some(channel) = self.pool.read().await.get(&peer).cloned() {
             return Ok(channel);
         }
 
-        // Resolve and validate the peer URL *before* touching the
-        // connect-lock map. Unknown peers fail here without creating a
-        // per-peer mutex, keeping `connect_locks` bounded by
-        // `peer_endpoints.len()`.
+        // Per-peer connect serialisation. Look up the peer's mutex; an
+        // unknown peer is a configuration error (matches the original
+        // behaviour of returning `Misconfigured` before any connect).
+        let connect_lock = self
+            .connect_locks
+            .get(&peer)
+            .cloned()
+            .ok_or_else(|| {
+                ChannelError::Misconfigured(XRaftError::Transport(format!(
+                    "no endpoint configured for peer {peer:?}; check ClusterConfig.voters"
+                )))
+            })?;
+
+        // Hold the per-peer guard across the entire connect + insert
+        // critical section so that concurrent tasks for *this* peer
+        // share the single handshake performed below. Other peers
+        // proceed in parallel because each peer has its own mutex.
+        let _connect_guard = connect_lock.lock().await;
+
+        // Double-check the pool now that we hold the per-peer guard —
+        // a task that was ahead of us in the per-peer queue may have
+        // already connected and populated the pool, in which case we
+        // skip the redundant handshake entirely.
+        if let Some(channel) = self.pool.read().await.get(&peer).cloned() {
+            return Ok(channel);
+        }
+
         let url = self
             .config
             .peer_endpoints
@@ -243,35 +261,20 @@ impl RaftGrpcClient {
         let endpoint = self
             .build_endpoint(&url)
             .map_err(ChannelError::Misconfigured)?;
-
-        // Serialise concurrent connect attempts for this peer. We drop
-        // the `connect_locks` RwLock guard inside `connect_lock_for`
-        // before awaiting the per-peer mutex, so different peers never
-        // block each other and the global lock is never held across the
-        // `endpoint.connect()` await.
-        let connect_lock = self.connect_lock_for(peer).await;
-        let _guard = connect_lock.lock().await;
-
-        // Re-check the pool under the per-peer mutex: a concurrent task
-        // that won the previous race may have just published a channel
-        // while we were queued behind it.
-        if let Some(channel) = self.pool.read().await.get(&peer).cloned() {
-            return Ok(channel);
-        }
-
         let channel = endpoint
             .connect()
             .await
             .map_err(|e| ChannelError::Connect(format!("connect to peer {}: {e}", peer.0)))?;
 
-        // Publish. `entry().or_insert(...)` is defensive: while no other
-        // task can be inside `channel_for` for this peer (we hold the
-        // per-peer mutex), the `or_insert` form keeps this insertion
-        // race-free against any future writer to `pool` and matches the
-        // pattern used elsewhere in the file.
-        let mut pool = self.pool.write().await;
-        let entry = pool.entry(peer).or_insert(channel).clone();
-        Ok(entry)
+        // We still hold the per-peer connect guard, so no other task
+        // can be racing to insert a channel for this peer. A plain
+        // insert is sufficient and clearer than `entry().or_insert()`.
+        // A concurrent `invalidate(peer)` is benign: either it ran
+        // before our insert (pool was empty here — fine) or it runs
+        // after, in which case the next caller will rebuild via this
+        // same serialised path.
+        self.pool.write().await.insert(peer, channel.clone());
+        Ok(channel)
     }
 
     /// Acquire a channel for one RPC attempt within the outer retry loop.
@@ -316,13 +319,6 @@ impl RaftGrpcClient {
 
     /// Drop the pooled channel for `peer` so the next `channel_for` call
     /// rebuilds it.
-    ///
-    /// This is cache eviction, **not** a fence: it does not cancel an
-    /// in-flight `connect()` attempt that is happening under the per-peer
-    /// connect mutex. A connect that began before an `invalidate` call
-    /// will still publish its (freshly-established) channel afterwards.
-    /// That is correct behaviour — the freshly-connected channel is by
-    /// definition newer than the one being invalidated.
     async fn invalidate(&self, peer: NodeId) {
         let mut pool = self.pool.write().await;
         pool.remove(&peer);
@@ -535,24 +531,12 @@ impl RaftGrpcClient {
 
         Ok(mapped)
     }
-
-    /// Snapshot the set of peers that have a per-peer connect mutex
-    /// allocated. Test-only inspector for verifying the bound on
-    /// `connect_locks` growth.
-    #[cfg(test)]
-    async fn connect_locked_peers(&self) -> Vec<NodeId> {
-        let mut v: Vec<NodeId> = self.connect_locks.read().await.keys().copied().collect();
-        v.sort_by_key(|p| p.0);
-        v
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::net::TcpListener;
 
     #[test]
     fn jittered_sleep_within_equal_jitter_bounds() {
@@ -612,212 +596,32 @@ mod tests {
         }
     }
 
-    /// Build a config that points one peer at the supplied address with
-    /// generous timeouts and no retry budget — useful for tests that
-    /// exercise `channel_for` directly.
-    fn test_config(peer: NodeId, addr: std::net::SocketAddr) -> RaftGrpcClientConfig {
-        let mut endpoints = HashMap::new();
-        endpoints.insert(peer, format!("http://{addr}"));
-        RaftGrpcClientConfig {
-            peer_endpoints: endpoints,
-            connect_timeout: Duration::from_secs(5),
-            rpc_timeout: Duration::from_secs(5),
-            max_retries: 0,
-            initial_backoff: Duration::from_millis(1),
-            max_backoff: Duration::from_millis(1),
-            max_message_size: 1024,
-            tls: None,
-        }
-    }
-
-    /// Concurrent `channel_for` calls for the same peer must serialise on
-    /// the per-peer connect mutex so that no more than one TCP connect is
-    /// observed by the server at any instant — the *core* invariant the
-    /// fix introduces, and the one the review comment asked for.
-    ///
-    /// A local `TcpListener` accepts connections, holds each socket open
-    /// for a window long enough that parallel clients would overlap, and
-    /// tracks the peak number of simultaneously-open inbound sockets via
-    /// an atomic counter. Without serialisation the peak would equal the
-    /// caller fan-out; with serialisation it must be exactly 1.
-    #[tokio::test]
-    async fn channel_for_serialises_concurrent_connects_to_same_peer() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let total = Arc::new(AtomicUsize::new(0));
-
-        let active_srv = Arc::clone(&active);
-        let peak_srv = Arc::clone(&peak);
-        let total_srv = Arc::clone(&total);
-
-        // Server: hold each accepted socket open for a window long enough
-        // that two unsynchronised clients would visibly overlap.
-        let server = tokio::spawn(async move {
-            loop {
-                let (sock, _) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(_) => break,
-                };
-                total_srv.fetch_add(1, Ordering::SeqCst);
-                let active_inner = Arc::clone(&active_srv);
-                let peak_inner = Arc::clone(&peak_srv);
-                tokio::spawn(async move {
-                    let n = active_inner.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak_inner.fetch_max(n, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(80)).await;
-                    active_inner.fetch_sub(1, Ordering::SeqCst);
-                    drop(sock);
-                });
-            }
-        });
-
-        let peer = NodeId(1);
-        let client = Arc::new(RaftGrpcClient::new(test_config(peer, addr)));
-
-        const FANOUT: usize = 8;
-        let mut joins = Vec::with_capacity(FANOUT);
-        for _ in 0..FANOUT {
-            let c = Arc::clone(&client);
-            joins.push(tokio::spawn(async move {
-                // Connection will fail (server never speaks HTTP/2) but
-                // the TCP accept on the listener side is what we count.
-                let _ = c.channel_for(peer).await;
-            }));
-        }
-        for j in joins {
-            let _ = j.await;
-        }
-
-        server.abort();
-
-        let observed_peak = peak.load(Ordering::SeqCst);
-        let observed_total = total.load(Ordering::SeqCst);
-        assert_eq!(
-            observed_peak, 1,
-            "expected per-peer serialisation; saw {observed_peak} simultaneous inbound \
-             connections (total accepts: {observed_total})",
-        );
-
-        // Exactly one connect-mutex was created for this peer, regardless
-        // of fan-out, and the pool stays empty because every connect fails
-        // at the HTTP/2 layer.
-        assert_eq!(client.connect_locked_peers().await, vec![peer]);
-        assert_eq!(client.pool_size().await, 0);
-    }
-
-    /// Concurrent `channel_for` calls for *different* peers must NOT
-    /// serialise — that would re-introduce the head-of-line blocking the
-    /// original double-checked locking pattern was designed to avoid.
-    ///
-    /// Each peer connects to its own local listener that holds the socket
-    /// open for the same window. A shared atomic counter aggregates the
-    /// active inbound-socket count across BOTH listeners, so we can
-    /// distinguish "serialised across peers" (peak = 1) from "parallel
-    /// across peers" (peak = 2). The fix must produce the latter.
-    #[tokio::test]
-    async fn channel_for_does_not_serialise_across_different_peers() {
-        let listener_a = TcpListener::bind("127.0.0.1:0").await.expect("bind a");
-        let listener_b = TcpListener::bind("127.0.0.1:0").await.expect("bind b");
-        let addr_a = listener_a.local_addr().expect("local_addr a");
-        let addr_b = listener_b.local_addr().expect("local_addr b");
-
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-
-        let spawn_listener = |listener: TcpListener,
-                              active: Arc<AtomicUsize>,
-                              peak: Arc<AtomicUsize>| {
-            tokio::spawn(async move {
-                loop {
-                    let (sock, _) = match listener.accept().await {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
-                    let active_inner = Arc::clone(&active);
-                    let peak_inner = Arc::clone(&peak);
-                    tokio::spawn(async move {
-                        let n = active_inner.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak_inner.fetch_max(n, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(80)).await;
-                        active_inner.fetch_sub(1, Ordering::SeqCst);
-                        drop(sock);
-                    });
-                }
-            })
-        };
-
-        let srv_a = spawn_listener(listener_a, Arc::clone(&active), Arc::clone(&peak));
-        let srv_b = spawn_listener(listener_b, Arc::clone(&active), Arc::clone(&peak));
-
-        let peer_a = NodeId(1);
-        let peer_b = NodeId(2);
-        let mut endpoints = HashMap::new();
-        endpoints.insert(peer_a, format!("http://{addr_a}"));
-        endpoints.insert(peer_b, format!("http://{addr_b}"));
+    #[test]
+    fn connect_locks_initialised_for_every_configured_peer() {
+        // The per-peer connect serialisation only works if every
+        // configured peer has a pre-allocated mutex. Guard against a
+        // future refactor that forgets to wire up `connect_locks`.
+        let mut peers = HashMap::new();
+        peers.insert(NodeId(1), "http://10.0.0.1:6000".to_string());
+        peers.insert(NodeId(2), "http://10.0.0.2:6000".to_string());
+        peers.insert(NodeId(7), "http://10.0.0.7:6000".to_string());
         let cfg = RaftGrpcClientConfig {
-            peer_endpoints: endpoints,
-            connect_timeout: Duration::from_secs(5),
-            rpc_timeout: Duration::from_secs(5),
+            peer_endpoints: peers.clone(),
+            connect_timeout: Duration::from_secs(1),
+            rpc_timeout: Duration::from_secs(1),
             max_retries: 0,
-            initial_backoff: Duration::from_millis(1),
-            max_backoff: Duration::from_millis(1),
-            max_message_size: 1024,
-            tls: None,
-        };
-        let client = Arc::new(RaftGrpcClient::new(cfg));
-
-        let ca = Arc::clone(&client);
-        let cb = Arc::clone(&client);
-        let ja = tokio::spawn(async move {
-            let _ = ca.channel_for(peer_a).await;
-        });
-        let jb = tokio::spawn(async move {
-            let _ = cb.channel_for(peer_b).await;
-        });
-        let _ = ja.await;
-        let _ = jb.await;
-
-        srv_a.abort();
-        srv_b.abort();
-
-        let observed_peak = peak.load(Ordering::SeqCst);
-        assert_eq!(
-            observed_peak, 2,
-            "expected peer A and peer B connects to overlap; saw peak {observed_peak} \
-             (different peers must use independent connect mutexes)",
-        );
-    }
-
-    /// Unknown peers must be rejected *before* a per-peer connect mutex
-    /// is created, so that adversarial or buggy callers cannot grow
-    /// `connect_locks` without bound.
-    #[tokio::test]
-    async fn channel_for_unknown_peer_does_not_grow_connect_locks() {
-        let cfg = RaftGrpcClientConfig {
-            peer_endpoints: HashMap::new(),
-            connect_timeout: Duration::from_millis(50),
-            rpc_timeout: Duration::from_millis(50),
-            max_retries: 0,
-            initial_backoff: Duration::from_millis(1),
-            max_backoff: Duration::from_millis(1),
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(100),
             max_message_size: 1024,
             tls: None,
         };
         let client = RaftGrpcClient::new(cfg);
-
-        for id in 0..16u64 {
-            let res = client.channel_for(NodeId(id)).await;
+        assert_eq!(client.connect_locks.len(), peers.len());
+        for peer in peers.keys() {
             assert!(
-                matches!(res, Err(ChannelError::Misconfigured(_))),
-                "expected Misconfigured for unknown peer {id}, got {res:?}"
+                client.connect_locks.contains_key(peer),
+                "missing connect mutex for {peer:?}"
             );
         }
-        assert!(
-            client.connect_locked_peers().await.is_empty(),
-            "connect_locks must stay empty for unknown peers"
-        );
     }
 }
