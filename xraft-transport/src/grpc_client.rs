@@ -24,14 +24,31 @@
 //! # Retry policy
 //!
 //! Unary RPCs (`Vote`, `PreVote`, `Fetch`) retry on
-//! [`tonic::Code::Unavailable`] up to `max_retries` times with exponential
-//! backoff **with equal jitter** (sleep in `[backoff/2, backoff]`), capped
-//! at `max_backoff`. Equal jitter satisfies the `architecture.md` §2.3
-//! requirement of "exponential with jitter, max 5 s" and prevents
-//! synchronised reconnect storms when many peers detect the same outage
+//! [`tonic::Code::Unavailable`] and [`tonic::Code::DeadlineExceeded`] up
+//! to `max_retries` times with exponential backoff **with equal jitter**
+//! (sleep in `[backoff/2, backoff]`), capped at `max_backoff`. Equal
+//! jitter satisfies the `architecture.md` §2.3 requirement of
+//! "exponential with jitter, max 5 s" and prevents synchronised
+//! reconnect storms when many peers detect the same outage
 //! simultaneously. Streaming `FetchSnapshot` only retries the initial RPC
 //! invocation; mid-stream errors are surfaced to the caller because
 //! re-running the entire stream from scratch would corrupt offset-tracking.
+//!
+//! Other tonic status codes are deliberately **not** retried at the
+//! transport layer. In particular:
+//!
+//! * `ResourceExhausted` indicates that the *server* has hit a rate or
+//!   quota limit. Repeating the call from the transport layer competes
+//!   with — and undermines — whatever admission-control / load-shedding
+//!   response the peer is using to recover, and burns this client's
+//!   retry budget on a condition that exponential backoff alone cannot
+//!   resolve. The Raft layer above re-issues the logical RPC on its own
+//!   schedule, which is the correct place to react to sustained server
+//!   pressure.
+//! * `Aborted` carries gRPC's documented semantics of a higher-level
+//!   concurrency conflict ("retry at a higher level") rather than a
+//!   transient transport failure. The Raft state machine is the only
+//!   layer with enough context to decide whether re-issuing makes sense.
 //!
 //! Connect-time failures (peer unreachable, TLS handshake error) are
 //! folded into the *same* outer retry loop as RPC failures — each call
@@ -334,13 +351,23 @@ impl RaftGrpcClient {
 
     /// Decide whether a tonic error represents a transient transport-level
     /// failure that justifies a retry on a fresh connection.
+    ///
+    /// Only [`tonic::Code::Unavailable`] (server is unreachable, channel
+    /// torn down, HTTP/2 GOAWAY, etc.) and [`tonic::Code::DeadlineExceeded`]
+    /// (the per-RPC timeout fired) are treated as transport-transient.
+    /// Both clear cleanly with a fresh channel after a jittered backoff.
+    ///
+    /// Other status codes — including `ResourceExhausted` (server-side
+    /// overload / quota) and `Aborted` (gRPC's higher-level concurrency
+    /// conflict; "retry at a higher level" per the gRPC spec) — must NOT
+    /// be retried at the transport layer. They are surfaced to the Raft
+    /// layer above, which has the cluster-wide context needed to decide
+    /// whether and when to re-issue the logical RPC. See the module-level
+    /// `# Retry policy` section for the full rationale.
     fn is_retriable(status: &tonic::Status) -> bool {
         matches!(
             status.code(),
-            tonic::Code::Unavailable
-                | tonic::Code::DeadlineExceeded
-                | tonic::Code::ResourceExhausted
-                | tonic::Code::Aborted
+            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
         )
     }
 
@@ -621,6 +648,55 @@ mod tests {
             assert!(
                 client.connect_locks.contains_key(peer),
                 "missing connect mutex for {peer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_retriable_matches_documented_policy() {
+        // Lock in the documented retry policy: only `Unavailable` and
+        // `DeadlineExceeded` are transport-transient. Every other tonic
+        // status code — including `ResourceExhausted` (server-side
+        // overload) and `Aborted` (gRPC's "retry at a higher level"
+        // concurrency conflict) — must be surfaced to the Raft layer
+        // above without consuming this client's retry budget.
+        use tonic::{Code, Status};
+
+        // Retried.
+        assert!(RaftGrpcClient::is_retriable(&Status::new(
+            Code::Unavailable,
+            ""
+        )));
+        assert!(RaftGrpcClient::is_retriable(&Status::new(
+            Code::DeadlineExceeded,
+            ""
+        )));
+
+        // Explicitly NOT retried. `ResourceExhausted` and `Aborted` are
+        // the two codes called out in the module-level docs; the rest
+        // pin down the full status-code surface so a future edit that
+        // adds a code has to update this test deliberately.
+        let non_retriable = [
+            Code::Ok,
+            Code::Cancelled,
+            Code::Unknown,
+            Code::InvalidArgument,
+            Code::NotFound,
+            Code::AlreadyExists,
+            Code::PermissionDenied,
+            Code::ResourceExhausted,
+            Code::FailedPrecondition,
+            Code::Aborted,
+            Code::OutOfRange,
+            Code::Unimplemented,
+            Code::Internal,
+            Code::DataLoss,
+            Code::Unauthenticated,
+        ];
+        for code in non_retriable {
+            assert!(
+                !RaftGrpcClient::is_retriable(&Status::new(code, "")),
+                "tonic::Code::{code:?} must not be retriable at the transport layer"
             );
         }
     }
