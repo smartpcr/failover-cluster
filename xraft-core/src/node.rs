@@ -1715,25 +1715,17 @@ impl RaftNode {
             return actions;
         }
 
-        // Non-diverging entries path. Move `entries` out of `resp` once
-        // up-front so the validation window can borrow `&entries` and the
-        // final `Action::AppendEntries(entries)` is a move rather than a
-        // clone. Cloning a `Vec<Entry>` whose payloads are large
-        // `Command` blobs would otherwise duplicate every byte of the
-        // batch on the hot replication path. `resp.high_watermark` below
-        // is a different field (`Copy`) so partial-moving `entries` here
-        // is fine.
-        let entries = resp.entries;
-        if !entries.is_empty() {
+        // Non-diverging entries path.
+        if !resp.entries.is_empty() {
             // Sanity: entries must be contiguous starting at last_log_index + 1.
             // If the leader sent an out-of-order batch, drop and let the next
             // tick re-fetch.
             let expected_first = LogIndex(self.last_log_index.0.saturating_add(1));
-            if entries[0].index != expected_first {
+            if resp.entries[0].index != expected_first {
                 tracing::warn!(
                     node_id = %self.id,
                     expected_first = %expected_first,
-                    actual_first = %entries[0].index,
+                    actual_first = %resp.entries[0].index,
                     "dropping FetchResponse with non-contiguous entries"
                 );
                 return actions;
@@ -1748,7 +1740,7 @@ impl RaftNode {
             // (term may only stay the same or grow within a single batch
             // from a single leader epoch) for the same reason. Drop the
             // entire response ΓÇö the next tick re-fetches.
-            for w in entries.windows(2) {
+            for w in resp.entries.windows(2) {
                 if w[1].index.0 != w[0].index.0.saturating_add(1) {
                     tracing::warn!(
                         node_id = %self.id,
@@ -1768,10 +1760,10 @@ impl RaftNode {
                     return actions;
                 }
             }
-            let last_entry = entries.last().expect("entries is non-empty");
+            let last_entry = resp.entries.last().expect("entries is non-empty");
             let new_last_index = last_entry.index;
             let new_last_term = last_entry.term;
-            actions.push(Action::AppendEntries(entries));
+            actions.push(Action::AppendEntries(resp.entries.clone()));
             self.last_log_index = new_last_index;
             self.last_log_term = new_last_term;
         }
@@ -4562,6 +4554,139 @@ port = 6004
             )),
             "expected ApplyToStateMachine{{2,2}}, got {actions:?}"
         );
+    }
+
+    /// ClientPropose on a 3-voter leader: exercises the **multi-voter**
+    /// (non-auto-commit) path of §5.2 / Stage 3.3 step 5, complementing
+    /// the single-voter auto-commit path covered by
+    /// `scenario_client_propose_single_voter_commits_immediately`.
+    ///
+    /// On a multi-voter cluster the leader appends the new command
+    /// entry locally and emits `Action::AppendEntries`, but the entry
+    /// CANNOT commit until a quorum of voters has replicated it. Until
+    /// then no `Action::ApplyToStateMachine` may be emitted and neither
+    /// `commit_index` nor `last_applied` may move.
+    ///
+    /// This test verifies:
+    ///   (a) the immediate ClientPropose response carries
+    ///       `AppendEntries` for the new command at index 2 and **no**
+    ///       `ApplyToStateMachine`; `commit_index` / `last_applied`
+    ///       remain at 0 (not even the no-op at index 1 commits — no
+    ///       follower has yet acked anything);
+    ///   (b) commit advances only once a follower acks the new command
+    ///       index. A partial ack at offset=1 (no-op only) commits the
+    ///       no-op alone and leaves the command uncommitted; only the
+    ///       subsequent ack at offset=2 — the 2nd-of-3 voter reaching
+    ///       the new index — releases the command for apply.
+    #[test]
+    fn scenario_client_propose_three_voter_waits_for_quorum_ack() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 53).unwrap();
+        drive_three_voter_to_leader(&mut node);
+        // Sanity: leader at term 1, no-op at index 1, nothing committed,
+        // both peers untouched at offset 0.
+        assert_eq!(node.role, NodeRole::Leader);
+        assert_eq!(node.current_term(), Term(1));
+        assert_eq!(node.last_log_index, LogIndex(1));
+        assert_eq!(node.commit_index, LogIndex(0));
+        assert_eq!(node.last_applied, LogIndex(0));
+        assert_eq!(
+            node.peers.get(&NodeId(2)).unwrap().last_fetch_offset,
+            LogIndex(0)
+        );
+        assert_eq!(
+            node.peers.get(&NodeId(3)).unwrap().last_fetch_offset,
+            LogIndex(0)
+        );
+
+        // ---------- (a) ClientPropose: append, no commit, no apply ----------
+        let propose = node.step(Input::ClientPropose(bytes::Bytes::from_static(b"set k v")));
+
+        // The proposed entry is appended locally at index 2 with the
+        // leader's current term and a Command payload.
+        let appended = propose
+            .iter()
+            .find_map(|a| match a {
+                Action::AppendEntries(es) => Some(es.clone()),
+                _ => None,
+            })
+            .expect("AppendEntries emitted on ClientPropose");
+        assert_eq!(appended.len(), 1, "exactly one entry per ClientPropose");
+        assert_eq!(appended[0].index, LogIndex(2));
+        assert_eq!(appended[0].term, Term(1));
+        assert!(matches!(appended[0].payload, EntryPayload::Command(_)));
+
+        // Leader's local tail reflects the append, but commit/apply do
+        // NOT move: peer 2 and peer 3 are still at offset 0, so the
+        // sorted offsets are [leader=2, peer2=0, peer3=0] and the q-th
+        // value (q=2) is offsets[1]=0 — short of even the no-op at 1.
+        assert_eq!(node.last_log_index, LogIndex(2));
+        assert_eq!(node.last_log_term, Term(1));
+        assert_eq!(
+            node.commit_index,
+            LogIndex(0),
+            "multi-voter ClientPropose must NOT auto-commit",
+        );
+        assert_eq!(
+            node.last_applied,
+            LogIndex(0),
+            "multi-voter ClientPropose must NOT apply locally",
+        );
+        assert!(
+            !propose
+                .iter()
+                .any(|a| matches!(a, Action::ApplyToStateMachine { .. })),
+            "no ApplyToStateMachine until a quorum acks the new index, got {propose:?}",
+        );
+
+        // ---------- (b1) Partial ack at offset=1 commits only the no-op ----------
+        // Sorted offsets: [leader=2, peer2=1, peer3=0] -> q-th = offsets[1] = 1.
+        // commit_index advances to 1 (no-op), demonstrating that the
+        // command at index 2 specifically requires a quorum at
+        // offset>=2 — a partial ack short of the new index does NOT
+        // commit it. Only ApplyToStateMachine{1,1} for the no-op fires.
+        let ack_noop = node.step(Input::FetchRequestAcked {
+            replica_id: NodeId(2),
+            confirmed_offset: LogIndex(1),
+        });
+        assert_eq!(node.commit_index, LogIndex(1));
+        assert_eq!(node.last_applied, LogIndex(1));
+        assert!(
+            ack_noop.iter().any(|a| matches!(
+                a,
+                Action::ApplyToStateMachine { from, to }
+                    if *from == LogIndex(1) && *to == LogIndex(1)
+            )),
+            "expected ApplyToStateMachine{{1,1}} for the no-op, got {ack_noop:?}",
+        );
+
+        // ---------- (b2) 2nd voter acks the new index -> command commits ----------
+        // Sorted offsets: [leader=2, peer2=2, peer3=0] -> q-th = offsets[1] = 2.
+        // The command at index 2 is now replicated on 2-of-3 voters
+        // (leader + node 2). Peer 3 is still at offset 0 — explicitly
+        // NOT required for quorum. commit_index advances to 2 and
+        // ApplyToStateMachine{2,2} is emitted.
+        let ack_cmd = node.step(Input::FetchRequestAcked {
+            replica_id: NodeId(2),
+            confirmed_offset: LogIndex(2),
+        });
+        assert_eq!(node.commit_index, LogIndex(2));
+        assert_eq!(node.last_applied, LogIndex(2));
+        assert_eq!(
+            node.peers.get(&NodeId(3)).unwrap().last_fetch_offset,
+            LogIndex(0),
+            "third voter is NOT required for quorum",
+        );
+        let apply = ack_cmd
+            .iter()
+            .find(|a| matches!(a, Action::ApplyToStateMachine { .. }))
+            .expect("ApplyToStateMachine emitted after the 2nd voter acks the new index");
+        match apply {
+            Action::ApplyToStateMachine { from, to } => {
+                assert_eq!(*from, LogIndex(2));
+                assert_eq!(*to, LogIndex(2));
+            }
+            other => panic!("expected ApplyToStateMachine, got {other:?}"),
+        }
     }
 
     /// ClientPropose on a non-leader is silently dropped (returns no
