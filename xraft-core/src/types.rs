@@ -150,7 +150,10 @@ pub enum VoterSetError {
     /// The voter set must contain at least one voter.
     Empty,
     /// Duplicate `(NodeId, DirectoryId)` pair found.
-    DuplicateVoter { node_id: NodeId, directory_id: DirectoryId },
+    DuplicateVoter {
+        node_id: NodeId,
+        directory_id: DirectoryId,
+    },
     /// A voter record has no endpoints.
     MissingEndpoints { node_id: NodeId },
     /// A voter record has a nil DirectoryId.
@@ -161,8 +164,14 @@ impl std::fmt::Display for VoterSetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VoterSetError::Empty => write!(f, "voter set must contain at least one voter"),
-            VoterSetError::DuplicateVoter { node_id, directory_id } => {
-                write!(f, "duplicate voter: node_id={node_id}, directory_id={directory_id}")
+            VoterSetError::DuplicateVoter {
+                node_id,
+                directory_id,
+            } => {
+                write!(
+                    f,
+                    "duplicate voter: node_id={node_id}, directory_id={directory_id}"
+                )
             }
             VoterSetError::MissingEndpoints { node_id } => {
                 write!(f, "voter {node_id} has no endpoints")
@@ -256,6 +265,80 @@ impl VoterSet {
         let nodes: std::collections::HashSet<NodeId> =
             self.voters.iter().map(|v| v.node_id).collect();
         nodes.len()
+    }
+}
+
+/// Set of voters that have granted a vote (real or pre-vote) to this node
+/// during a single election round.
+///
+/// `VoteGrantedSet` is the dedicated Stage 3.2 deliverable that tracks votes
+/// per election and prevents double-counting (per
+/// `implementation-plan.md` Stage 3.2 — "Add `VoteGrantedSet` to track votes
+/// per election, preventing double-counting"). It wraps a `HashSet<NodeId>`
+/// so a duplicate grant from the same voter — common when retries land on
+/// top of an already-counted response — cannot inflate the tally toward
+/// quorum.
+///
+/// The set is cleared on every role transition (`become_follower`,
+/// `become_pre_candidate`, `become_candidate`, `become_leader`) so a stale
+/// grant from a prior election round cannot contribute to the current one.
+/// See [`crate::node::RaftNode::votes_received`] and
+/// [`crate::node::RaftNode::pre_votes_received`] for the two concrete sites
+/// where this type is used.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VoteGrantedSet {
+    granted: std::collections::HashSet<NodeId>,
+}
+
+impl VoteGrantedSet {
+    /// Build an empty `VoteGrantedSet`.
+    pub fn new() -> Self {
+        Self {
+            granted: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Record a granter. Returns `true` if this is the first time the
+    /// granter has been recorded for the current election round
+    /// (mirroring [`HashSet::insert`] semantics, which is the dedupe
+    /// guarantee that prevents double-counting).
+    pub fn insert(&mut self, node_id: NodeId) -> bool {
+        self.granted.insert(node_id)
+    }
+
+    /// Whether `node_id` has already granted a vote in the current round.
+    pub fn contains(&self, node_id: &NodeId) -> bool {
+        self.granted.contains(node_id)
+    }
+
+    /// Number of unique granters recorded so far.
+    pub fn len(&self) -> usize {
+        self.granted.len()
+    }
+
+    /// Whether no votes have been recorded yet.
+    pub fn is_empty(&self) -> bool {
+        self.granted.is_empty()
+    }
+
+    /// Forget every recorded grant — called on every role transition so
+    /// the next election round starts from a clean slate.
+    pub fn clear(&mut self) {
+        self.granted.clear();
+    }
+
+    /// Iterate the recorded granter `NodeId`s in unspecified order.
+    pub fn iter(&self) -> impl Iterator<Item = &NodeId> {
+        self.granted.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a VoteGrantedSet {
+    type Item = &'a NodeId;
+    type IntoIter = std::collections::hash_set::Iter<'a, NodeId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.granted.iter()
     }
 }
 
@@ -543,7 +626,8 @@ mod tests {
             make_voter(3),
             make_voter(4),
             make_voter(5),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(vs5.quorum_size(), 3);
     }
 
@@ -560,7 +644,8 @@ mod tests {
                 directory_id: DirectoryId::new_random(),
                 endpoints: vec![Endpoint::new("host2", 6000)],
             },
-        ]).unwrap();
+        ])
+        .unwrap();
         assert!(vs.contains(NodeId(1)));
         assert!(vs.contains(NodeId(2)));
         assert!(!vs.contains(NodeId(3)));
@@ -623,28 +708,30 @@ mod tests {
 
     #[test]
     fn voter_set_rejects_nil_directory_id() {
-        let result = VoterSet::try_new(vec![
-            VoterRecord {
-                node_id: NodeId(1),
-                directory_id: DirectoryId::nil(),
-                endpoints: vec![Endpoint::new("host1", 6000)],
-            },
-        ]);
+        let result = VoterSet::try_new(vec![VoterRecord {
+            node_id: NodeId(1),
+            directory_id: DirectoryId::nil(),
+            endpoints: vec![Endpoint::new("host1", 6000)],
+        }]);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), VoterSetError::NilDirectoryId { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            VoterSetError::NilDirectoryId { .. }
+        ));
     }
 
     #[test]
     fn voter_set_rejects_missing_endpoints() {
-        let result = VoterSet::try_new(vec![
-            VoterRecord {
-                node_id: NodeId(1),
-                directory_id: DirectoryId::new_random(),
-                endpoints: vec![],
-            },
-        ]);
+        let result = VoterSet::try_new(vec![VoterRecord {
+            node_id: NodeId(1),
+            directory_id: DirectoryId::new_random(),
+            endpoints: vec![],
+        }]);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), VoterSetError::MissingEndpoints { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            VoterSetError::MissingEndpoints { .. }
+        ));
     }
 
     #[test]
@@ -653,7 +740,8 @@ mod tests {
             node_id: NodeId(1),
             directory_id: DirectoryId::new_random(),
             endpoints: vec![Endpoint::new("host1", 6000), Endpoint::new("host1", 6001)],
-        }]).unwrap();
+        }])
+        .unwrap();
         let json = serde_json::to_string(&vs).unwrap();
         let vs2: VoterSet = serde_json::from_str(&json).unwrap();
         assert_eq!(vs, vs2);
@@ -665,7 +753,10 @@ mod tests {
         let result: Result<VoterSet, _> = serde_json::from_str(json);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("at least one voter"), "expected validation error, got: {err}");
+        assert!(
+            err.contains("at least one voter"),
+            "expected validation error, got: {err}"
+        );
     }
 
     #[test]
@@ -674,7 +765,10 @@ mod tests {
         let result: Result<VoterSet, _> = serde_json::from_str(json);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("nil directory_id"), "expected validation error, got: {err}");
+        assert!(
+            err.contains("nil directory_id"),
+            "expected validation error, got: {err}"
+        );
     }
 
     #[test]
@@ -683,7 +777,10 @@ mod tests {
         let result: Result<VoterSet, _> = serde_json::from_str(json);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("no endpoints"), "expected validation error, got: {err}");
+        assert!(
+            err.contains("no endpoints"),
+            "expected validation error, got: {err}"
+        );
     }
 
     #[test]

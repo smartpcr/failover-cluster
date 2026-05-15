@@ -54,16 +54,46 @@ pub struct Entry {
 }
 
 /// Inputs consumed by the Raft state machine.
+///
+/// `Vote` / `PreVote` response variants carry an explicit `from: NodeId` because
+/// the on-the-wire response struct does not embed the responder identity (see
+/// the doc comment on [`VoteResponse`] / [`PreVoteResponse`]). The transport
+/// layer is responsible for deriving `from` from the connection context and
+/// passing it in. Other responses (`FetchResponse`) embed the responder ID
+/// (`leader_id`) inside the response payload so a separate field is unnecessary.
 #[derive(Debug, Clone)]
 pub enum Input {
     Tick,
     VoteRequest(VoteRequest),
-    VoteResponse(VoteResponse),
+    VoteResponse {
+        from: NodeId,
+        response: VoteResponse,
+    },
     PreVoteRequest(PreVoteRequest),
-    PreVoteResponse(PreVoteResponse),
+    PreVoteResponse {
+        from: NodeId,
+        response: PreVoteResponse,
+    },
     FetchRequest(FetchRequest),
     FetchResponse(FetchResponse),
     ClientPropose(Bytes),
+    /// Driver feedback after validating a [`FetchRequest`] (Stage 3.3).
+    ///
+    /// `handle_fetch_request` cannot itself check log divergence because the
+    /// engine is I/O-free and does not hold log entries. The driver, while
+    /// processing [`Action::ServeFetch`](Action::ServeFetch), reads the leader's
+    /// `LogStore::term_at(req.fetch_offset - 1)` and compares it to
+    /// `req.last_fetched_epoch`. If they match, the follower's confirmed
+    /// replication tip is `req.fetch_offset - 1`; the driver feeds this back
+    /// via `FetchRequestAcked` so the engine can update peer progress and
+    /// potentially advance the high watermark. If divergence is detected,
+    /// the driver feeds the response with `DivergingEpoch` instead and does
+    /// NOT emit this input — the diverging follower has not actually
+    /// replicated those entries.
+    FetchRequestAcked {
+        replica_id: NodeId,
+        confirmed_offset: LogIndex,
+    },
 }
 
 /// Side-effects emitted by the Raft state machine.
@@ -75,7 +105,24 @@ pub enum Action {
         to: NodeId,
         message: OutboundMessage,
     },
-    ApplyToStateMachine(Vec<Entry>),
+    /// Instruct the driver to read the inclusive range `[from, to]` (1-based)
+    /// from the durable `LogStore` and apply each entry to the state machine
+    /// callback. The engine has already advanced `last_applied` to `to`; the
+    /// driver MUST apply the entries (or halt and recover from durable state
+    /// on restart) before feeding any further input into the node, by the
+    /// same contract that requires it to honour [`Action::PersistHardState`]
+    /// before any RPC reply.
+    ///
+    /// **Why the engine emits indices, not entries**: the engine is I/O-free
+    /// and does not hold log entries (only the index/term mirror tail). The
+    /// driver looks up entries via `LogStore::get_range(from, to + 1)` when
+    /// dispatching to the state machine. This matches the
+    /// `apply_committed()` Stage 3.3 contract in `implementation-plan.md`
+    /// while keeping the engine pure.
+    ApplyToStateMachine {
+        from: LogIndex,
+        to: LogIndex,
+    },
     TakeSnapshot,
     /// Instruct the driver to install a snapshot received from the leader.
     InstallSnapshot {
@@ -84,6 +131,38 @@ pub enum Action {
     },
     BecomeLeader,
     StepDown,
+    /// Instruct the driver (acting as leader) to materialize a `FetchResponse`
+    /// for the given peer and dispatch it. The engine cannot construct the
+    /// response itself because it does not hold log entries; the driver
+    /// looks up `entries[fetch_offset .. fetch_offset + max_batch)` from
+    /// the durable `LogStore`, performs divergence detection by comparing
+    /// `LogStore::term_at(fetch_offset - 1)` with `last_fetched_epoch`, and
+    /// builds a [`FetchResponse`] using the envelope fields provided here.
+    /// On a successful (non-diverging) read, the driver also emits
+    /// [`Input::FetchRequestAcked`](Input::FetchRequestAcked) so the engine
+    /// can advance the per-peer replication tip and the high watermark.
+    ///
+    /// All envelope fields (`cluster_id`, `leader_epoch`, `leader_id`,
+    /// `high_watermark`) are captured at action-emit time so the driver does
+    /// not race against subsequent node mutations.
+    ServeFetch {
+        to: NodeId,
+        cluster_id: String,
+        leader_epoch: u64,
+        leader_id: NodeId,
+        high_watermark: LogIndex,
+        fetch_offset: LogIndex,
+        last_fetched_epoch: Term,
+    },
+    /// Instruct the driver (acting as follower) to truncate its durable log
+    /// from `from_index_inclusive` onward. After truncation the driver MUST
+    /// call [`RaftNode::set_last_log`](crate::node::RaftNode::set_last_log)
+    /// with the actual post-truncation last index/term so the engine's
+    /// in-memory mirror is consistent with durable state. Used by Stage 3.3
+    /// follower divergence resolution.
+    TruncateLog {
+        from_index_inclusive: LogIndex,
+    },
 }
 
 /// Messages sent over the network.
