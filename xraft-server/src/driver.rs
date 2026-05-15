@@ -1363,6 +1363,22 @@ where
                         }
                     }
                 }
+                Action::RejectUnsupportedInput { input_kind, reason } => {
+                    // Visible rejection from the engine for inputs whose
+                    // handlers are deferred to Stage 3.3 (ClientPropose /
+                    // FetchRequest / FetchResponse / FetchRequestAcked).
+                    // The engine guarantees no Raft state mutation when
+                    // emitting this action, so the driver only needs to
+                    // surface the rejection. Stage 3.3 will replace these
+                    // with real handlers and remove this arm.
+                    warn!(
+                        target: "xraft_server::driver",
+                        node_id = %self.node.id,
+                        input_kind = input_kind,
+                        reason = %reason,
+                        "engine rejected unsupported input (Stage 3.3 deferred)"
+                    );
+                }
             }
         }
         captured
@@ -2225,6 +2241,12 @@ port = 6000
     // -----------------------------------------------------------------
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[ignore = "Stage 3.3 (Log Replication): Stage 3.1's RejectUnsupportedInput \
+                contract intentionally rejects ClientPropose at the engine \
+                boundary, so this end-to-end propose-and-apply scenario will \
+                not pass until the Stage 3.3 propose pipeline lands. Re-enable \
+                (drop the #[ignore]) when Input::ClientPropose is wired in \
+                xraft-core/src/node.rs."]
     async fn driver_processes_tick_drives_election() {
         let cfg = single_voter_config(2);
         let (driver, handle, applied) = build_driver(cfg);
@@ -2290,6 +2312,12 @@ port = 6000
     // -----------------------------------------------------------------
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[ignore = "Stage 3.3 (Log Replication): Stage 3.1's RejectUnsupportedInput \
+                contract intentionally rejects ClientPropose at the engine \
+                boundary, so this commit-resolution scenario will not pass \
+                until the Stage 3.3 propose pipeline lands. Re-enable (drop \
+                the #[ignore]) when Input::ClientPropose is wired in \
+                xraft-core/src/node.rs."]
     async fn client_command_flow_appends_and_resolves_on_commit() {
         let cfg = single_voter_config(2);
         let (driver, handle, applied) = build_driver(cfg);

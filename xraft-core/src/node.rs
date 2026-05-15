@@ -1214,7 +1214,7 @@ impl RaftNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ClusterConfig, VoterConfig};
+    use crate::config::ClusterConfig;
     use crate::error::XRaftError;
     use crate::message::EntryPayload;
     use crate::types::{NodeId, NodeRole, Term};
@@ -2027,31 +2027,15 @@ port = 6000
     fn new_returns_err_on_invalid_voter_directory_id() {
         // `RaftNode::new_with_seed` MUST surface configuration errors
         // rather than silently degrading into an unable-to-elect state
-        // (per iter-2 evaluator finding #2). Bypass `from_toml_str` (which
-        // performs its own UUID validation) by constructing the
-        // `ClusterConfig` struct directly with a syntactically malformed
-        // `directory_id`. `build_voter_set` (or `validate`) must reject it
-        // and the error must reach the caller of `new_with_seed`.
-        let cfg = ClusterConfig {
-            node_id: NodeId(1),
-            cluster_id: "test".into(),
-            listen_addr: "0.0.0.0:6000".into(),
-            peers: Vec::new(),
-            voters: vec![VoterConfig {
-                node_id: 1,
-                directory_id: "not-a-valid-uuid".into(),
-                host: "node1".into(),
-                port: 6000,
-            }],
-            election_timeout_min_ms: 100,
-            election_timeout_max_ms: 200,
-            fetch_interval_ms: 50,
-            tick_interval_ms: 10,
-            snapshot_interval: 10_000,
-            max_log_entries_before_compaction: 100_000,
-            data_dir: std::path::PathBuf::from("data"),
-            snapshot_retention_count: 3,
-        };
+        // (per iter-2 evaluator finding #2). Bypass `from_toml_str`'s
+        // UUID validation by parsing a valid-shaped TOML first and then
+        // mutating `directory_id` in place to a syntactically malformed
+        // value. `build_voter_set` (or `validate`) must reject it and the
+        // error must reach the caller of `new_with_seed`. Building the
+        // struct via TOML keeps this test resilient to new transport /
+        // TLS fields added to `ClusterConfig` in later stages.
+        let mut cfg = single_voter_config();
+        cfg.voters[0].directory_id = "not-a-valid-uuid".into();
         let err = RaftNode::new_with_seed(cfg, 1).expect_err(
             "RaftNode::new_with_seed must propagate invalid voter config as Err, \
              not silently degrade voter_set to None",
