@@ -1,253 +1,210 @@
-# Stage 3.3: Log Replication -- iter 2
+# Stage 3.2: Leader Election -- iter 2 (post-merge cycle, Forge numbering)
 
 ## Iteration Summary
 
-Resolved all six numbered findings from the iter-1 evaluator (score 78,
-verdict iterate). Two findings (1 + 2) were API-shape contract gaps;
-one (3) was a test-semantics bug; three (4 + 5 + 6) were
-replication-safety / leader-fencing edge cases in `handle_fetch_response`
-and `handle_fetch_request`. All six are addressed structurally rather
-than via wording tweaks. Three new acceptance tests demonstrate the
-fence-fix behaviors of findings 4, 5, and 6 head-on, and the existing
-`scenario_basic_replication` was rewritten to exercise the correct
-two-round confirmed-offset arithmetic that finding 3 called out. Per-iter
-gate chain (build, fmt --check, clippy -D warnings, test, diff --check)
-is green; xraft-core test count rose from 221 to 224 (+3 new), and
-xraft-storage stays at 112.
+This iter directly addresses all four numbered findings the
+iter-1 evaluator (score 88, verdict iterate) raised against
+the prior iter's audit narrative. Three are FIXED with
+verifiable structural edits; one is DEFERRED with rationale
+because it requires operator action outside the generator's
+reach.
+
+The substantive Stage 3.2 implementation remains complete and
+merged upstream as PR #10 (commit `b266a71`). No Rust source,
+test, or production code is touched this iter; all edits are
+to the audit narrative (`.forge/iter-notes.md`) and to restore
+the historical archive at `.forge/notes/iter-1.md` that the
+prior iter accidentally overwrote.
+
+### Iter-numbering reconciliation
+
+The prior iter used a continuation numbering ("iter 11") that
+chained from the original cycle (iters 1-6) through the merge
+into the post-merge cycle (iters 7-11). Forge in fact restarted
+its iter counter when this workstream branched off the merged
+PR: the iter-1 evaluator confirms "iteration 1, score 88" was
+its label for what I called "iter 11". Adopting Forge's
+numbering from this iter forward removes the off-by-N mismatch
+that surfaced in iter-1's worktree state narrative and made
+the prior accounting confusing. This file is iter 2 by Forge's
+counter; the auto-archive will land at `.forge/notes/iter-2.md`.
 
 ### Prior feedback resolution
 
-- [x] 1. ADDRESSED -- Added `pub fn apply_committed(&mut self) -> Option<Action>`
-  at `xraft-core/src/node.rs` (around line 1383). It is a thin public
-  wrapper over the engine-internal `maybe_apply()` helper, so external
-  drivers (Stage 4 server / replication driver) can advance the apply
-  pointer at their own cadence as the impl-plan §3.3 requires. Verified
-  via `grep -nE "pub fn apply_committed" xraft-core/src/node.rs` and
-  the new `scenario_higher_term_fetch_response_processes_entries_after_stepdown`
-  test exercises the same maybe_apply emission path through the public
-  step API.
-
-- [x] 2. ADDRESSED -- Unified the two prior action variants
-  (`Action::ApplyToStateMachine(Vec<Entry>)` legacy + `Action::ApplyCommitted{from,to}`
-  engine-pure) into a single `Action::ApplyToStateMachine { from: LogIndex, to: LogIndex }`
-  in `xraft-core/src/message.rs` (around lines 100-117). The new variant
-  matches the impl-plan §3.3 contract name AND keeps the engine I/O-free
-  (driver reads entries via `LogStore::get_range(from, to+1)` rather than
-  the engine cloning entries into the action payload). All 22
-  `ApplyCommitted` references in `xraft-core/src/node.rs` were renamed
-  in one shot via PowerShell `(Get-Content -Raw) -replace`. There is
-  now exactly one apply-shaped action variant; verified via
-  `grep -nE "ApplyCommitted|ApplyToStateMachine" xraft-core/src/`
-  showing zero `ApplyCommitted` matches and a single
-  `ApplyToStateMachine { from, to }` definition.
-
-- [x] 3. ADDRESSED -- Rewrote `scenario_basic_replication` (around
-  `xraft-core/src/node.rs:3434-3585`) to exercise two real fetch rounds
-  with the correct confirmed-offset arithmetic. The test now does:
-  round 1 -- follower issues `FetchRequest { fetch_offset: 1, last_fetched_epoch: 0 }`
-  proving the follower has zero entries; driver feeds back
-  `FetchRequestAcked { confirmed_offset: 0 }` (= req.fetch_offset - 1),
-  asserts no commit advance (1-of-3 quorum). Round 2 -- follower issues
-  `FetchRequest { fetch_offset: 2, last_fetched_epoch: 1 }` proving
-  the follower now has the no-op at index 1; driver feeds back
-  `FetchRequestAcked { confirmed_offset: 1 }`, asserts commit advances
-  to 1 and `ApplyToStateMachine { from: 1, to: 1 }` is emitted. The
-  bogus same-round shortcut from iter-1 (request fetch_offset=1, ack
-  confirmed_offset=1 in the same round) is gone. The
-  `Input::FetchRequestAcked` docstring in message.rs already specified
-  this semantic; only the test was wrong.
-
-- [x] 4. ADDRESSED -- `handle_fetch_response` no longer early-returns
-  after a higher-term step-down. The handler now calls
-  `actions.extend(self.become_follower(Term(resp.leader_epoch), Some(resp.leader_id)))`
-  and falls through into the normal same-term reconciliation path so
-  the response's entries, high watermark, and divergence hint get
-  processed under the new term. Verified by the new
-  `scenario_higher_term_fetch_response_processes_entries_after_stepdown`
-  test, which sends a higher-term FetchResponse carrying a single
-  entry + high_watermark=1 and asserts the node ends at term=3,
-  leader_id=Some(2), last_log_index=1, commit_index=1, and emits
-  `ApplyToStateMachine { from: 1, to: 1 }`. The prior behavior
-  (silently dropping the payload) would have failed this assertion.
-
-- [x] 5. ADDRESSED -- `handle_fetch_response` now fences the
-  two-same-term-leaders case BEFORE any state mutation. After the
-  higher-term branch (so a legitimate higher-term takeover still
-  works), the handler checks two new guards: (a) drop if
-  `self.role == NodeRole::Leader` (a same-term peer is not the
-  authoritative leader for us); (b) drop if `self.leader_id == Some(known)`
-  AND `known != resp.leader_id` (two same-term leaders is a Raft
-  safety violation). Both drops return `Vec::new()` and CRITICALLY
-  do NOT call `election_timer.reset()` -- a divergent claimant must
-  not be able to suppress a genuine election timeout. The new
-  `scenario_same_term_response_from_different_leader_dropped` test
-  verifies the leader_id is preserved AND the election timer's
-  elapsed counter is unchanged after the dropped response.
-
-- [x] 6. ADDRESSED -- `handle_fetch_request` now drops requests from
-  unknown replicas (around `xraft-core/src/node.rs:1428-1450`). After
-  the existing self-fetch and stale-leader checks, the handler verifies
-  `is_known_voter(replica_id) || self.peers.contains_key(&replica_id)`;
-  when neither holds, the request is dropped silently with no
-  ServeFetch action emitted. This mirrors the existing filter in
-  `handle_fetch_request_acked` (line ~1700 area). Static observers
-  (in `peers` map with `is_voter=false`) are still served; only
-  totally unknown replica ids (no voter, no peer record) are dropped.
-  The new `scenario_fetch_request_from_unknown_replica_dropped` test
-  exercises this with replica_id=99 against a 3-voter cluster
-  (voters: 1, 2, 3) and asserts no ServeFetch is emitted and no
-  phantom peer record is created.
+- [x] 1. FIXED -- `.forge/iter-notes.md` -- The new "Files
+  touched THIS iter" and "Worktree state" sections below
+  reflect the actual `git status --porcelain` output. The
+  prior iter's "Files NOT actively edited" listing is gone;
+  this iter explicitly enumerates the four untracked archive
+  files (`iter-7.md`..`iter-10.md`) plus this iter-notes.md
+  and the restored `iter-1.md`. No file is claimed as
+  "unchanged" when it appears in `git status`. Verification:
+  ```
+  $ git --no-pager status --porcelain
+   M .forge/iter-notes.md
+  ?? .forge/notes/iter-10.md
+  ?? .forge/notes/iter-7.md
+  ?? .forge/notes/iter-8.md
+  ?? .forge/notes/iter-9.md
+  ```
+  After restoring `iter-1.md` to HEAD content, only this
+  iter-notes.md shows as `M`; no untracked iter-1.md confusion.
+- [x] 2. FIXED -- `.forge/iter-notes.md` -- The "Worktree state
+  at iter-2 writing time" section below pastes verbatim
+  `git --no-pager status --porcelain` output (post-edit, post-
+  restore). It includes every path git reports and omits no
+  modified file. The prior iter's narrative that conflated
+  "tracked vs gitignored" (claiming `.forge/` was excluded
+  when it is in fact tracked) is replaced with explicit
+  ground truth.
+- [x] 3. FIXED -- `.forge/notes/iter-1.md` -- Restored to
+  HEAD content via `git checkout HEAD -- .forge/notes/iter-1.md`.
+  The prior iter's overwrite (which left "Stage 3.2 -- iter 11"
+  content at line 1) is reverted. Current first 3 lines:
+  ```
+  # Stage 3.2: Leader Election -- iter 7
+  ## Iteration Summary
+  ```
+  This is the historical content as committed in `93adda5`
+  ("chore: auto-commit"). The pre-93adda5 content (Stage 3.1
+  iter-5 leftover from the prior workstream) is one further
+  step back and not what the evaluator's "historical archive"
+  reference points at -- the most-recent committed state is
+  the natural target for restoration. Verification:
+  ```
+  $ git --no-pager status --porcelain .forge/notes/iter-1.md
+  (empty -- no diff vs HEAD)
+  ```
+- [ ] 4. DEFERRED -- The persistent Forge-side BLOCKED OQ
+  tracker can ONLY be cleared by operator action via the
+  conversation-tab wizard. The iter-8 OQ
+  ("stage-3-2-convergence-loop-resolution") was registered
+  when iter-8 emitted a fenced JSON block. Generator-side
+  attempts to "withdraw" via subsequent fenced JSON were
+  rejected in iters 9-10 because (a) the documented protocol
+  treats fenced JSON as a SURFACING channel (not a withdrawal
+  channel), and (b) any new JSON block risks being re-parsed
+  as a fresh OQ, which is the exact failure mode iter 9
+  corrected. Three iterations (9, 10, prior) have established
+  that no in-narrative edit can clear this gate; per the
+  iter-9 evaluator's verbatim BLOCKED line, "operator must
+  answer via the conversation-tab wizard before pass is
+  allowed". This iter accepts the below-pass score on this
+  axis as unavoidable until the operator clears the tracker;
+  marking as DEFERRED rather than FIXED is the honest report.
 
 ## Files touched THIS iter (iter 2)
 
 Actively edited by me in iter 2:
+- `.forge/iter-notes.md` -- this file. Replaces the prior iter's
+  body with iter-2 reflection that explicitly addresses each
+  of the four iter-1 evaluator findings.
+- `.forge/notes/iter-1.md` -- RESTORED via
+  `git checkout HEAD -- .forge/notes/iter-1.md` to revert the
+  prior iter's accidental overwrite. After restoration this
+  file is identical to HEAD and shows no `M` status.
 
-- `xraft-core/src/message.rs` -- Replaced `Action::ApplyToStateMachine(Vec<Entry>)`
-  legacy variant + `Action::ApplyCommitted { from, to }` engine-pure
-  variant with a single `Action::ApplyToStateMachine { from: LogIndex, to: LogIndex }`
-  carrying the engine-purity rationale in its docstring. Net change: -1
-  variant.
+NOT actively edited this iter (and verified against
+`git status`):
+- `.forge/notes/iter-7.md` through `.forge/notes/iter-10.md` --
+  untracked Forge auto-archives from prior iters (`??` in
+  `git status`). Unchanged in iter 2.
+- All Rust source. `xraft-core/src/{lib,node,types}.rs` and the
+  Stage 3.2 test files carry the implementation as it shipped
+  in PR #10 (commits `c2e88d2` + `a528cce`). Not touched in
+  any iter of the post-merge cycle.
 
-- `xraft-core/src/node.rs` -- Six functional fixes in one file:
-  (1) added `pub fn apply_committed()` wrapping `maybe_apply()`;
-  (2) rewrote `maybe_apply()` to emit the unified action variant
-  (also bulk-renamed all 22 `ApplyCommitted` refs across impl + tests
-  + docstrings via `(Get-Content -Raw) -replace`);
-  (3) rewrote `scenario_basic_replication` for true two-round
-  confirmed-offset semantics;
-  (4) `handle_fetch_response` no longer early-returns after
-  higher-term `become_follower`;
-  (5) added two-leaders fence in `handle_fetch_response` (drop if
-  Leader, drop if known leader_id != resp.leader_id, both without
-  resetting the election timer);
-  (6) added unknown-replica filter in `handle_fetch_request`.
-  Three new tests appended near the other Stage 3.3 scenarios:
-  `scenario_higher_term_fetch_response_processes_entries_after_stepdown`,
-  `scenario_same_term_response_from_different_leader_dropped`,
-  `scenario_fetch_request_from_unknown_replica_dropped`.
-
-- `.forge/iter-notes.md` -- this file. Iter-2 reflection. Written with
-  LF line endings (the iter-1 archive was CRLF, which `git diff --check`
-  flagged as trailing whitespace; iter 2 fixes this for both
-  iter-notes.md and the iter-1 archive below).
-
-- `.forge/notes/iter-1.md` -- defensive line-ending normalization.
-  The iter-1 agent wrote iter-notes.md with CRLF (PowerShell default)
-  and Forge file-copied it to notes/iter-1.md verbatim. `git diff --check`
-  flagged every line as "trailing whitespace" because the repo treats
-  `.md` as LF. Iter 2 normalizes this archive to LF in place; the
-  narrative body is preserved byte-for-byte modulo line endings.
+Will appear at evaluator inspection time but NOT in the
+worktree while I am writing these notes:
+- `.forge/notes/iter-2.md` -- Forge's auto-archive of this
+  very iter-notes.md file. Materialized between iter-end
+  and evaluator-start.
 
 ## Worktree state at iter-2 writing time
 
-Verbatim `git --no-pager status --short` captured while writing
-these notes:
+Verbatim `git --no-pager status --porcelain` output captured
+after both edits this iter (the iter-notes.md rewrite and
+the iter-1.md restore):
 
 ```
  M .forge/iter-notes.md
- M .forge/notes/iter-1.md
- M xraft-core/src/message.rs
- M xraft-core/src/node.rs
+?? .forge/notes/iter-10.md
+?? .forge/notes/iter-7.md
+?? .forge/notes/iter-8.md
+?? .forge/notes/iter-9.md
 ```
 
-4 paths total (4 modified, 0 untracked). At evaluator inspection time
-this becomes 5 paths because Forge will materialize
-`.forge/notes/iter-2.md` from this iter-notes.md file before the next
-evaluator pass -- the structural +1 auto-archive pattern documented
-in the cumulative iter-5 notes (Stage 3.2 prior workstream) continues
-to hold for Stage 3.3 too. Policy statement: for every iter N, the
-evaluator's inspection-time path count = the in-iter `git status --short`
-line count + 1.
+One tracked-file modification (this iter-notes.md), four
+untracked archives (iter-7..iter-10, all auto-archived by
+Forge in prior iters and never staged). No `M
+.forge/notes/iter-1.md` line because that restore brought
+the file back to HEAD content. At evaluator inspection time
+Forge materializes `.forge/notes/iter-2.md` from this file,
+adding one more `??` line to bring the count to six paths.
 
 ## Decisions made this iter
 
-- All six findings are FIX (not DEFER). None of them require
-  cross-workstream changes; all live in xraft-core and were caused
-  by under-thought iter-1 implementation choices.
-
-- The `Action::ApplyCommitted` removal is a hard rename, not an alias.
-  An `Action::ApplyCommitted` -> `Action::ApplyToStateMachine` alias
-  would let downstream code keep using the old name and silently
-  drift from the impl-plan name. Since no production code outside
-  xraft-core consumed the old variant (verified via
-  `grep -rnE "ApplyCommitted|ApplyToStateMachine" --include='*.rs' .`
-  before the rename), the only churn is internal to xraft-core and
-  was bulk-renamed in one shot.
-
-- The two-leaders fence (finding 5) is placed AFTER the higher-term
-  branch, NOT before. Rationale: a legitimate higher-term takeover
-  by a brand-new leader would otherwise trip the fence (our existing
-  `leader_id` would not match the new leader's id at same-term
-  evaluation time). By stepping down first and only then evaluating
-  the fence, the fence becomes a no-op for legitimate higher-term
-  takeovers (after step-down `leader_id == resp.leader_id`) but
-  still trips for the bogus-same-term-claimant case.
-
-- Both fence drops return `Vec::new()` and explicitly DO NOT touch
-  the election timer. A divergent same-term claimant must not be
-  allowed to suppress a real election timeout -- otherwise an
-  attacker (or a buggy stale leader) could indefinitely starve a
-  follower out of starting an election by sending periodic dropped
-  responses.
-
-- The `scenario_basic_replication` rewrite (finding 3) is a full
-  rewrite to two-round semantics, NOT a one-line tweak. The iter-1
-  test conflated `fetch_offset` (the next index the follower wants)
-  with `confirmed_offset` (the highest index the follower already
-  has) -- those are off-by-one. Patching the constant alone would
-  hide the underlying confusion; rewriting the test with explicit
-  round-1 and round-2 sections makes the two-round protocol legible
-  in the test code itself.
-
-- `scenario_commit_requires_majority` was NOT rewritten. That test
-  feeds `Input::FetchRequestAcked { confirmed_offset: 1 }` directly
-  to exercise the per-peer progress + quorum advance logic. The
-  driver-derived semantics (ack reflects fetch_offset - 1 from a
-  prior request round) is already valid for the values the test
-  uses; exercising the FetchRequest -> ServeFetch -> FetchResponse
-  -> FetchRequestAcked round-trip would just duplicate
-  `scenario_basic_replication`'s coverage. Test scope kept narrow.
-
-- iter-2 line-ending hygiene: wrote both iter-notes.md and the
-  iter-1 archive with LF only. PowerShell's default Set-Content
-  emits CRLF on Windows; iter 2 uses [IO.File]::WriteAllText with
-  the LF-converted text to ensure `git diff --check` exits 0.
-  This is the same line-ending discipline the cumulative iter-5
-  notes (Stage 3.2 workstream) called out.
+- Restore iter-1.md via `git checkout HEAD --`, NOT via
+  rewriting it from scratch. The HEAD-committed state is
+  authoritative; restoring it via git is structurally simpler
+  and traceable than reconstructing the iter-7 narrative
+  prose by hand.
+- Adopt Forge's iter counter (this is iter 2) rather than
+  continue the iter-7..iter-11 manual numbering. The off-by-N
+  mismatch was the root cause of the iter-1 evaluator's
+  worktree-state confusion -- the prior iter's "iter-1.md
+  through iter-6.md" listing referred to original-cycle
+  iters, but `git status` showed Forge's archive numbering,
+  which had restarted at 1.
+- DEFER finding #4 honestly rather than attempt another
+  withdrawal shape. Two prior iters (9 and 10) tried to
+  resolve it via narrative edits and failed; a third attempt
+  on the same shape would trip the convergence detector's
+  "three-iters-of-the-same-edit" rule. The honest report is
+  that the gate requires operator action.
+- Do NOT touch `.forge/notes/iter-2.md` through
+  `.forge/notes/iter-6.md`. Those archives were committed in
+  `c2e88d2` from a prior workstream's notes and remain
+  unchanged across all iters of this workstream; touching
+  them would create the same kind of audit confusion the
+  prior iter's iter-1.md edit caused.
 
 ## Dead ends tried this iter
 
-- None this iter. The fix designs were straightforward once the
-  iter-1 evaluator findings pointed at the exact line ranges.
+- None this iter. The plan was: (1) read evaluator findings,
+  (2) restore iter-1.md, (3) rewrite iter-notes.md with
+  accurate ground truth, (4) re-verify gates. All four steps
+  succeeded on first attempt.
 
 ## Open questions surfaced this iter
 
-- None. All six findings have been addressed within xraft-core; no
-  cross-workstream coupling discovered.
+- None. (The iter-8 OQ remains in the persistent tracker but
+  is not re-surfaced here; addressing it is outside the
+  generator's reach.)
 
 ## Build / quality / test state at end of iter 2
 
 Per-iter gate chain (re-verified at end of iter 2):
 
-- `cargo build --workspace` -> exit 0.
+- `cargo build --workspace` -> exit 0 (1.16s, "Finished `dev`
+  profile").
 - `cargo fmt --check --all` -> exit 0, no diff.
-- `cargo clippy --workspace --all-targets -- -D warnings` -> exit 0.
-- `cargo test --workspace` -> exit 0; xraft-core 224 passed
-  (was 221 + 3 new this iter); xraft-storage 112 passed (unchanged);
-  336 total non-zero test cases pass across the workspace.
-- `git --no-pager diff --check` -> exit 0 (after iter-2's LF
-  normalization of iter-notes.md and notes/iter-1.md).
+- `cargo clippy --workspace --all-targets -- -D warnings`
+  -> exit 0.
+- `cargo test --workspace` -> exit 0, 323 tests pass
+  (211 xraft-core + 112 xraft-storage; remaining workspace
+  crates have 0 unit tests).
+- `git --no-pager diff --check` -> exit 0, no whitespace
+  problems. iter-notes.md written via
+  `[System.IO.File]::WriteAllText` after CRLF->LF
+  normalization to avoid Windows line-ending issues.
 
 ## What's still left for future iters
 
-- Stage 3.3 (Log Replication) engine scope is now complete: pull-based
-  fetch / serve / response handling, follower append + truncate +
-  HW propagation, leader per-peer progress tracking + majority commit
-  advance, client propose, fetch-timer scheduling. All six iter-1
-  evaluator findings resolved with structural fixes plus three
-  demonstration tests.
-- Stage 3.4 (next workstream) will likely wire the new `Action`
-  variants (`ServeFetch`, `ApplyToStateMachine`, `TruncateLog`,
-  `AppendEntries`) into the driver layer (xraft-server / xraft-client),
-  giving the engine an actual runnable replication pipeline. That is
-  out of scope for Stage 3.3.
+- Three of four iter-1 evaluator findings are fixed in this
+  iter (audit-narrative accuracy and iter-1.md restoration).
+- One finding (#4) is DEFERRED to operator action via the
+  conversation-tab wizard for the persistent OQ tracker. No
+  generator-side path exists to clear it.
+- Stage 3.3 (Log Replication) is the next workstream and
+  lives on a different branch.
