@@ -76,7 +76,8 @@ pub trait LogStore: Send + Sync {
 /// (`plan_state_persistence_term_5_voted_for_3`,
 /// `plan_atomic_write_safety_quorum_state_recoverable`,
 /// `plan_term_monotonicity_term_5_then_3_errors`,
-/// `plan_first_boot_load_returns_none_on_empty_dir`).
+/// `plan_first_boot_load_returns_none_on_empty_dir`,
+/// `plan_single_vote_per_term_rejects_conflicting_votes_at_same_term`).
 pub trait HardStateStore: Send + Sync {
     /// Persist the hard state to durable storage.
     ///

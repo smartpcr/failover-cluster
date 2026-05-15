@@ -179,6 +179,82 @@ fn plan_first_boot_load_returns_none_on_empty_dir() {
     );
 }
 
+/// Plan invariant 5 -- single vote per term
+/// (`implementation-plan.md` line 102: "voted_for is only set once
+/// per term"). Within the same `current_term`:
+///
+/// * `None -> Some(node_a)` is allowed (first vote in the term).
+/// * `Some(node_a) -> Some(node_a)` is allowed (idempotent retry).
+/// * `Some(node_a) -> Some(node_b)` (b != a) MUST be rejected --
+///   would otherwise allow a split-vote / double-vote at the same term.
+/// * `Some(node_a) -> None` MUST be rejected -- would let the node
+///   re-vote for someone else after a crash + reload.
+///
+/// A strictly-greater term resets vote eligibility.
+///
+/// Added in iter 6 to mirror the in-crate
+/// `file_store_enforces_invariants` test through the
+/// `persistent_raft_state_acceptance` public-surface crate, so
+/// downstream embedders observing only the `xraft-storage` public
+/// API see the invariant exercised end-to-end.
+#[test]
+fn plan_single_vote_per_term_rejects_conflicting_votes_at_same_term() {
+    let tmp = TempDir::new().unwrap();
+    let mut store = FileHardStateStore::open(tmp.path()).unwrap();
+
+    store
+        .persist(&HardState {
+            current_term: Term(7),
+            voted_for: Some(NodeId(1)),
+        })
+        .expect("plan: first vote in a fresh term is allowed");
+
+    store
+        .persist(&HardState {
+            current_term: Term(7),
+            voted_for: Some(NodeId(1)),
+        })
+        .expect("plan: idempotent re-persist of the same vote is allowed");
+
+    let switch_err = store
+        .persist(&HardState {
+            current_term: Term(7),
+            voted_for: Some(NodeId(2)),
+        })
+        .expect_err("plan: switching vote at same term must error");
+    let msg = format!("{switch_err:?}");
+    assert!(
+        msg.contains("Storage") || msg.to_lowercase().contains("vote"),
+        "plan: vote-switch error must mention Storage or vote, got {msg}",
+    );
+
+    let clear_err = store
+        .persist(&HardState {
+            current_term: Term(7),
+            voted_for: None,
+        })
+        .expect_err("plan: clearing vote at same term must error");
+    let cmsg = format!("{clear_err:?}");
+    assert!(
+        cmsg.contains("Storage") || cmsg.to_lowercase().contains("vote"),
+        "plan: vote-clear error must mention Storage or vote, got {cmsg}",
+    );
+
+    let still = store
+        .load()
+        .unwrap()
+        .expect("plan: state after rejected transitions must remain loadable");
+    assert_eq!(still.current_term, Term(7));
+    assert_eq!(still.voted_for, Some(NodeId(1)));
+
+    store
+        .persist(&HardState {
+            current_term: Term(8),
+            voted_for: Some(NodeId(2)),
+        })
+        .expect("plan: a strictly-greater term resets vote eligibility");
+}
+
 fn path_exists(p: &Path) -> bool {
     std::fs::metadata(p).is_ok()
 }
