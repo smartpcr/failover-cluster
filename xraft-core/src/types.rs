@@ -268,6 +268,80 @@ impl VoterSet {
     }
 }
 
+/// Set of voters that have granted a vote (real or pre-vote) to this node
+/// during a single election round.
+///
+/// `VoteGrantedSet` is the dedicated Stage 3.2 deliverable that tracks votes
+/// per election and prevents double-counting (per
+/// `implementation-plan.md` Stage 3.2 — "Add `VoteGrantedSet` to track votes
+/// per election, preventing double-counting"). It wraps a `HashSet<NodeId>`
+/// so a duplicate grant from the same voter — common when retries land on
+/// top of an already-counted response — cannot inflate the tally toward
+/// quorum.
+///
+/// The set is cleared on every role transition (`become_follower`,
+/// `become_pre_candidate`, `become_candidate`, `become_leader`) so a stale
+/// grant from a prior election round cannot contribute to the current one.
+/// See [`crate::node::RaftNode::votes_received`] and
+/// [`crate::node::RaftNode::pre_votes_received`] for the two concrete sites
+/// where this type is used.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VoteGrantedSet {
+    granted: std::collections::HashSet<NodeId>,
+}
+
+impl VoteGrantedSet {
+    /// Build an empty `VoteGrantedSet`.
+    pub fn new() -> Self {
+        Self {
+            granted: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Record a granter. Returns `true` if this is the first time the
+    /// granter has been recorded for the current election round
+    /// (mirroring [`HashSet::insert`] semantics, which is the dedupe
+    /// guarantee that prevents double-counting).
+    pub fn insert(&mut self, node_id: NodeId) -> bool {
+        self.granted.insert(node_id)
+    }
+
+    /// Whether `node_id` has already granted a vote in the current round.
+    pub fn contains(&self, node_id: &NodeId) -> bool {
+        self.granted.contains(node_id)
+    }
+
+    /// Number of unique granters recorded so far.
+    pub fn len(&self) -> usize {
+        self.granted.len()
+    }
+
+    /// Whether no votes have been recorded yet.
+    pub fn is_empty(&self) -> bool {
+        self.granted.is_empty()
+    }
+
+    /// Forget every recorded grant — called on every role transition so
+    /// the next election round starts from a clean slate.
+    pub fn clear(&mut self) {
+        self.granted.clear();
+    }
+
+    /// Iterate the recorded granter `NodeId`s in unspecified order.
+    pub fn iter(&self) -> impl Iterator<Item = &NodeId> {
+        self.granted.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a VoteGrantedSet {
+    type Item = &'a NodeId;
+    type IntoIter = std::collections::hash_set::Iter<'a, NodeId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.granted.iter()
+    }
+}
+
 /// Custom `Deserialize` for `VoterSet` that enforces validation on
 /// deserialized data, preventing construction of invalid voter sets
 /// from untrusted input (network, config files, snapshots).

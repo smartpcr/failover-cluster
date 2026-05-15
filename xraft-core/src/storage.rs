@@ -257,11 +257,10 @@ pub trait SnapshotStore: Send + Sync {
         };
 
         // Starting chunk index reflects the byte offset into the full payload.
-        let base_chunk_index = if chunk_size > 0 {
-            offset_usize / chunk_size
-        } else {
-            0
-        };
+        // Use `checked_div` rather than the manual `if chunk_size > 0` guard
+        // so clippy's `manual_checked_ops` lint (Rust 1.95+) stays happy
+        // under the workspace's `-D warnings` policy.
+        let base_chunk_index = offset_usize.checked_div(chunk_size).unwrap_or(0);
         // The window reaches the end of the full payload.
         let window_covers_tail = offset_usize + data.len() >= full_data.len();
 
