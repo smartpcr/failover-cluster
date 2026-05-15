@@ -483,6 +483,7 @@ impl<T: Transport + Send + Sync + 'static> MessageRouter<T> {
                                         chunk_count += 1;
                                         if chunk.done {
                                             completed = true;
+                                            break;
                                         }
                                     }
                                     Some(Err(e)) => {
