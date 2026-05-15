@@ -1,4 +1,4 @@
-//! Raft node state machine — core consensus engine.
+//! Raft node state machine ΓÇö core consensus engine.
 //!
 //! `RaftNode` holds the volatile and durable state for a single Raft participant.
 //! It processes [`Input`] events and emits [`Action`] side-effects without
@@ -8,9 +8,9 @@
 //! # Stage 3.1 / Stage 3.2 scope
 //!
 //! Stage 3.1 (Raft Node State Machine) established the structural foundation:
-//! - [`ElectionTimer`] — randomised tick-based timeout in the
+//! - [`ElectionTimer`] ΓÇö randomised tick-based timeout in the
 //!   `[election_timeout_min_ms, election_timeout_max_ms]` configured range.
-//! - [`PeerState`] — per-peer tracking used by the leader to drive
+//! - [`PeerState`] ΓÇö per-peer tracking used by the leader to drive
 //!   pull-based replication.
 //! - [`RaftNode`] role transitions: `become_follower`, `become_pre_candidate`,
 //!   `become_candidate`, `become_leader`.
@@ -18,18 +18,18 @@
 //!   on followers/candidates and triggers an election.
 //!
 //! Stage 3.2 (Leader Election) adds the on-receive handlers that drive the
-//! full Pre-Vote → Vote → Leader cascade across a real cluster:
-//! - [`RaftNode::handle_vote_request`] — validate term, log up-to-dateness,
+//! full Pre-Vote ΓåÆ Vote ΓåÆ Leader cascade across a real cluster:
+//! - [`RaftNode::handle_vote_request`] ΓÇö validate term, log up-to-dateness,
 //!   and `voted_for`; grant or reject a real vote with a single coalesced
 //!   `PersistHardState` action where applicable.
-//! - [`RaftNode::handle_vote_response`] — tally votes from voters,
+//! - [`RaftNode::handle_vote_response`] ΓÇö tally votes from voters,
 //!   step down on a higher observed term, transition to `Leader` on quorum.
-//! - [`RaftNode::handle_pre_vote_request`] — speculative-grant check that
+//! - [`RaftNode::handle_pre_vote_request`] ΓÇö speculative-grant check that
 //!   does NOT mutate term, `voted_for`, or the election timer. Rejected when
 //!   the responder still considers a leader recently active (per
-//!   `architecture.md` §2.1 — Pre-Vote prevents disruptive elections).
-//! - [`RaftNode::handle_pre_vote_response`] — tally pre-votes (including
-//!   from voters at a lagging term — Pre-Vote responders do not bump terms),
+//!   `architecture.md` ┬º2.1 ΓÇö Pre-Vote prevents disruptive elections).
+//! - [`RaftNode::handle_pre_vote_response`] ΓÇö tally pre-votes (including
+//!   from voters at a lagging term ΓÇö Pre-Vote responders do not bump terms),
 //!   step down on observed higher term, transition to `Candidate` on
 //!   pre-election quorum.
 //!
@@ -173,7 +173,7 @@ fn pick_in_range<R: Rng + ?Sized>(lo: u64, hi: u64, rng: &mut R) -> u64 {
 /// `Instant` to convey monotonic-clock semantics; the engine, however, is
 /// deliberately I/O-free and uses the *logical tick* counter (incremented by
 /// each [`Input::Tick`]) as its monotonic time source. The field type here
-/// is therefore `u64` ticks rather than `std::time::Instant` — this is the
+/// is therefore `u64` ticks rather than `std::time::Instant` ΓÇö this is the
 /// engine-internal equivalent of the architecture's `Instant` and allows the
 /// state machine to be deterministic and replayable without consulting the
 /// wall clock. The driver layer in `xraft-server` may translate ticks to
@@ -185,15 +185,15 @@ pub struct PeerState {
     pub last_fetch_offset: LogIndex,
     /// Logical-tick timestamp of this peer's most recent Fetch request.
     /// Used by Check-Quorum (Stage 6) to detect partitioned followers.
-    /// Spec name: `last_fetch_time` (architecture.md §3.2). The value is
+    /// Spec name: `last_fetch_time` (architecture.md ┬º3.2). The value is
     /// the engine's logical tick count, not wall clock.
     pub last_fetch_time: u64,
     /// Logical-tick timestamp at which this peer last reached the leader's
     /// log end. Used to gate leadership-transfer and membership-change
-    /// protocols. Spec name: `last_caught_up_time` (architecture.md §3.2).
+    /// protocols. Spec name: `last_caught_up_time` (architecture.md ┬º3.2).
     pub last_caught_up_time: u64,
     /// Whether this peer participates in quorum decisions (false for
-    /// `Observer` nodes — non-voting replicas).
+    /// `Observer` nodes ΓÇö non-voting replicas).
     pub is_voter: bool,
 }
 
@@ -234,7 +234,7 @@ impl PeerState {
 /// 4. Dispatching [`Action::SendMessage`] over the [`Transport`](crate::transport::Transport).
 ///
 /// If any persistence operation fails, the driver MUST halt the node and
-/// recover from durable state on restart — partial application of an action
+/// recover from durable state on restart ΓÇö partial application of an action
 /// list is unsafe.
 #[derive(Debug)]
 pub struct RaftNode {
@@ -252,7 +252,7 @@ pub struct RaftNode {
     pub election_timer: ElectionTimer,
     /// Set of votes received in the current real election (only meaningful
     /// when role is `Candidate`). Concretely the [`VoteGrantedSet`] type
-    /// (the Stage 3.2 deliverable) — its `HashSet`-backed semantics dedupe
+    /// (the Stage 3.2 deliverable) ΓÇö its `HashSet`-backed semantics dedupe
     /// duplicate grants from the same voter, so retried responses cannot
     /// be double-counted toward quorum.
     pub votes_received: VoteGrantedSet,
@@ -277,12 +277,12 @@ pub struct RaftNode {
     /// Logical-tick timestamp of the last time we observed positive leader
     /// contact (set on [`become_follower`] with a `Some(leader_id)` argument
     /// and by Stage 3.3's Fetch-response handling when wired). The Pre-Vote
-    /// rejection check (`architecture.md` §2.1) consults this rather than
+    /// rejection check (`architecture.md` ┬º2.1) consults this rather than
     /// the election timer because the election timer is reset on actions
     /// unrelated to leader contact (e.g. on granting a vote). `None` means
     /// "no leader has ever been observed in the current era".
     pub last_leader_contact_tick: Option<u64>,
-    /// Logical tick clock — incremented by every [`Input::Tick`].
+    /// Logical tick clock ΓÇö incremented by every [`Input::Tick`].
     /// Used as the timestamp source for the `last_fetch_time` /
     /// `last_caught_up_time` fields on [`PeerState`].
     pub logical_tick: u64,
@@ -296,7 +296,7 @@ pub struct RaftNode {
     /// `None` when this node is not the leader (or never has been in the
     /// current term). Used to gate commit advancement so that a freshly
     /// elected leader cannot commit prior-term entries by replication count
-    /// alone — Raft Figure 8 safety: a leader may only commit a prior-term
+    /// alone ΓÇö Raft Figure 8 safety: a leader may only commit a prior-term
     /// entry once it has committed at least one current-term entry. The
     /// no-op IS that current-term entry; commit advancement is gated on
     /// `candidate_index >= leader_no_op_index`.
@@ -453,17 +453,17 @@ impl RaftNode {
     /// election-timer reset path (the reset itself happens inside
     /// [`handle_fetch_response`]).
     ///
-    /// Per `architecture.md` §5.1 (Leader Election with Pre-Vote) and
+    /// Per `architecture.md` ┬º5.1 (Leader Election with Pre-Vote) and
     /// `e2e-scenarios.md` Feature 3 (Pre-Vote prevents disruptive elections):
     ///
-    /// - **Follower** election timeout → enter `PreCandidate` (no term bump,
+    /// - **Follower** election timeout ΓåÆ enter `PreCandidate` (no term bump,
     ///   send `PreVoteRequest`s). The actual term increment happens only
     ///   after a quorum of pre-votes is received in Stage 3.2.
-    /// - **PreCandidate** election timeout → restart the Pre-Vote phase by
+    /// - **PreCandidate** election timeout ΓåÆ restart the Pre-Vote phase by
     ///   re-issuing `PreVoteRequest`s with a fresh randomised timer. Term
     ///   is *not* bumped: the whole point of Pre-Vote is to avoid term
     ///   inflation when the cluster is unreachable.
-    /// - **Candidate** election timeout → fall back to Pre-Vote rather than
+    /// - **Candidate** election timeout ΓåÆ fall back to Pre-Vote rather than
     ///   straight re-election. A real Candidate that loses contact has the
     ///   same partition-disruption risk as a Follower; routing through
     ///   `PreCandidate` honours the architecture's "no term bump without
@@ -601,7 +601,7 @@ impl RaftNode {
         self.role = NodeRole::Follower;
         self.leader_id = leader_id;
         // Record leader contact when transitioning with a known leader so the
-        // Pre-Vote rejection window (architecture §2.1) starts from now.
+        // Pre-Vote rejection window (architecture ┬º2.1) starts from now.
         // When stepping down to `None`, clear the prior contact stamp because
         // we no longer have evidence of a healthy leader.
         if leader_id.is_some() {
@@ -612,7 +612,7 @@ impl RaftNode {
         self.votes_received.clear();
         self.pre_votes_received.clear();
         // Stage 3.3: a follower no longer owns the leader-side no-op marker;
-        // and a fresh follower must fetch eagerly to catch up — reset the
+        // and a fresh follower must fetch eagerly to catch up ΓÇö reset the
         // fetch scheduling cursor.
         self.leader_no_op_index = None;
         self.last_fetch_tick = None;
@@ -632,8 +632,8 @@ impl RaftNode {
     /// Enter the `PreCandidate` role and emit `PreVoteRequest`s.
     ///
     /// The Pre-Vote phase checks quorum reachability *without* incrementing
-    /// the term — preventing a partitioned node that comes back from
-    /// disrupting an established leader (per architecture §2.1 and §5.1).
+    /// the term ΓÇö preventing a partitioned node that comes back from
+    /// disrupting an established leader (per architecture ┬º2.1 and ┬º5.1).
     /// Pre-vote granting / response tallying handlers are implemented in
     /// Stage 3.2.
     ///
@@ -648,7 +648,7 @@ impl RaftNode {
         self.role = NodeRole::PreCandidate;
         self.leader_id = None;
         // Stepping into an election round invalidates any prior leader contact
-        // evidence — clear it so subsequent pre-vote requests from peers are
+        // evidence ΓÇö clear it so subsequent pre-vote requests from peers are
         // judged on whether *they* still see a leader, not on ours.
         self.last_leader_contact_tick = None;
         // Clear any stale real-vote tallies from a prior Candidate phase.
@@ -752,7 +752,7 @@ impl RaftNode {
     ///
     /// Stage 3.3: also records `leader_no_op_index` (used as the Raft
     /// Figure-8 commit gate so prior-term entries cannot be committed by
-    /// majority count alone — the leader must first commit a current-term
+    /// majority count alone ΓÇö the leader must first commit a current-term
     /// entry, and the no-op IS that current-term entry). On a single-voter
     /// cluster the leader's own no-op already satisfies the quorum, so
     /// commit advancement runs immediately and an [`Action::ApplyToStateMachine`]
@@ -761,10 +761,10 @@ impl RaftNode {
     pub fn become_leader(&mut self) -> Vec<Action> {
         self.role = NodeRole::Leader;
         self.leader_id = Some(self.id);
-        // We are now the leader — record self-contact so any pre-vote we
+        // We are now the leader ΓÇö record self-contact so any pre-vote we
         // receive while leader is rejected as "leader is recently active".
         self.last_leader_contact_tick = Some(self.logical_tick);
-        // Clear vote tallies — they are no longer meaningful once we have
+        // Clear vote tallies ΓÇö they are no longer meaningful once we have
         // crossed into the Leader role for the current term.
         self.votes_received.clear();
         self.pre_votes_received.clear();
@@ -824,7 +824,7 @@ impl RaftNode {
 
     /// Whether the votes already collected by this candidate constitute a
     /// quorum. Quorum is computed over **unique voter `NodeId`s** (matching
-    /// KRaft semantics — see [`VoterSet::quorum_size`]) so a single broker
+    /// KRaft semantics ΓÇö see [`VoterSet::quorum_size`]) so a single broker
     /// with multiple log directories still counts as one vote.
     ///
     /// Returns `false` whenever the node has no structured `voter_set` (the
@@ -866,7 +866,7 @@ impl RaftNode {
     }
 
     // ---------------------------------------------------------------------
-    // Stage 3.2 — Leader Election handlers
+    // Stage 3.2 ΓÇö Leader Election handlers
     // ---------------------------------------------------------------------
 
     /// Whether the given `node_id` is in the configured voter set.
@@ -874,7 +874,7 @@ impl RaftNode {
     /// Used to validate the sender of vote / pre-vote messages: non-voter
     /// senders are dropped before they can force a term bump or contribute
     /// to a quorum tally. A node with no `voter_set` configured cannot
-    /// participate in elections — every call returns `false` in that case.
+    /// participate in elections ΓÇö every call returns `false` in that case.
     fn is_known_voter(&self, node_id: NodeId) -> bool {
         self.voter_set
             .as_ref()
@@ -882,7 +882,7 @@ impl RaftNode {
             .unwrap_or(false)
     }
 
-    /// Standard Raft up-to-date predicate (architecture.md §6 S4 — Leader
+    /// Standard Raft up-to-date predicate (architecture.md ┬º6 S4 ΓÇö Leader
     /// Completeness): the candidate's log is at least as up-to-date as
     /// ours iff its `last_log_term` is strictly greater than ours, or the
     /// terms are equal and its `last_log_index` is at least ours.
@@ -898,7 +898,7 @@ impl RaftNode {
 
     /// Whether this node still considers a leader to be recently active.
     ///
-    /// Drives the Pre-Vote rejection rule in `architecture.md` §2.1 / §5.1
+    /// Drives the Pre-Vote rejection rule in `architecture.md` ┬º2.1 / ┬º5.1
     /// and `e2e-scenarios.md` Feature 3
     /// ("Pre-Vote prevents disruptive elections"). We say a leader is
     /// "recently active" when *either* of:
@@ -913,7 +913,7 @@ impl RaftNode {
     ///   receiver itself would still wait this long before starting an
     ///   election, it must reject pre-votes from peers that might cause
     ///   a disruptive election. Per `implementation-plan.md` Stage 3.2
-    ///   and `architecture.md` §5.1 — "followers reject pre-votes if
+    ///   and `architecture.md` ┬º5.1 ΓÇö "followers reject pre-votes if
     ///   they have heard from a leader within the election timeout".
     fn leader_recently_active(&self) -> bool {
         if self.role == NodeRole::Leader {
@@ -954,11 +954,11 @@ impl RaftNode {
 
     /// Handle a real-election `VoteRequest`.
     ///
-    /// Per `architecture.md` §5.1 and the canonical Raft safety rules:
+    /// Per `architecture.md` ┬º5.1 and the canonical Raft safety rules:
     /// 1. Reject silently if `cluster_id` does not match (cross-cluster
     ///    misrouting).
     /// 2. Reject silently if the candidate is not in our configured
-    ///    voter set — a non-voter must not be able to force a term bump
+    ///    voter set ΓÇö a non-voter must not be able to force a term bump
     ///    on a real voter (rubber-duck blocking issue #2).
     /// 3. If `req.term < current_term`, reply with a denial carrying our
     ///    current term so the stale candidate can step down.
@@ -975,7 +975,7 @@ impl RaftNode {
     /// The returned action vector is ordered `[PersistHardState?,
     /// StepDown?, SendMessage]`. The driver MUST execute them in order
     /// so the hard state is durable before any RPC reply leaves the box
-    /// (Raft safety invariant S1 — election safety).
+    /// (Raft safety invariant S1 ΓÇö election safety).
     #[tracing::instrument(level = "debug", skip(self), fields(node_id = %self.id, current_term = %self.hard_state.current_term))]
     pub fn handle_vote_request(&mut self, req: VoteRequest) -> Vec<Action> {
         if req.cluster_id != self.config.cluster_id {
@@ -1044,7 +1044,7 @@ impl RaftNode {
             hard_state_changed = true;
         }
         if granted {
-            // Granting a vote engages us in this election round — reset the
+            // Granting a vote engages us in this election round ΓÇö reset the
             // timer so we do not immediately start our own competing one.
             self.election_timer.reset(&mut self.rng);
         }
@@ -1075,7 +1075,7 @@ impl RaftNode {
 
     /// Handle a real-election `VoteResponse`.
     ///
-    /// Per `architecture.md` §5.1:
+    /// Per `architecture.md` ┬º5.1:
     /// 1. Drop silently on `cluster_id` mismatch.
     /// 2. Drop silently if `from` is not a configured voter (rubber-duck
     ///    blocking issue #2: non-voter responses must not bump term or
@@ -1127,11 +1127,11 @@ impl RaftNode {
 
     /// Handle a `PreVoteRequest` (speculative election round, no term bump).
     ///
-    /// Per `architecture.md` §2.1 / §5.1 and e2e-scenarios.md Feature 3:
+    /// Per `architecture.md` ┬º2.1 / ┬º5.1 and e2e-scenarios.md Feature 3:
     /// 1. Drop silently on `cluster_id` mismatch.
     /// 2. Drop silently if the candidate is not a configured voter.
     /// 3. Grant iff all three hold:
-    ///    - `req.next_term > current_term` — the candidate would actually
+    ///    - `req.next_term > current_term` ΓÇö the candidate would actually
     ///      advance our term in a real election.
     ///    - The candidate's log is at least as up-to-date as ours.
     ///    - We do NOT currently consider a leader to be recently active
@@ -1177,13 +1177,13 @@ impl RaftNode {
 
     /// Handle a `PreVoteResponse`.
     ///
-    /// Per `architecture.md` §5.1:
+    /// Per `architecture.md` ┬º5.1:
     /// 1. Drop silently on `cluster_id` / non-voter sender.
     /// 2. If `resp.term > current_term`, step down to follower at the new
     ///    term. This is term *reconciliation*, not inflation: another
     ///    voter has evidence the cluster has advanced.
     /// 3. Otherwise act only while we are a `PreCandidate`. NOTE: We
-    ///    deliberately do **not** require `resp.term == current_term` —
+    ///    deliberately do **not** require `resp.term == current_term` ΓÇö
     ///    pre-vote responders never bump their term (that is the entire
     ///    point of Pre-Vote), so a lagging voter at a lower term can
     ///    still legitimately grant a pre-vote (rubber-duck blocking
@@ -1225,7 +1225,7 @@ impl RaftNode {
     }
 
     // ---------------------------------------------------------------------
-    // Stage 3.3 — Log Replication handlers
+    // Stage 3.3 ΓÇö Log Replication handlers
     //
     // The engine remains I/O-free: it does not hold the contents of the log,
     // so it cannot itself materialise [`FetchResponse::entries`], detect
@@ -1247,7 +1247,7 @@ impl RaftNode {
     //   machine. The engine has already advanced `last_applied` to `to`;
     //   the driver MUST apply the entries (or halt and recover from durable
     //   state on restart). The variant carries indices (not entries) so the
-    //   engine stays I/O-free — see [`Action::ApplyToStateMachine`] doc
+    //   engine stays I/O-free ΓÇö see [`Action::ApplyToStateMachine`] doc
     //   for the rationale.
     //
     // - [`Action::TruncateLog`]: instructs the follower's driver to drop
@@ -1262,7 +1262,7 @@ impl RaftNode {
     //   read). Updating `peer.last_fetch_offset` only on this feedback
     //   (rather than on raw `FetchRequest` arrival) guarantees the leader
     //   never inflates a follower's replication progress on the strength of
-    //   an unverified log-tail claim — this is a Raft safety invariant
+    //   an unverified log-tail claim ΓÇö this is a Raft safety invariant
     //   (see rubber-duck blocking issue #1).
     // ---------------------------------------------------------------------
 
@@ -1278,7 +1278,7 @@ impl RaftNode {
     /// pull-based progress representation:
     /// - The leader's own log tail counts as `last_log_index` for itself.
     /// - Each voter peer contributes `peer.last_fetch_offset` (which the
-    ///   driver only updates on a *validated* fetch — see [`handle_fetch_request_acked`]).
+    ///   driver only updates on a *validated* fetch ΓÇö see [`handle_fetch_request_acked`]).
     /// - Non-voter peers (Observers) and any voter without a `PeerState`
     ///   record do NOT contribute to quorum.
     /// - The candidate commit index is the `(quorum_size)`-th largest
@@ -1308,7 +1308,7 @@ impl RaftNode {
                 }
                 offsets.push(p.last_fetch_offset);
             } else {
-                // Voter unknown to peers map — count them as zero so they
+                // Voter unknown to peers map ΓÇö count them as zero so they
                 // hold back commit advancement until they are observed.
                 offsets.push(LogIndex(0));
             }
@@ -1327,7 +1327,7 @@ impl RaftNode {
         }
         if candidate < no_op_index {
             // Figure-8 safety: cannot commit a prior-term entry by majority
-            // count alone — must wait for the current-term no-op to itself
+            // count alone ΓÇö must wait for the current-term no-op to itself
             // be replicated to a quorum.
             return None;
         }
@@ -1366,7 +1366,7 @@ impl RaftNode {
         Some(Action::ApplyToStateMachine { from, to })
     }
 
-    /// Stage 3.3 step 5 (`implementation-plan.md` §3.3): emit
+    /// Stage 3.3 step 5 (`implementation-plan.md` ┬º3.3): emit
     /// [`Action::ApplyToStateMachine`] for every log entry between
     /// `last_applied + 1` and `commit_index`, advancing `last_applied`.
     /// Returns `None` when `last_applied == commit_index` (nothing pending).
@@ -1375,9 +1375,9 @@ impl RaftNode {
     /// directly when it wants to drain the apply pipeline outside of a
     /// regular [`step`](Self::step) call (e.g. during shutdown, snapshot
     /// installation, or after a manual `set_last_log`/`commit_index` repair).
-    /// The standard hot path — leader after a peer ack, follower after a
+    /// The standard hot path ΓÇö leader after a peer ack, follower after a
     /// `FetchResponse` HW advance, leader after `ClientPropose`,
-    /// `become_leader` cascade on a single-voter cluster — already calls
+    /// `become_leader` cascade on a single-voter cluster ΓÇö already calls
     /// the internal helper as part of their action sequence, so the public
     /// method exists primarily as a manual-trigger / re-entry point.
     pub fn apply_committed(&mut self) -> Option<Action> {
@@ -1387,15 +1387,15 @@ impl RaftNode {
     /// Handle a `FetchRequest` received by this (leader) node from a
     /// follower or observer.
     ///
-    /// Per `architecture.md` §5.2 / §5.4 and the implementation-plan
+    /// Per `architecture.md` ┬º5.2 / ┬º5.4 and the implementation-plan
     /// Stage 3.3 specification:
     /// 1. Drop silently on `cluster_id` mismatch.
     /// 2. If `req.leader_epoch > current_term`, the cluster has advanced
-    ///    past us — step down to follower at the new term and return the
+    ///    past us ΓÇö step down to follower at the new term and return the
     ///    step-down actions. We are no longer leader and cannot serve.
     /// 3. If we are not the Leader, drop (the requester's leader-hint
     ///    will route them to the actual leader).
-    /// 4. If `req.leader_epoch < current_term`, still serve — the response
+    /// 4. If `req.leader_epoch < current_term`, still serve ΓÇö the response
     ///    will carry our higher `leader_epoch` so the stale follower can
     ///    catch up its term view.
     /// 5. Update `peer.last_fetch_time` to the current logical tick (proof
@@ -1404,7 +1404,7 @@ impl RaftNode {
     ///    NOTE: `peer.last_fetch_offset` is NOT updated here. It is
     ///    updated only via [`Input::FetchRequestAcked`] after the driver
     ///    has validated the follower's `last_fetched_epoch` against the
-    ///    leader's log — otherwise a divergent follower could inflate
+    ///    leader's log ΓÇö otherwise a divergent follower could inflate
     ///    quorum (rubber-duck blocking issue #1).
     /// 6. Emit an [`Action::ServeFetch`] carrying the envelope fields so
     ///    the driver can construct and dispatch the [`FetchResponse`].
@@ -1427,7 +1427,7 @@ impl RaftNode {
             return Vec::new();
         }
 
-        // Stage 3.3 finding-1 fix (iter 4): trust-boundary check — only
+        // Stage 3.3 finding-1 fix (iter 4): trust-boundary check ΓÇö only
         // accept FetchRequest from a sender we already recognise as either
         // a configured voter (`is_known_voter`) or a tracked peer
         // (`peers.contains_key`). This guard runs BEFORE the higher-term
@@ -1450,7 +1450,7 @@ impl RaftNode {
 
         // Higher-term FetchRequest: a follower has evidence the cluster has
         // advanced past us. Step down (becomes Follower at the new term)
-        // and return — we cannot serve as leader after that. Reachable
+        // and return ΓÇö we cannot serve as leader after that. Reachable
         // only for a sender we already recognise (the known-sender guard
         // above ran first), so an unknown attacker cannot trip this path.
         if req.leader_epoch > self.hard_state.current_term.0 {
@@ -1471,9 +1471,9 @@ impl RaftNode {
         }
 
         // Stage 3.3 finding-3 fix (iter 3): `fetch_offset` is the next
-        // 1-based log index the follower wants (architecture §5.2). A value
+        // 1-based log index the follower wants (architecture ┬º5.2). A value
         // of 0 is structurally invalid because the driver derives the
-        // confirmed_offset by subtracting one (`fetch_offset - 1`) — a 0
+        // confirmed_offset by subtracting one (`fetch_offset - 1`) ΓÇö a 0
         // would underflow into u64::MAX and corrupt the leader's per-peer
         // progress map. The empty-log case is correctly encoded as
         // `fetch_offset = 1, last_fetched_epoch = 0` (the follower wants
@@ -1488,7 +1488,7 @@ impl RaftNode {
             return Vec::new();
         }
 
-        // Update peer-liveness fields — but NOT replication progress.
+        // Update peer-liveness fields ΓÇö but NOT replication progress.
         if let Some(peer) = self.peers.get_mut(&req.replica_id) {
             peer.last_fetch_time = self.logical_tick;
         }
@@ -1530,7 +1530,7 @@ impl RaftNode {
             // for nodes it has never observed via configuration or fetch).
             return Vec::new();
         }
-        // Clamp to leader's own log tail — we cannot honour a follower
+        // Clamp to leader's own log tail ΓÇö we cannot honour a follower
         // claim of having entries the leader itself does not have.
         let clamped = LogIndex(confirmed_offset.0.min(self.last_log_index.0));
 
@@ -1558,35 +1558,35 @@ impl RaftNode {
     /// Handle a `FetchResponse` received by this (follower or observer)
     /// node from the leader.
     ///
-    /// Per `architecture.md` §5.2 / §5.4 and Stage 3.3 step 2 + step 3:
+    /// Per `architecture.md` ┬º5.2 / ┬º5.4 and Stage 3.3 step 2 + step 3:
     /// 1. Drop silently on `cluster_id` mismatch.
     /// 2. If `resp.leader_epoch > current_term`: adopt the new term via
     ///    `become_follower(Term, Some(leader_id))`. Stage 3.3 finding-4 fix:
-    ///    do NOT return after the step-down — the response is now same-term
+    ///    do NOT return after the step-down ΓÇö the response is now same-term
     ///    valid and its entries / high watermark / divergence MUST still be
     ///    processed under the new term, otherwise the higher-term leader's
     ///    payload is silently dropped and the follower stays one round
     ///    behind. Fall through to the same-term path.
-    /// 3. If `resp.leader_epoch < current_term`, drop — stale leader.
+    /// 3. If `resp.leader_epoch < current_term`, drop ΓÇö stale leader.
     /// 4. Same-term, two-leaders fencing (Stage 3.3 finding-5 fix): if we
     ///    already have `leader_id = Some(known)` and `known != resp.leader_id`,
     ///    the response either comes from a misbehaving peer or has been
     ///    misrouted (two same-term leaders is a Raft safety violation).
     ///    Drop the response WITHOUT resetting the election timer so a
     ///    spurious claimant cannot suppress a genuine election timeout.
-    ///    Same fence applies if WE are the leader at this term — drop
+    ///    Same fence applies if WE are the leader at this term ΓÇö drop
     ///    defensively.
     /// 5. Same-term valid response: if we are a Candidate or PreCandidate,
     ///    a legitimate same-term leader has been established; step down
     ///    to follower with the leader hint. If we are a Follower /
     ///    Observer without a known leader, adopt the hint.
     /// 6. Reset the election timer and refresh `last_leader_contact_tick`
-    ///    (any valid FetchResponse is proof of leader liveness — the
+    ///    (any valid FetchResponse is proof of leader liveness ΓÇö the
     ///    `fetch-resets-election-timer` Stage 3.3 scenario).
     /// 7. If `diverging_epoch` is set: emit [`Action::TruncateLog`] from
     ///    `end_offset + 1` and an immediate re-fetch [`Action::SendMessage`]
     ///    using the leader-supplied consistent point. (We do not update
-    ///    `last_log_index` / `last_log_term` here — the driver calls
+    ///    `last_log_index` / `last_log_term` here ΓÇö the driver calls
     ///    [`set_last_log`](Self::set_last_log) after truncation.)
     /// 8. If entries are present: emit [`Action::AppendEntries`] and
     ///    advance the in-memory mirror to the last entry. Then advance
@@ -1594,7 +1594,7 @@ impl RaftNode {
     ///    and emit [`Action::ApplyToStateMachine`] if anything became
     ///    committed.
     /// 9. If entries are empty: still propagate the high watermark
-    ///    (followers learn HW one round late — see architecture §5.2).
+    ///    (followers learn HW one round late ΓÇö see architecture ┬º5.2).
     #[tracing::instrument(level = "debug", skip(self), fields(node_id = %self.id, current_term = %self.hard_state.current_term))]
     pub fn handle_fetch_response(&mut self, resp: FetchResponse) -> Vec<Action> {
         if resp.cluster_id != self.config.cluster_id {
@@ -1608,7 +1608,7 @@ impl RaftNode {
         // entries via `become_follower(_, Some(resp.leader_id))` (higher
         // term branch) or via the `if self.leader_id.is_none()` adopt path
         // (same-term branch) without any membership check. This guard runs
-        // BEFORE any state mutation — including the higher-term step-down —
+        // BEFORE any state mutation ΓÇö including the higher-term step-down ΓÇö
         // so an unknown sender cannot force a term bump either. Mirrors the
         // identical filter on `handle_fetch_request` and matches KRaft's
         // requirement that a leader id be a configured voter.
@@ -1634,7 +1634,7 @@ impl RaftNode {
             // matches `resp.leader_id`, so the fencing check below is a
             // no-op and the entries are processed.
         } else if resp.leader_epoch < self.hard_state.current_term.0 {
-            // Stale-leader response — drop (we have moved on).
+            // Stale-leader response ΓÇö drop (we have moved on).
             return actions;
         }
 
@@ -1680,7 +1680,7 @@ impl RaftNode {
                 }
             }
             NodeRole::Leader => {
-                // Already returned above. Unreachable — kept for an
+                // Already returned above. Unreachable ΓÇö kept for an
                 // exhaustive match.
                 return Vec::new();
             }
@@ -1715,17 +1715,25 @@ impl RaftNode {
             return actions;
         }
 
-        // Non-diverging entries path.
-        if !resp.entries.is_empty() {
+        // Non-diverging entries path. Move `entries` out of `resp` once
+        // up-front so the validation window can borrow `&entries` and the
+        // final `Action::AppendEntries(entries)` is a move rather than a
+        // clone. Cloning a `Vec<Entry>` whose payloads are large
+        // `Command` blobs would otherwise duplicate every byte of the
+        // batch on the hot replication path. `resp.high_watermark` below
+        // is a different field (`Copy`) so partial-moving `entries` here
+        // is fine.
+        let entries = resp.entries;
+        if !entries.is_empty() {
             // Sanity: entries must be contiguous starting at last_log_index + 1.
             // If the leader sent an out-of-order batch, drop and let the next
             // tick re-fetch.
             let expected_first = LogIndex(self.last_log_index.0.saturating_add(1));
-            if resp.entries[0].index != expected_first {
+            if entries[0].index != expected_first {
                 tracing::warn!(
                     node_id = %self.id,
                     expected_first = %expected_first,
-                    actual_first = %resp.entries[0].index,
+                    actual_first = %entries[0].index,
                     "dropping FetchResponse with non-contiguous entries"
                 );
                 return actions;
@@ -1739,8 +1747,8 @@ impl RaftNode {
             // log-matching invariants. We also reject in-batch term regress
             // (term may only stay the same or grow within a single batch
             // from a single leader epoch) for the same reason. Drop the
-            // entire response — the next tick re-fetches.
-            for w in resp.entries.windows(2) {
+            // entire response ΓÇö the next tick re-fetches.
+            for w in entries.windows(2) {
                 if w[1].index.0 != w[0].index.0.saturating_add(1) {
                     tracing::warn!(
                         node_id = %self.id,
@@ -1760,15 +1768,15 @@ impl RaftNode {
                     return actions;
                 }
             }
-            let last_entry = resp.entries.last().expect("entries is non-empty");
+            let last_entry = entries.last().expect("entries is non-empty");
             let new_last_index = last_entry.index;
             let new_last_term = last_entry.term;
-            actions.push(Action::AppendEntries(resp.entries.clone()));
+            actions.push(Action::AppendEntries(entries));
             self.last_log_index = new_last_index;
             self.last_log_term = new_last_term;
         }
 
-        // Propagate the high watermark — clamp to our own log tail because
+        // Propagate the high watermark ΓÇö clamp to our own log tail because
         // we cannot commit entries we have not yet replicated.
         let new_commit = LogIndex(resp.high_watermark.0.min(self.last_log_index.0));
         if new_commit > self.commit_index {
@@ -1781,7 +1789,7 @@ impl RaftNode {
         actions
     }
 
-    /// Handle an [`Input::ClientPropose`] (Stage 3.3 step 5 / §5.2).
+    /// Handle an [`Input::ClientPropose`] (Stage 3.3 step 5 / ┬º5.2).
     ///
     /// Only the leader accepts client proposals. The new entry is appended
     /// at `last_log_index + 1` with the current term and emitted as
@@ -1989,9 +1997,9 @@ port = 6000
     fn election_timeout_triggers_candidacy() {
         // Stage 3.1 scenario: election-timeout-triggers-candidacy.
         //
-        // Per architecture.md §5.1 and e2e-scenarios.md Feature 3, an
+        // Per architecture.md ┬º5.1 and e2e-scenarios.md Feature 3, an
         // election timeout sends a Follower into the Pre-Vote phase
-        // (`PreCandidate`) — *not* directly into `Candidate`. The term must
+        // (`PreCandidate`) ΓÇö *not* directly into `Candidate`. The term must
         // NOT be incremented until a quorum of pre-votes is received
         // (Stage 3.2). This protects an established leader from disruption
         // when a partitioned node rejoins.
@@ -2012,13 +2020,13 @@ port = 6000
             let actions = node.step(Input::Tick);
             if node.role == NodeRole::PreCandidate && became_pre_candidate_at.is_none() {
                 became_pre_candidate_at = Some(i);
-                // No PersistHardState — Pre-Vote does not bump term.
+                // No PersistHardState ΓÇö Pre-Vote does not bump term.
                 assert!(
                     !actions
                         .iter()
                         .any(|a| matches!(a, Action::PersistHardState)),
                     "PreCandidate transition must NOT persist hard state \
-                     (term unchanged) — got {actions:?}"
+                     (term unchanged) ΓÇö got {actions:?}"
                 );
                 // One PreVoteRequest per peer.
                 let pre_votes = actions
@@ -2034,7 +2042,7 @@ port = 6000
                     })
                     .count();
                 assert_eq!(pre_votes, node.peers.len());
-                // No real VoteRequest yet — that fires after pre-vote quorum.
+                // No real VoteRequest yet ΓÇö that fires after pre-vote quorum.
                 let vote_requests = actions
                     .iter()
                     .filter(|a| {
@@ -2061,7 +2069,7 @@ port = 6000
         assert_eq!(
             node.current_term(),
             initial_term,
-            "Pre-Vote must NOT increment term (architecture.md §5.1)"
+            "Pre-Vote must NOT increment term (architecture.md ┬º5.1)"
         );
         assert_eq!(
             node.hard_state.voted_for, None,
@@ -2073,7 +2081,7 @@ port = 6000
     #[test]
     fn pre_candidate_promotes_to_candidate_on_quorum() {
         // Synthetic complement to `election_timeout_triggers_candidacy`:
-        // exercises the second half of the Pre-Vote → Candidate transition
+        // exercises the second half of the Pre-Vote ΓåÆ Candidate transition
         // by directly invoking `become_candidate()` (the actual response
         // handler that drives this transition is wired in Stage 3.2). The
         // contract verified here is the Stage-3.1 promise that
@@ -2127,7 +2135,7 @@ port = 6000
         // so the node has a fresh window before re-issuing votes.
         // start_election is the real-election entrypoint (increments term,
         // emits VoteRequests). The architecturally-correct Pre-Vote-first
-        // path is exercised separately via handle_tick → become_pre_candidate.
+        // path is exercised separately via handle_tick ΓåÆ become_pre_candidate.
         let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
         let term_before = node.current_term();
         let actions = node.start_election();
@@ -2160,7 +2168,7 @@ port = 6000
     #[test]
     fn pre_candidate_election_timeout_restarts_pre_vote() {
         // PreCandidate timeout must restart Pre-Vote (re-issue
-        // PreVoteRequests with a fresh timer) — NOT increment the term.
+        // PreVoteRequests with a fresh timer) ΓÇö NOT increment the term.
         // The whole point of Pre-Vote is to avoid term inflation when the
         // cluster is unreachable.
         let mut node = RaftNode::new_with_seed(three_voter_config(), 7).unwrap();
@@ -2237,7 +2245,7 @@ port = 6000
         assert_eq!(
             node.current_term(),
             term_after_candidate,
-            "Candidate→PreCandidate fallback must NOT bump term again"
+            "CandidateΓåÆPreCandidate fallback must NOT bump term again"
         );
     }
 
@@ -2319,13 +2327,13 @@ port = 6000
 
     #[test]
     fn election_loop_in_single_voter_cluster_via_tick() {
-        // The full Pre-Vote-first path (architecture.md §5.1):
+        // The full Pre-Vote-first path (architecture.md ┬º5.1):
         //   Follower ticks until election timer expires
-        //     → handle_tick routes to become_pre_candidate
-        //     → self pre-vote satisfies pre-election quorum (1-of-1)
-        //     → cascades into become_candidate (term++)
-        //     → self vote satisfies election quorum (1-of-1)
-        //     → cascades into become_leader (no-op AppendEntries)
+        //     ΓåÆ handle_tick routes to become_pre_candidate
+        //     ΓåÆ self pre-vote satisfies pre-election quorum (1-of-1)
+        //     ΓåÆ cascades into become_candidate (term++)
+        //     ΓåÆ self vote satisfies election quorum (1-of-1)
+        //     ΓåÆ cascades into become_leader (no-op AppendEntries)
         // Verifies the end-to-end handle_tick wiring on a one-node cluster
         // honours the Pre-Vote-first contract while still electing in a
         // single tick window.
@@ -2647,7 +2655,7 @@ port = 6000
     }
 
     // -------------------------------------------------------------------
-    // Stage 3.2 — Leader Election handler tests
+    // Stage 3.2 ΓÇö Leader Election handler tests
     // -------------------------------------------------------------------
 
     /// Locate the first `VoteResponse` produced in an action list.
@@ -2774,7 +2782,7 @@ port = 6000
         let resp = extract_vote_response(&actions);
         assert!(!resp.vote_granted);
         assert_eq!(resp.term, Term(5));
-        // No PersistHardState — neither term nor vote changed.
+        // No PersistHardState ΓÇö neither term nor vote changed.
         assert!(
             !actions
                 .iter()
@@ -2802,7 +2810,7 @@ port = 6000
         let resp = extract_vote_response(&actions);
         assert!(!resp.vote_granted, "stale-log candidate must be rejected");
         // But the higher term still must be adopted (Raft safety: see a
-        // higher term → adopt and clear vote, then reject the vote).
+        // higher term ΓåÆ adopt and clear vote, then reject the vote).
         assert_eq!(node.current_term(), Term(4));
         assert_eq!(node.hard_state.voted_for, None);
     }
@@ -2810,7 +2818,7 @@ port = 6000
     #[test]
     fn handle_vote_request_rejects_when_already_voted_other() {
         // At the same term, voted_for=NodeId(2). A new candidate=NodeId(3)
-        // asks for a vote — denied (one vote per term safety invariant).
+        // asks for a vote ΓÇö denied (one vote per term safety invariant).
         let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
         node.hard_state.current_term = Term(4);
         node.hard_state.voted_for = Some(NodeId(2));
@@ -2841,7 +2849,7 @@ port = 6000
         let resp = extract_vote_response(&actions);
         assert!(resp.vote_granted, "re-grant to same candidate must succeed");
         assert_eq!(node.hard_state.voted_for, Some(NodeId(2)));
-        // No PersistHardState — voted_for did not actually change.
+        // No PersistHardState ΓÇö voted_for did not actually change.
         assert!(
             !actions
                 .iter()
@@ -2851,7 +2859,7 @@ port = 6000
 
     #[test]
     fn handle_vote_request_steps_down_on_higher_term_as_leader() {
-        // Leader at term=2 receives VoteRequest at term=5 — step down to
+        // Leader at term=2 receives VoteRequest at term=5 ΓÇö step down to
         // follower at term=5 (StepDown action present), then evaluate the
         // vote at term=5.
         let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
@@ -2961,7 +2969,7 @@ port = 6000
         assert!(a.is_empty(), "no actions before quorum");
 
         let a = node.handle_vote_response(NodeId(3), vote_resp("test", term.0, true));
-        assert_eq!(node.role, NodeRole::Leader, "two peer grants → quorum");
+        assert_eq!(node.role, NodeRole::Leader, "two peer grants ΓåÆ quorum");
         assert!(
             a.iter().any(|x| matches!(x, Action::BecomeLeader)),
             "expected Action::BecomeLeader once quorum reached"
@@ -3038,7 +3046,7 @@ port = 6000
         let _ = node.handle_vote_response(NodeId(2), vote_resp("test", term.0, true));
         let _ = node.handle_vote_response(NodeId(2), vote_resp("test", term.0, true));
 
-        // Tally = {self, NodeId(2)} → 2 of 5 (quorum=3).
+        // Tally = {self, NodeId(2)} ΓåÆ 2 of 5 (quorum=3).
         assert_eq!(node.votes_received.len(), 2);
         assert_ne!(
             node.role,
@@ -3080,7 +3088,7 @@ port = 6000
     fn scenario_pre_vote_prevents_disruption() {
         // Scenario: pre-vote-prevents-disruption
         // Given a Follower that has just heard from a leader, When it
-        // receives a PreVote, Then it rejects (architecture §2.1).
+        // receives a PreVote, Then it rejects (architecture ┬º2.1).
         let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
         // Acknowledge leader NodeId(3) at the current term.
         let _ = node.become_follower(Term(0), Some(NodeId(3)));
@@ -3106,7 +3114,7 @@ port = 6000
         // than election_timer.timeout_ticks()), the leader is no longer
         // "recently active" and a pre-vote should be granted. Using the
         // full randomized election timeout (not just min_ticks) matches
-        // the architecture rule "within the election timeout" — see
+        // the architecture rule "within the election timeout" ΓÇö see
         // `leader_recently_active`.
         let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
         let _ = node.become_follower(Term(0), Some(NodeId(3)));
@@ -3202,7 +3210,7 @@ port = 6000
 
         let actions =
             node.handle_pre_vote_response(NodeId(2), pre_vote_resp("test", term_before.0, true));
-        // Pre-vote quorum (2 of 3) → cascade into Candidate.
+        // Pre-vote quorum (2 of 3) ΓåÆ cascade into Candidate.
         assert_eq!(node.role, NodeRole::Candidate);
         assert_eq!(
             node.current_term().0,
@@ -3229,7 +3237,7 @@ port = 6000
         // Voter 2 responds from a stale term=3.
         let _ = node.handle_pre_vote_response(NodeId(2), pre_vote_resp("test", 3, true));
 
-        // Quorum (2 of 3) → cascade to Candidate at term 6.
+        // Quorum (2 of 3) ΓåÆ cascade to Candidate at term 6.
         assert_eq!(node.role, NodeRole::Candidate);
         assert_eq!(node.current_term(), Term(6));
     }
@@ -3272,7 +3280,7 @@ port = 6000
     #[test]
     fn handle_pre_vote_response_dedupes_double_grant() {
         // Quorum of 5 = 3 (self + 2). Two grants from the same voter must
-        // NOT count as two — the HashSet semantics dedupe.
+        // NOT count as two ΓÇö the HashSet semantics dedupe.
         let cfg = five_voter_config();
         let mut node = RaftNode::new_with_seed(cfg, 1).unwrap();
         let _ = node.become_pre_candidate();
@@ -3307,7 +3315,7 @@ port = 6000
         // Drive into Candidate at term=1.
         let _ = node.become_candidate();
         let term = node.current_term();
-        // Vote response → quorum on a 3-node cluster (self + one peer).
+        // Vote response ΓåÆ quorum on a 3-node cluster (self + one peer).
         let actions = node.step(Input::VoteResponse {
             from: NodeId(2),
             response: vote_resp("test", term.0, true),
@@ -3336,7 +3344,7 @@ port = 6000
             from: NodeId(2),
             response: pre_vote_resp("test", 0, true),
         });
-        // Pre-quorum → Candidate.
+        // Pre-quorum ΓåÆ Candidate.
         assert_eq!(node.role, NodeRole::Candidate);
     }
 
@@ -3344,10 +3352,10 @@ port = 6000
 
     #[test]
     fn three_node_cluster_full_election_via_step() {
-        // End-to-end: drive the full Pre-Vote → Vote → Leader cascade on
+        // End-to-end: drive the full Pre-Vote ΓåÆ Vote ΓåÆ Leader cascade on
         // node 1 by feeding it Tick (until pre-candidate), then a
-        // PreVoteResponse grant (→ Candidate), then a VoteResponse grant
-        // (→ Leader). Verifies all four Stage 3.2 handlers are wired via
+        // PreVoteResponse grant (ΓåÆ Candidate), then a VoteResponse grant
+        // (ΓåÆ Leader). Verifies all four Stage 3.2 handlers are wired via
         // `step()` and interoperate.
         let mut node = RaftNode::new_with_seed(three_voter_config(), 42).unwrap();
         // 1) Tick until the election timer triggers PreCandidate.
@@ -3360,7 +3368,7 @@ port = 6000
         assert_eq!(node.role, NodeRole::PreCandidate);
         assert_eq!(node.current_term(), Term(0)); // Pre-vote does NOT bump term.
 
-        // 2) One peer grants the pre-vote → Candidate at term 1.
+        // 2) One peer grants the pre-vote ΓåÆ Candidate at term 1.
         let _ = node.step(Input::PreVoteResponse {
             from: NodeId(2),
             response: pre_vote_resp("test", 0, true),
@@ -3368,7 +3376,7 @@ port = 6000
         assert_eq!(node.role, NodeRole::Candidate);
         assert_eq!(node.current_term(), Term(1));
 
-        // 3) One peer grants the real vote → Leader.
+        // 3) One peer grants the real vote ΓåÆ Leader.
         let actions = node.step(Input::VoteResponse {
             from: NodeId(3),
             response: vote_resp("test", 1, true),
@@ -3434,7 +3442,7 @@ port = 6004
     }
 
     // -------------------------------------------------------------------
-    // Stage 3.3 — Log Replication scenario tests
+    // Stage 3.3 ΓÇö Log Replication scenario tests
     // -------------------------------------------------------------------
 
     /// Helper: drive `node` from Follower into Leader on a 3-voter cluster
@@ -3456,14 +3464,14 @@ port = 6004
             "did not become PreCandidate"
         );
 
-        // Step 2: One pre-vote grant from a peer → Candidate (term++).
+        // Step 2: One pre-vote grant from a peer ΓåÆ Candidate (term++).
         let _ = node.step(Input::PreVoteResponse {
             from: NodeId(2),
             response: pre_vote_resp("test", 0, true),
         });
         assert_eq!(node.role, NodeRole::Candidate, "did not become Candidate");
 
-        // Step 3: One real-vote grant → Leader (with no-op AppendEntries).
+        // Step 3: One real-vote grant ΓåÆ Leader (with no-op AppendEntries).
         let cur_term = node.current_term().0;
         let _ = node.step(Input::VoteResponse {
             from: NodeId(3),
@@ -3517,17 +3525,17 @@ port = 6004
     /// next, which only proves it has entries up to `N - 1`. The driver
     /// (after validating divergence on the leader's `LogStore`) feeds
     /// `Input::FetchRequestAcked { confirmed_offset: req.fetch_offset - 1 }`
-    /// — NOT `req.fetch_offset`. Concretely:
+    /// ΓÇö NOT `req.fetch_offset`. Concretely:
     ///
-    /// - Round 1: req(fetch_offset=1, last_fetched_epoch=0) → ServeFetch.
+    /// - Round 1: req(fetch_offset=1, last_fetched_epoch=0) ΓåÆ ServeFetch.
     ///   Driver acks with confirmed_offset=0 (the follower is empty).
     ///   Leader's view: peer 2 last_fetch_offset=0. Quorum (sorted desc:
-    ///   leader=1, peer 2=0, peer 3=0) → q-th=offsets[1]=0. Commit does
+    ///   leader=1, peer 2=0, peer 3=0) ΓåÆ q-th=offsets[1]=0. Commit does
     ///   NOT advance.
-    /// - Round 2: req(fetch_offset=2, last_fetched_epoch=1) → ServeFetch.
+    /// - Round 2: req(fetch_offset=2, last_fetched_epoch=1) ΓåÆ ServeFetch.
     ///   Driver acks with confirmed_offset=1 (the follower has entry 1).
     ///   Leader's view: peer 2 last_fetch_offset=1. Quorum (sorted desc:
-    ///   leader=1, peer 2=1, peer 3=0) → q-th=offsets[1]=1. Commit
+    ///   leader=1, peer 2=1, peer 3=0) ΓåÆ q-th=offsets[1]=1. Commit
     ///   advances to 1; ApplyToStateMachine{1,1} emitted.
     #[test]
     fn scenario_basic_replication() {
@@ -3655,7 +3663,7 @@ port = 6004
     /// Scenario: commit-requires-majority
     ///
     /// Given a 5-voter cluster with node 1 as leader (term 1, no-op at
-    /// index 1), When only ONE peer acks (2-of-5 — short of 3-of-5 quorum)
+    /// index 1), When only ONE peer acks (2-of-5 ΓÇö short of 3-of-5 quorum)
     /// Then `commit_index` does NOT advance. When a second peer acks
     /// (3-of-5 majority including the leader) Then `commit_index` advances
     /// to 1 and `ApplyToStateMachine` is emitted.
@@ -3671,7 +3679,7 @@ port = 6004
             }
         }
         assert_eq!(node.role, NodeRole::PreCandidate);
-        // Two pre-vote grants → 3-of-5 (incl. self) → Candidate.
+        // Two pre-vote grants ΓåÆ 3-of-5 (incl. self) ΓåÆ Candidate.
         let _ = node.step(Input::PreVoteResponse {
             from: NodeId(2),
             response: pre_vote_resp("test", 0, true),
@@ -3681,7 +3689,7 @@ port = 6004
             response: pre_vote_resp("test", 0, true),
         });
         assert_eq!(node.role, NodeRole::Candidate);
-        // Two vote grants → 3-of-5 (incl. self) → Leader.
+        // Two vote grants ΓåÆ 3-of-5 (incl. self) ΓåÆ Leader.
         let cur_term = node.current_term().0;
         let _ = node.step(Input::VoteResponse {
             from: NodeId(2),
@@ -3696,7 +3704,7 @@ port = 6004
         assert_eq!(node.commit_index, LogIndex(0));
 
         // Only ONE peer acks: leader self (offset=1) + node 2 (offset=1)
-        // = 2-of-5 → no quorum → no commit advance.
+        // = 2-of-5 ΓåÆ no quorum ΓåÆ no commit advance.
         let one_ack = node.step(Input::FetchRequestAcked {
             replica_id: NodeId(2),
             confirmed_offset: LogIndex(1),
@@ -3713,7 +3721,7 @@ port = 6004
             "no ApplyToStateMachine when commit did not advance"
         );
 
-        // Second peer acks: 3-of-5 majority (self + node 2 + node 3) → commit advances.
+        // Second peer acks: 3-of-5 majority (self + node 2 + node 3) ΓåÆ commit advances.
         let two_ack = node.step(Input::FetchRequestAcked {
             replica_id: NodeId(3),
             confirmed_offset: LogIndex(1),
@@ -3802,7 +3810,7 @@ port = 6004
         assert_eq!(refetch.1.leader_epoch, 5);
         assert_eq!(refetch.1.replica_id, NodeId(1));
 
-        // The handler must NOT mutate last_log_index/term itself —
+        // The handler must NOT mutate last_log_index/term itself ΓÇö
         // truncation is the driver's job, and only the driver knows the
         // post-truncation tail (see rubber-duck blocking issue #3).
         assert_eq!(node.last_log_index, LogIndex(10));
@@ -3814,7 +3822,7 @@ port = 6004
     /// Given a Follower with a known leader_id whose election timer has
     /// been advanced near expiry, When a valid same-term FetchResponse
     /// (empty entries) arrives, Then the election timer is reset and the
-    /// follower's `last_leader_contact_tick` is refreshed — i.e. proof of
+    /// follower's `last_leader_contact_tick` is refreshed ΓÇö i.e. proof of
     /// leader liveness suppresses the impending election.
     #[test]
     fn scenario_fetch_resets_election_timer() {
@@ -3889,7 +3897,7 @@ port = 6004
                 .any(|a| matches!(a, Action::PersistHardState)),
             "expected PersistHardState on step-down, got {actions:?}"
         );
-        // No ServeFetch — we are no longer leader.
+        // No ServeFetch ΓÇö we are no longer leader.
         assert!(
             !actions
                 .iter()
@@ -3900,7 +3908,7 @@ port = 6004
 
     /// Stage 3.3 finding-4 fix: when a higher-term `FetchResponse` arrives
     /// at this node, after stepping down to the new term we MUST still
-    /// process the response's entries and high watermark — they are now
+    /// process the response's entries and high watermark ΓÇö they are now
     /// same-term valid under the new term. Dropping the payload (the prior
     /// behavior) silently delays follower catch-up by one round.
     ///
@@ -4032,19 +4040,19 @@ port = 6004
         );
         let actions = node.step(Input::FetchResponse(resp));
 
-        // Response is dropped — no actions emitted.
+        // Response is dropped ΓÇö no actions emitted.
         assert!(
             actions.is_empty(),
             "two same-term leaders must drop with no actions, got {actions:?}"
         );
-        // leader_id PRESERVED — no overwrite.
+        // leader_id PRESERVED ΓÇö no overwrite.
         assert_eq!(node.leader_id, Some(NodeId(2)));
         // No log mutation, no commit/apply mutation.
         assert_eq!(node.last_log_index, LogIndex(5));
         assert_eq!(node.last_log_term, Term(4));
         assert_eq!(node.commit_index, LogIndex(3));
         assert_eq!(node.last_applied, LogIndex(3));
-        // Election timer NOT reset — a spurious response cannot suppress
+        // Election timer NOT reset ΓÇö a spurious response cannot suppress
         // a genuine timeout.
         assert_eq!(
             node.election_timer.elapsed(),
@@ -4079,7 +4087,7 @@ port = 6004
         let req = build_fetch_request_from(NodeId(99), 1, 0, /*leader_epoch=*/ 1);
         let actions = node.step(Input::FetchRequest(req));
 
-        // Dropped silently — no actions whatsoever.
+        // Dropped silently ΓÇö no actions whatsoever.
         assert!(
             actions.is_empty(),
             "unknown-replica FetchRequest must be dropped, got {actions:?}"
@@ -4226,7 +4234,7 @@ port = 6004
         );
         let actions = node.step(Input::FetchRequest(req));
 
-        // Dropped silently — no ServeFetch, no other actions.
+        // Dropped silently ΓÇö no ServeFetch, no other actions.
         assert!(
             actions.is_empty(),
             "fetch_offset=0 must be dropped, got {actions:?}"
@@ -4248,9 +4256,9 @@ port = 6004
     /// `leader_id` is neither a configured voter nor a known peer MUST
     /// be dropped before any state mutation. Two attack vectors are
     /// closed by this check:
-    /// (a) higher-term path — without the guard, an unknown sender could
+    /// (a) higher-term path ΓÇö without the guard, an unknown sender could
     ///     force a term bump via `become_follower(Term, Some(unknown))`.
-    /// (b) same-term `leader_id == None` path — without the guard, an
+    /// (b) same-term `leader_id == None` path ΓÇö without the guard, an
     ///     unknown sender could set `self.leader_id = Some(unknown)` and
     ///     then push entries the follower would accept.
     /// This test exercises both: (a) higher-term unknown-leader response
@@ -4287,7 +4295,7 @@ port = 6004
         );
         let actions = node.step(Input::FetchResponse(resp));
 
-        // Dropped — NO term bump, NO leader change, NO entries appended.
+        // Dropped ΓÇö NO term bump, NO leader change, NO entries appended.
         assert!(
             actions.is_empty(),
             "unknown-leader FetchResponse must be dropped, got {actions:?}"
@@ -4346,7 +4354,7 @@ port = 6004
     /// Stage 3.3 finding-2 fix (iter 3): the entries batch in a
     /// `FetchResponse` must be index-contiguous end-to-end, not just at
     /// its first element. The previous code checked `entries[0].index`
-    /// matched `last_log_index + 1` then appended the whole batch — so a
+    /// matched `last_log_index + 1` then appended the whole batch ΓÇö so a
     /// malformed leader sending `[entry(1), entry(3)]` would corrupt the
     /// follower's log with a gap at index 2 and silently violate Raft's
     /// log-matching invariant. Validate every adjacent pair before
