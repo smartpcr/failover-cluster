@@ -1,181 +1,178 @@
-# Stage 3.2: Leader Election -- iter 4
-
-> NOTE [annotation added in iter 5]: The iter-4 evaluator pass flagged
-> the "7-path" file-count claim in this file because Forge auto-archived
-> iter-4's iter-notes.md to `.forge/notes/iter-4.md` AFTER iter 4
-> finished, bringing the worktree-delta count to 8 by the time the
-> evaluator inspected the tree. The iter-4 narrative below was truthful
-> at the moment iter-4 wrote it (it could not see its own
-> not-yet-created archive), but the count is stale once Forge runs its
-> auto-archive step. See `.forge/iter-notes.md` (iter-5 reflection) for
-> the structural fix: iter-5 onwards documents the auto-archive +1
-> pattern in plain language instead of committing to a fixed file
-> count that goes stale 0.0 seconds after the iter ends.
+# Stage 3.3: Log Replication -- iter 4
 
 ## Iteration Summary
 
-Notes-and-audit-trail cleanup iter. Same pattern as iter 3: no Rust
-source changed; only markdown notes were touched, plus a line-ending
-conversion fix that resolves the iter-3 trailing-whitespace finding.
-All three iter-3 evaluator findings are addressed below.
+Resolved the single iter-3 evaluator finding (score 89, verdict
+iterate). The fix is symmetric to the iter-3 finding-1 fix on
+`handle_fetch_response`: the unknown-replica trust-boundary guard
+in `handle_fetch_request` was placed AFTER the higher-term
+reconciliation branch, so an unknown same-cluster replica with
+`leader_epoch > current_term` could still reach
+`become_follower(Term(req.leader_epoch), None)` and force a stepdown.
+This iter moves the guard to the very top of the function (right
+after cluster_id and self-fetch checks, BEFORE the higher-term
+branch) so unknown senders cannot mutate any state — including term,
+role, leader_id, the election timer, or per-peer liveness fields.
+A new direct regression test pins the new ordering. Per-iter gate
+chain (build, fmt --check, clippy -D warnings, test, diff --check)
+is green; xraft-core test count rose from 227 to 228 (+1 new this
+iter), xraft-storage stays at 112.
 
 ### Prior feedback resolution
 
-- [x] 1. ADDRESSED -- Files-touched narrative now matches the actual
-  ground-truth file list.
-  Ran `git --no-pager status --short` at the start of iter 4 to
-  capture the authoritative file list. Ground truth:
-  ```
-   M .forge/iter-notes.md
-   M .forge/notes/iter-2.md
-   M .forge/notes/iter-3.md
-   M xraft-core/src/lib.rs
-   M xraft-core/src/node.rs
-   M xraft-core/src/types.rs
-  ?? .forge/notes/iter-1.md
-  ```
-  That is 6 modified files plus 1 untracked file = 7 paths in the
-  worktree delta versus branch base. The iter-3 notes only listed 5
-  (the 3 Rust files plus iter-notes.md and notes/iter-2.md) because
-  they were written BEFORE Forge auto-archived iter-3's iter-notes.md
-  to notes/iter-3.md, and they did not enumerate the prior-workstream
-  auto-archive at notes/iter-1.md. This iter (iter 4) splits the
-  narrative explicitly into:
-  * "Actively edited this iter" (the files I touched with my own
-    edits in iter 4 -- see Files touched below).
-  * "Already in the worktree delta" (the cumulative files that exist
-    from prior iters and Forge's auto-archive mechanism, including
-    notes/iter-1.md and notes/iter-3.md).
-  The full 7-path list is enumerated in the diff stat block below.
+- [x] 1. ADDRESSED -- xraft-core/src/node.rs handle_fetch_request
+  -- Reordered the function's defensive checks so the unknown-replica
+  guard runs BEFORE the higher-term reconciliation branch. New order:
+  (1) cluster_id check; (2) is_self drop (also moved up so a
+  malformed self-loopback with bogus higher leader_epoch can never
+  step ourselves down); (3) unknown-replica drop (NEW POSITION);
+  (4) higher-term step-down (now reachable only for known senders);
+  (5) not-leader drop; (6) fetch_offset == 0 drop; (7) per-peer
+  liveness update + ServeFetch. Mirrors the symmetric ordering
+  the iter-3 fix established for handle_fetch_response (cluster ->
+  unknown-leader -> higher-term reconciliation). Unknown senders can
+  no longer trip `become_follower(Term(req.leader_epoch), None)` to
+  force a stepdown / term bump. New test
+  `scenario_unknown_replica_higher_term_fetch_request_cannot_force_stepdown`
+  exercises a NodeId(99) (not in voter_set {1,2,3}, not in peers)
+  request carrying leader_epoch=10 against a leader at term 2 and
+  asserts: no actions emitted, no PersistHardState, term stays 2,
+  role stays Leader, leader_id unchanged, election timer NOT reset,
+  no phantom peer record, other peers' liveness untouched.
 
-- [x] 2. ADDRESSED -- Cumulative diff stat covers all 7 changed files.
-  The iter-3 diff stat listed 5 paths. The corrected diff stat block
-  in this iter-notes.md (see "Cumulative git diff --stat" below)
-  enumerates all 7: the 3 Rust source files plus the 4 markdown
-  files in .forge/. The notes/iter-3.md defensive overwrite in this
-  iter carries the same corrected diff stat so the audit trail is
-  consistent across iter-notes.md and the archive.
-
-- [x] 3. ADDRESSED -- Trailing whitespace is now actually clean per
-  `git --no-pager diff --check`.
-  Root cause: my iter-3 `create` tool calls wrote the markdown files
-  with CRLF line endings (Windows default). Git's default
-  `core.whitespace` rules flag CR-before-LF as "trailing whitespace"
-  in `git diff --check`, so every line of my LF-claimed files
-  reported as trailing-whitespace. The iter-3 fix only stripped
-  trailing space/tab characters; it did not address the CR-before-LF
-  pattern that `diff --check` actually flags.
-  Iter-4 fix: re-wrote all four .forge markdown files
-  (iter-notes.md, notes/iter-1.md, notes/iter-2.md, notes/iter-3.md)
-  with explicit `[System.IO.File]::WriteAllText(...,
-  UTF8Encoding($false))` after replacing every `\r\n` with `\n`.
-  Byte-level verification AFTER the rewrite:
-  ```
-  .forge/iter-notes.md       CR=0 LF=142 non-ASCII=0
-  .forge/notes/iter-1.md     CR=0 LF=70  non-ASCII=0
-  .forge/notes/iter-2.md     CR=0 LF=143 non-ASCII=0
-  .forge/notes/iter-3.md     CR=0 LF=142 non-ASCII=0
-  ```
-  `git --no-pager diff --check` exit=0 with no output -- the line
-  1, 5, 6, 7 trailing-whitespace warnings the evaluator cited are
-  gone. (notes/iter-1.md previously also had 6 non-ASCII bytes from
-  the prior workstream's em-dashes; those are now `--` too.)
+  Symmetry verification (the trust-boundary check now runs first in
+  BOTH handlers):
+  - handle_fetch_request: cluster_id -> is_self -> unknown-replica
+    -> higher-term -> not-leader -> fetch_offset==0 -> serve.
+  - handle_fetch_response: cluster_id -> unknown-leader -> higher-term
+    -> two-leaders fence -> ... -> apply.
 
 ## Files touched THIS iter (iter 4)
 
-Actively edited by me in this iter:
-- `.forge/iter-notes.md` -- this file. LF-only, ASCII-only, iter-4
-  reflection.
-- `.forge/notes/iter-3.md` -- defensive overwrite of the iter-3
-  archive. Same corrected narrative shape as iter 3 said it would
-  carry, but now with LF line endings, accurate 7-file diff stat,
-  and a forward note pointing at iter 4's CRLF fix.
-- `.forge/notes/iter-2.md` -- line-endings normalized to LF (content
-  unchanged from iter 3's defensive overwrite).
-- `.forge/notes/iter-1.md` -- line-endings normalized to LF and
-  non-ASCII em-dash glyphs replaced with `--` (the file is
-  untracked, an artifact of the prior Stage 3.1 workstream auto-
-  archive, but it was being read by the evaluator and showing up
-  with mojibake / CRLF noise).
+Actively edited by me in iter 4:
 
-No Rust source code changed this iter. `xraft-core/src/lib.rs`,
-`xraft-core/src/node.rs`, and `xraft-core/src/types.rs` remain
-byte-identical to their end-of-iter-2 state. The full Stage 3.2
-implementation (the substantive code work) landed in iter 1 and was
-refined in iter 2; iters 3 and 4 have been audit-trail cleanups.
+- `xraft-core/src/node.rs` -- One functional reorder in
+  `handle_fetch_request`: moved `is_self` and the
+  `is_known_voter || peers.contains_key` guard ABOVE the higher-term
+  step-down branch. Updated the leading doc-comment hooks for
+  steps 1-6 in the handler body. Net code delta is small (block-
+  reorder + tracing-level upgrade from `debug` to `warn` for the
+  unknown-replica drop, matching the response-side guard).
+  One new test appended near the other Stage 3.3 scenarios (between
+  `scenario_fetch_request_from_unknown_replica_dropped` and
+  `scenario_fetch_request_with_zero_offset_dropped`):
+  `scenario_unknown_replica_higher_term_fetch_request_cannot_force_stepdown`.
+
+- `.forge/iter-notes.md` -- this file. Iter-4 reflection. Written
+  with LF line endings.
+
+- `.forge/notes/iter-1.md` -- still LF-normalized from iter 2; no
+  fresh edit this iter, file remains in worktree delta because the
+  iter-2 normalization pass has not yet been committed by Forge.
+  Defensive re-check at end of iter 4 confirms CR-bytes = 0.
+
+- `.forge/notes/iter-2.md` -- the Stage 3.3 iter-2 reflection
+  Forge auto-archived from iter-notes.md between the iter-2 and
+  iter-3 agent runs. Not touched this iter; CR-bytes = 0.
+
+- `.forge/notes/iter-3.md` -- the Stage 3.3 iter-3 reflection
+  Forge auto-archived from iter-notes.md between the iter-3 and
+  iter-4 agent runs. Not touched this iter; CR-bytes = 0.
+
+- `xraft-core/src/message.rs` -- still in the worktree delta from
+  iter 2 (the unified `Action::ApplyToStateMachine { from, to }`
+  variant); not touched this iter.
+
+## Worktree state at iter-4 writing time
+
+Verbatim `git --no-pager status --short` captured while writing
+these notes:
+
+```
+ M .forge/iter-notes.md
+ M .forge/notes/iter-1.md
+ M .forge/notes/iter-2.md
+ M .forge/notes/iter-3.md
+ M xraft-core/src/message.rs
+ M xraft-core/src/node.rs
+```
+
+6 paths total (6 modified, 0 untracked). At evaluator inspection
+time this becomes 7 paths because Forge will materialize
+`.forge/notes/iter-4.md` from this iter-notes.md file before the
+next evaluator pass — the structural +1 auto-archive pattern
+documented in the cumulative iter-5 (Stage 3.2) notes continues
+to hold for Stage 3.3. Policy statement: for every iter N, the
+evaluator's inspection-time path count = the in-iter
+`git status --short` line count + 1.
 
 ## Decisions made this iter
 
-- LF-only line endings for all .forge markdown. The CRLF-vs-LF
-  problem is the root cause of the trailing-whitespace finding that
-  appeared THREE TIMES in the evaluator feedback (iter 1 implicit,
-  iter 2 explicit, iter 3 explicit again). Per the
-  STRICT-PER-ITEM-ATTENTION protocol, a third recurrence triggers
-  a "try a structural change instead of another word-tweak". The
-  structural change here is: instead of stripping
-  `[ \t]+\r?\n` only, the iter-4 rewrite normalizes the entire file
-  to UTF-8-no-BOM with `\n` line endings, which is the only form
-  that `git diff --check` will accept without configuration changes.
-  Verified by `git --no-pager diff --check` exit=0.
-- Touch notes/iter-1.md too. It is untracked but visible to the
-  evaluator. Cleaning its encoding (LF + ASCII em-dashes) removes
-  it from the "noisy audit trail" finding without changing the
-  historical narrative content.
-- Keep the iter-3 narrative shape in notes/iter-3.md. The iter-3
-  story is correct in spirit (notes-only cleanup); only its
-  accounting of the file list and trailing-whitespace claim needed
-  correction. The defensive overwrite of notes/iter-3.md updates
-  those two paragraphs in place rather than rewriting the whole
-  reflection.
+- Chose to also move `is_self` ABOVE the higher-term branch (not
+  just the unknown-replica guard the evaluator asked about).
+  Rationale: a malformed self-loopback FetchRequest carrying a bogus
+  higher leader_epoch could otherwise step ourselves down. Self
+  never legitimately sends fetch requests to itself in normal
+  operation, so a higher-epoch self-fetch is always either a bug
+  or an attack. Dropping it before any state mutation is strictly
+  safer and one extra moved check.
+
+- Upgraded the unknown-replica drop's tracing level from `debug` to
+  `warn`. Rationale: this is now a security-boundary check (an
+  unknown sender attempting to disrupt leadership), not just a
+  routine "stale-config sender" diagnostic. The response-side
+  unknown-leader guard already uses `warn`; symmetry preserved.
+
+- The new test exhaustively asserts the no-mutation contract:
+  no actions, no PersistHardState (which become_follower would
+  emit), term unchanged, role unchanged, leader_id unchanged,
+  election timer NOT reset, no phantom peer record, OTHER peers'
+  liveness fields untouched. Covers every observable side effect
+  the previous broken ordering could have produced.
+
+- No changes to `handle_fetch_response`: that handler's ordering
+  was already correct as of iter 3 (cluster -> unknown-leader ->
+  higher-term -> two-leaders-fence). The iter-3 evaluator
+  independently verified this.
+
+- No changes to message.rs or any other non-node.rs source. The
+  fix is purely a reorder + tracing-level tweak inside the
+  handle_fetch_request function body.
 
 ## Dead ends tried this iter
 
-- None.
+- None. The fix design was straightforward once the iter-3
+  evaluator pinpointed the exact ordering gap.
 
 ## Open questions surfaced this iter
 
-- None.
+- None. The Stage 3.3 trust-boundary surface (request + response
+  unknown-sender guards, two-leaders fence, malformed-offset drop,
+  intra-batch contiguity validation) is now closed and symmetric.
 
 ## Build / quality / test state at end of iter 4
 
-Per-iter gate chain (re-verified after iter-4 edits):
+Per-iter gate chain (re-verified at end of iter 4):
 
 - `cargo build --workspace` -> exit 0.
 - `cargo fmt --check --all` -> exit 0, no diff.
 - `cargo clippy --workspace --all-targets -- -D warnings` -> exit 0.
-- `cargo test --workspace` -> exit 0, 323 tests pass
-  (211 xraft-core + 112 xraft-storage). Unchanged from end of
-  iter 2; no Rust source touched in iter 3 or iter 4.
-- `git --no-pager diff --check` -> exit 0, no output. The
-  trailing-whitespace finding from iter 3 is fixed at the byte
-  level.
-
-## Cumulative git diff --stat (vs. branch base, after iter 4)
-
-Verbatim copy of `git --no-pager status --short`:
-
-```
- M .forge/iter-notes.md
- M .forge/notes/iter-2.md
- M .forge/notes/iter-3.md
- M xraft-core/src/lib.rs
- M xraft-core/src/node.rs
- M xraft-core/src/types.rs
-?? .forge/notes/iter-1.md
-```
-
-7 paths total: 6 modified, 1 untracked. The 3 xraft-core/src files
-carry the Stage 3.2 implementation (iter 1 + iter 2). The 4
-.forge markdown files carry the iteration audit trail (iter-notes.md
-is this iter's, notes/iter-N.md are the auto-archived prior iters).
+- `cargo test --workspace` -> exit 0; xraft-core 228 passed
+  (was 227 + 1 new this iter); xraft-storage 112 passed (unchanged);
+  340 total non-zero test cases pass across the workspace.
+- `git --no-pager diff --check` -> exit 0 (all .forge markdown
+  files remain LF-clean; defensive re-check at end of iter 4).
 
 ## What's still left for future iters
 
-- Stage 3.2 scope is fully implemented (real-vote + pre-vote
-  handlers, `start_election` real-election entrypoint,
-  `VoteGrantedSet` deliverable, five scenario-tagged acceptance
-  tests). Per-iter quality gate green; `git diff --check` clean.
-- Stage 3.3 (Log Replication) is the next workstream:
-  `handle_fetch_request`, `handle_fetch_response`, leader-side
-  per-peer progress updates, and `ClientPropose` handling on the
-  leader.
+- Stage 3.3 (Log Replication) engine is now complete with all
+  ten cumulative findings (six from iter 1, three from iter 2,
+  one from iter 3) resolved with structural fixes plus seven
+  demonstration tests (three from iter 2, three from iter 3, one
+  from iter 4). The trust-boundary check ordering is symmetric
+  between request and response handlers.
+- Stage 3.4 (next workstream) will likely wire the new `Action`
+  variants (`ServeFetch`, `ApplyToStateMachine`, `TruncateLog`,
+  `AppendEntries`) into the driver layer (xraft-server /
+  xraft-client) for an actual runnable replication pipeline.
+  That remains out of scope for Stage 3.3.
