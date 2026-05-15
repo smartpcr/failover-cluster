@@ -1002,18 +1002,20 @@ where
             }
         };
 
-        // (7) Open a chunked reader. `max_bytes == 0` means "no limit"
-        // per the FetchSnapshotRequest doc comment; pass `None` to
-        // `snapshot_reader_from_offset` in that case so it uses the
-        // store's default chunk size.
+        // (7) Open a chunked reader. `chunk_size` and `max_bytes` are
+        // semantically independent: `chunk_size` controls how big each
+        // emitted chunk is, while `max_bytes` is the overall transfer
+        // cap for this stream. `max_bytes == 0` means "no limit" per
+        // the FetchSnapshotRequest doc comment; pass `None` in that
+        // case. Always request the store's default chunk size by
+        // passing `0` so a small `max_bytes` doesn't collapse the
+        // stream into a single all-or-nothing chunk.
         let max_bytes_opt: Option<u64> = if req.max_bytes == 0 {
             None
         } else {
             Some(req.max_bytes)
         };
-        // `chunk_size` of 0 makes the store pick its default; the
-        // store also uses `chunk_size == 0 → default` semantics.
-        let chunk_size: usize = max_bytes_opt.map(|n| n as usize).unwrap_or(0);
+        let chunk_size: usize = 0; // 0 → store picks its default chunk size
         let iter = match self.snapshot_store.snapshot_reader_from_offset(
             &meta,
             chunk_size,
