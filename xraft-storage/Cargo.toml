@@ -8,6 +8,8 @@ workspace = true
 
 [dependencies]
 xraft-core = { path = "../xraft-core" }
+tokio = { workspace = true, features = ["rt", "sync"] }
+serde.workspace = true
 bincode.workspace = true
 bytes.workspace = true
 tracing.workspace = true
