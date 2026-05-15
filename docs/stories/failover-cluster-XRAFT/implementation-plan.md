@@ -237,17 +237,18 @@ storyId: "failover-cluster:XRAFT"
 ## Stage 5.1: State Machine Callback Trait
 
 ### Implementation Steps
-- [ ] Define `StateMachineCallback` trait in `xraft-core/src/state_machine.rs` with methods: `apply(index: LogIndex, entry: &[u8]) -> Result<()>`, `snapshot() -> Result<Vec<u8>>`, `restore(data: &[u8]) -> Result<()>` — this is the extension point for consumers; XRAFT provides the replicated log, not application logic
-- [ ] Implement `NoOpStateMachine` as a minimal default in `xraft-core/src/state_machine.rs` that logs applied entries via `tracing` but discards the data — used for testing and as a baseline
-- [ ] Wire `StateMachineCallback` into the `Action::ApplyToStateMachine` dispatch path in the event loop, so committed entries are forwarded to the callback
+- [ ] Define `StateMachine` trait in `xraft-core/src/state_machine.rs` with methods: `apply(&mut self, index: LogIndex, command: &[u8]) -> Result<Vec<u8>>`, `query(&self, query: &[u8]) -> Result<Vec<u8>>`, `snapshot(&self) -> Result<Vec<u8>>`, `restore(&mut self, snapshot: &[u8]) -> Result<()>` — trait name and signatures follow `architecture.md` §4.1 which is authoritative; `apply` returns `Result<Vec<u8>>` (serialised command result) rather than `Result<()>` to support read-after-write; `query` is the read-only path used by `xraft-server`'s embedded `read` API (see `architecture.md` §2.4); this is the extension point for consumers — XRAFT provides the replicated log, not application logic
+- [ ] Implement `NoOpStateMachine` as a minimal default in `xraft-core/src/state_machine.rs` that logs applied entries via `tracing` and returns an empty `Vec<u8>` for both `apply` and `query` — used for testing and as a baseline
+- [ ] Wire `StateMachine` into the `Action::ApplyToStateMachine` dispatch path in the event loop, so committed entries are forwarded to the callback
 - [ ] Implement `snapshot()` and `restore()` integration: the event loop calls `snapshot()` when a snapshot is triggered and `restore()` when a snapshot is installed from a leader
 
 ### Dependencies
 - _none — start stage_
 
 ### Test Scenarios
-- [ ] Scenario: noop-apply — Given a `NoOpStateMachine`, When `apply()` is called with 10 entries, Then no error is returned and the callback completes without side effects
-- [ ] Scenario: snapshot-restore-roundtrip — Given a `StateMachineCallback` implementation, When `snapshot()` is called and the result passed to `restore()` on a fresh instance, Then the restored state is equivalent to the original
+- [ ] Scenario: noop-apply — Given a `NoOpStateMachine`, When `apply()` is called with 10 entries, Then no error is returned and each call returns an empty `Vec<u8>`
+- [ ] Scenario: noop-query — Given a `NoOpStateMachine`, When `query()` is called with any query bytes, Then no error is returned and an empty `Vec<u8>` is returned
+- [ ] Scenario: snapshot-restore-roundtrip — Given a `StateMachine` implementation, When `snapshot()` is called and the result passed to `restore()` on a fresh instance, Then the restored state is equivalent to the original and `query()` returns the same results
 
 ## Stage 5.2: Snapshot Coordination
 
