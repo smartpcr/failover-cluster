@@ -49,13 +49,26 @@ pub struct Entry {
 }
 
 /// Inputs consumed by the Raft state machine.
+///
+/// `Vote` / `PreVote` response variants carry an explicit `from: NodeId` because
+/// the on-the-wire response struct does not embed the responder identity (see
+/// the doc comment on [`VoteResponse`] / [`PreVoteResponse`]). The transport
+/// layer is responsible for deriving `from` from the connection context and
+/// passing it in. Other responses (`FetchResponse`) embed the responder ID
+/// (`leader_id`) inside the response payload so a separate field is unnecessary.
 #[derive(Debug, Clone)]
 pub enum Input {
     Tick,
     VoteRequest(VoteRequest),
-    VoteResponse(VoteResponse),
+    VoteResponse {
+        from: NodeId,
+        response: VoteResponse,
+    },
     PreVoteRequest(PreVoteRequest),
-    PreVoteResponse(PreVoteResponse),
+    PreVoteResponse {
+        from: NodeId,
+        response: PreVoteResponse,
+    },
     FetchRequest(FetchRequest),
     FetchResponse(FetchResponse),
     ClientPropose(Bytes),
@@ -194,6 +207,11 @@ pub struct FetchSnapshotRequest {
     pub replica_id: NodeId,
     /// Identifies which snapshot to fetch.
     pub snapshot_id: String,
+    /// Byte offset into the snapshot payload for resumable transfer.
+    /// 0 means start from the beginning.
+    pub offset: u64,
+    /// Maximum bytes to return in this response. 0 means no limit.
+    pub max_bytes: u64,
 }
 
 /// A single chunk of a snapshot being transferred.
@@ -201,7 +219,7 @@ pub struct FetchSnapshotRequest {
 pub struct FetchSnapshotChunk {
     pub cluster_id: String,
     pub leader_epoch: u64,
-    pub chunk_index: u32,
+    pub chunk_index: u64,
     pub data: Vec<u8>,
     /// True when this is the final chunk.
     pub done: bool,
@@ -382,11 +400,9 @@ impl TryFrom<&Entry> for proto::LogEntry {
                 (proto::EntryType::Config as i32, data)
             }
             EntryPayload::Snapshot(_) => {
-                return Err(
-                    "EntryPayload::Snapshot is an in-memory compaction marker \
+                return Err("EntryPayload::Snapshot is an in-memory compaction marker \
                      and must not be serialised to the wire"
-                        .to_string(),
-                );
+                    .to_string());
             }
         };
         Ok(Self {
@@ -461,31 +477,31 @@ impl TryFrom<proto::FetchResponse> for FetchResponse {
 
 impl From<&SnapshotMeta> for proto::SnapshotMetadata {
     fn from(m: &SnapshotMeta) -> Self {
-        let voter_set = m.voter_set.as_ref().map(|vs| {
-            proto::VoterSet {
-                voters: vs
-                    .voters()
-                    .iter()
-                    .map(|vr| proto::VoterRecord {
-                        node_id: vr.node_id.0,
-                        directory_id: vr.directory_id.0.to_string(),
-                        endpoints: vr
-                            .endpoints
-                            .iter()
-                            .map(|ep| proto::Endpoint {
-                                host: ep.host.clone(),
-                                port: ep.port as u32,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            }
+        let voter_set = m.voter_set.as_ref().map(|vs| proto::VoterSet {
+            voters: vs
+                .voters()
+                .iter()
+                .map(|vr| proto::VoterRecord {
+                    node_id: vr.node_id.0,
+                    directory_id: vr.directory_id.0.to_string(),
+                    endpoints: vr
+                        .endpoints
+                        .iter()
+                        .map(|ep| proto::Endpoint {
+                            host: ep.host.clone(),
+                            port: ep.port as u32,
+                        })
+                        .collect(),
+                })
+                .collect(),
         });
         Self {
             last_included_index: m.last_included_index.0,
             last_included_term: m.last_included_term.0,
             voter_set,
             snapshot_id: m.id.clone(),
+            size_bytes: m.size_bytes,
+            checksum: m.checksum,
         }
     }
 }
@@ -537,6 +553,8 @@ impl TryFrom<proto::SnapshotMetadata> for SnapshotMeta {
             last_included_term: Term(p.last_included_term),
             id: p.snapshot_id,
             voter_set,
+            size_bytes: p.size_bytes,
+            checksum: p.checksum,
         })
     }
 }
@@ -550,6 +568,8 @@ impl From<&FetchSnapshotRequest> for proto::FetchSnapshotRequest {
             leader_epoch: r.leader_epoch,
             replica_id: r.replica_id.0,
             snapshot_id: r.snapshot_id.clone(),
+            offset: r.offset,
+            max_bytes: r.max_bytes,
         }
     }
 }
@@ -561,6 +581,8 @@ impl From<proto::FetchSnapshotRequest> for FetchSnapshotRequest {
             leader_epoch: p.leader_epoch,
             replica_id: NodeId(p.replica_id),
             snapshot_id: p.snapshot_id,
+            offset: p.offset,
+            max_bytes: p.max_bytes,
         }
     }
 }
@@ -758,7 +780,10 @@ mod tests {
         let rt = Entry::try_from(decoded).unwrap();
         assert_eq!(rt.index, LogIndex(42));
         assert_eq!(rt.term, Term(3));
-        assert_eq!(rt.payload, EntryPayload::Command(Bytes::from_static(b"hello")));
+        assert_eq!(
+            rt.payload,
+            EntryPayload::Command(Bytes::from_static(b"hello"))
+        );
     }
 
     #[test]
@@ -807,6 +832,8 @@ mod tests {
                 last_included_term: Term(0),
                 id: "snap".into(),
                 voter_set: None,
+                size_bytes: None,
+                checksum: None,
             }),
         };
         let result = proto::LogEntry::try_from(&entry);
@@ -904,6 +931,8 @@ mod tests {
             last_included_term: Term(5),
             id: "snap-42".into(),
             voter_set: Some(vs.clone()),
+            size_bytes: Some(1024),
+            checksum: Some(0xDEADBEEF),
         };
         let proto_meta = proto::SnapshotMetadata::from(&meta);
         let mut buf = Vec::new();
@@ -914,6 +943,9 @@ mod tests {
         assert_eq!(rt.last_included_term, Term(5));
         assert_eq!(rt.id, "snap-42");
         assert_eq!(rt.voter_set.as_ref().unwrap(), &vs);
+        // Proto now carries size_bytes/checksum for end-to-end snapshot transfer validation.
+        assert_eq!(rt.size_bytes, Some(1024));
+        assert_eq!(rt.checksum, Some(0xDEADBEEF));
     }
 
     #[test]
@@ -923,6 +955,8 @@ mod tests {
             last_included_term: Term(3),
             id: "snap-empty".into(),
             voter_set: None,
+            size_bytes: None,
+            checksum: None,
         };
         let proto_meta = proto::SnapshotMetadata::from(&meta);
         let mut buf = Vec::new();
@@ -941,6 +975,8 @@ mod tests {
             leader_epoch: 3,
             replica_id: NodeId(5),
             snapshot_id: "snap-99".into(),
+            offset: 1024,
+            max_bytes: 4096,
         };
         let proto_req = proto::FetchSnapshotRequest::from(&req);
         let mut buf = Vec::new();
@@ -951,6 +987,8 @@ mod tests {
         assert_eq!(rt.leader_epoch, 3);
         assert_eq!(rt.replica_id, NodeId(5));
         assert_eq!(rt.snapshot_id, "snap-99");
+        assert_eq!(rt.offset, 1024);
+        assert_eq!(rt.max_bytes, 4096);
     }
 
     #[test]
@@ -961,6 +999,8 @@ mod tests {
             last_included_term: Term(5),
             id: "snap-42".into(),
             voter_set: Some(vs),
+            size_bytes: Some(4096),
+            checksum: Some(0xCAFE),
         };
         let chunk = FetchSnapshotChunk {
             cluster_id: "c".into(),
@@ -982,6 +1022,8 @@ mod tests {
         let rt_meta = rt.metadata.unwrap();
         assert_eq!(rt_meta.last_included_index, meta.last_included_index);
         assert_eq!(rt_meta.id, "snap-42");
+        assert_eq!(rt_meta.size_bytes, Some(4096));
+        assert_eq!(rt_meta.checksum, Some(0xCAFE));
     }
 
     #[test]
@@ -1008,7 +1050,10 @@ mod tests {
         // Verify all three entry types roundtrip with correct discriminants
         let vs = make_voter_set();
         let entries: Vec<(proto::EntryType, EntryPayload)> = vec![
-            (proto::EntryType::Command, EntryPayload::Command(Bytes::from_static(b"cmd"))),
+            (
+                proto::EntryType::Command,
+                EntryPayload::Command(Bytes::from_static(b"cmd")),
+            ),
             (proto::EntryType::NoOp, EntryPayload::NoOp),
             (proto::EntryType::Config, EntryPayload::ConfigChange(vs)),
         ];
@@ -1041,7 +1086,11 @@ mod tests {
         };
         let result = Entry::try_from(bad_entry);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unknown entry_type discriminant: 99"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("unknown entry_type discriminant: 99")
+        );
     }
 
     #[test]
@@ -1054,6 +1103,10 @@ mod tests {
         };
         let result = Entry::try_from(bad_config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("failed to deserialise VoterSet"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("failed to deserialise VoterSet")
+        );
     }
 }
