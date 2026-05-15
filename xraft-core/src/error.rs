@@ -31,6 +31,12 @@ pub enum XRaftError {
     /// Configuration error.
     #[error("configuration error: {0}")]
     Config(String),
+    /// Snapshot file is corrupt (bad magic, CRC mismatch, truncated header).
+    #[error("corrupt snapshot: {0}")]
+    CorruptSnapshot(String),
+    /// Requested snapshot was not found in the store.
+    #[error("snapshot not found: {0}")]
+    SnapshotNotFound(String),
 }
 
 /// Convenience result alias.
@@ -99,5 +105,18 @@ mod tests {
     fn display_config_error() {
         let e = XRaftError::Config("missing node_id".into());
         assert_eq!(format!("{e}"), "configuration error: missing node_id");
+    }
+
+    #[test]
+    fn display_corrupt_snapshot() {
+        let e = XRaftError::CorruptSnapshot("bad CRC at offset 0".into());
+        assert_eq!(format!("{e}"), "corrupt snapshot: bad CRC at offset 0");
+    }
+
+    #[test]
+    fn display_snapshot_not_found() {
+        let e = XRaftError::SnapshotNotFound("snapshot-0000000002-00000000000000000010".into());
+        let msg = format!("{e}");
+        assert!(msg.contains("snapshot not found"), "got: {msg}");
     }
 }

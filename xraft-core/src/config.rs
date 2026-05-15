@@ -60,6 +60,10 @@ pub struct ClusterConfig {
     /// Directory for persistent data (log segments, snapshots, quorum-state).
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// Maximum number of snapshot files to retain on disk. Older snapshots
+    /// beyond this limit are deleted after a new snapshot is saved.
+    #[serde(default = "default_snapshot_retention_count")]
+    pub snapshot_retention_count: usize,
 }
 
 fn default_election_timeout_min() -> u64 {
@@ -82,6 +86,9 @@ fn default_max_log_entries() -> u64 {
 }
 fn default_data_dir() -> PathBuf {
     PathBuf::from("data")
+}
+fn default_snapshot_retention_count() -> usize {
+    3
 }
 
 impl ClusterConfig {
@@ -228,6 +235,15 @@ impl ClusterConfig {
         {
             self.data_dir = PathBuf::from(val);
         }
+        if let Ok(val) = env_var("XRAFT_SNAPSHOT_RETENTION_COUNT")
+            && !val.is_empty()
+        {
+            self.snapshot_retention_count = val.parse::<usize>().map_err(|_| {
+                XRaftError::Config(format!(
+                    "XRAFT_SNAPSHOT_RETENTION_COUNT: invalid usize value '{val}'"
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -269,10 +285,7 @@ impl ClusterConfig {
         // same port. For non-wildcard hosts we fall back to exact string
         // comparison since DNS resolution is out of scope at config time.
         if let Some((listen_host, listen_port)) = Self::parse_host_port(&self.listen_addr) {
-            let listen_is_wildcard = matches!(
-                listen_host.as_str(),
-                "0.0.0.0" | "::" | "[::]"
-            );
+            let listen_is_wildcard = matches!(listen_host.as_str(), "0.0.0.0" | "::" | "[::]");
             for peer in &self.peers {
                 let is_self = if let Some((peer_host, peer_port)) = Self::parse_host_port(peer) {
                     if listen_port != peer_port {
@@ -303,9 +316,7 @@ impl ClusterConfig {
             let mut seen_endpoints = std::collections::HashSet::new();
             for (i, voter) in self.voters.iter().enumerate() {
                 if voter.host.trim().is_empty() {
-                    return Err(XRaftError::Config(format!(
-                        "voter[{i}] has an empty host"
-                    )));
+                    return Err(XRaftError::Config(format!("voter[{i}] has an empty host")));
                 }
                 if voter.port == 0 {
                     return Err(XRaftError::Config(format!(
@@ -369,6 +380,11 @@ impl ClusterConfig {
         if self.data_dir.as_os_str().is_empty() {
             return Err(XRaftError::Config("data_dir must not be empty".into()));
         }
+        if self.snapshot_retention_count == 0 {
+            return Err(XRaftError::Config(
+                "snapshot_retention_count must be >= 1 (use a positive number to retain N snapshots; default is 3)".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -397,9 +413,8 @@ impl ClusterConfig {
                 })
             })
             .collect::<Result<Vec<_>, XRaftError>>()?;
-        let vs = VoterSet::try_new(records).map_err(|e| {
-            XRaftError::Config(format!("invalid voter set: {e}"))
-        })?;
+        let vs = VoterSet::try_new(records)
+            .map_err(|e| XRaftError::Config(format!("invalid voter set: {e}")))?;
         Ok(Some(vs))
     }
 
@@ -544,7 +559,7 @@ data_dir = "/var/lib/xraft"
 node_id = 1
 cluster_id = ""
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6000"]
+peers = ["node1:7000"]
 "#;
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
         assert!(format!("{err}").contains("cluster_id"));
@@ -604,7 +619,7 @@ peers = ["node1"]
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6001"]
+peers = ["node1:7000"]
 election_timeout_min_ms = 0
 "#;
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
@@ -617,7 +632,7 @@ election_timeout_min_ms = 0
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6001"]
+peers = ["node1:7000"]
 election_timeout_min_ms = 300
 election_timeout_max_ms = 150
 "#;
@@ -631,7 +646,7 @@ election_timeout_max_ms = 150
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6001"]
+peers = ["node1:7000"]
 election_timeout_min_ms = 200
 election_timeout_max_ms = 200
 "#;
@@ -645,7 +660,7 @@ election_timeout_max_ms = 200
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6001"]
+peers = ["node1:7000"]
 fetch_interval_ms = 0
 "#;
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
@@ -658,7 +673,7 @@ fetch_interval_ms = 0
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6001"]
+peers = ["node1:7000"]
 tick_interval_ms = 0
 "#;
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
@@ -671,7 +686,7 @@ tick_interval_ms = 0
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6001"]
+peers = ["node1:7000"]
 snapshot_interval = 0
 "#;
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
@@ -684,7 +699,7 @@ snapshot_interval = 0
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6001"]
+peers = ["node1:7000"]
 max_log_entries_before_compaction = 0
 "#;
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
@@ -697,7 +712,7 @@ max_log_entries_before_compaction = 0
 node_id = 1
 cluster_id = "c"
 listen_addr = "0.0.0.0:6000"
-peers = ["node1:6001"]
+peers = ["node1:7000"]
 data_dir = ""
 "#;
         let err = ClusterConfig::from_toml_str(toml).unwrap_err();
