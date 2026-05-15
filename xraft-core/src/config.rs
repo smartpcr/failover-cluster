@@ -64,6 +64,64 @@ pub struct ClusterConfig {
     /// beyond this limit are deleted after a new snapshot is saved.
     #[serde(default = "default_snapshot_retention_count")]
     pub snapshot_retention_count: usize,
+
+    // -----------------------------------------------------------------------
+    // gRPC transport configuration (Stage 4.1)
+    // -----------------------------------------------------------------------
+    /// Enable TLS for gRPC traffic. When `true`, both `tls_cert_path` and
+    /// `tls_key_path` MUST be provided. When `false` (the default), peers
+    /// communicate in plaintext.
+    ///
+    /// **Security note (v1):** TLS provides on-the-wire encryption only.
+    /// It does NOT bind a peer certificate to a Raft `NodeId` (no mutual TLS
+    /// in v1 per `tech-spec.md` §2.7); a malicious peer with a valid cert
+    /// can still claim arbitrary `candidate_id` / `replica_id`. NodeId trust
+    /// is assumed at the cluster-membership boundary.
+    #[serde(default)]
+    pub tls_enabled: bool,
+    /// PEM-encoded server certificate path. Required when `tls_enabled = true`.
+    #[serde(default)]
+    pub tls_cert_path: Option<PathBuf>,
+    /// PEM-encoded server private key path. Required when `tls_enabled = true`.
+    #[serde(default)]
+    pub tls_key_path: Option<PathBuf>,
+    /// PEM-encoded CA certificate the *client* uses to verify peer servers.
+    /// Optional; when absent, the transport reuses the server's own
+    /// `tls_cert_path` as the client-side trust anchor. This makes
+    /// `tls_cert_path` + `tls_key_path` sufficient for a single-cert cluster
+    /// per the Stage 4.1 brief — provide `tls_ca_path` explicitly when nodes
+    /// present distinct certs signed by a shared CA.
+    #[serde(default)]
+    pub tls_ca_path: Option<PathBuf>,
+    /// SNI / TLS server-name override applied by the *client* when connecting
+    /// to a peer. Useful when peer endpoints use IP addresses but the cert's
+    /// SAN lists a hostname (e.g. `"localhost"` for self-signed test certs).
+    #[serde(default)]
+    pub tls_domain_name: Option<String>,
+
+    /// Per-RPC connection establishment timeout (milliseconds).
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Per-RPC end-to-end timeout (milliseconds).
+    #[serde(default = "default_rpc_timeout_ms")]
+    pub rpc_timeout_ms: u64,
+    /// Maximum number of retry attempts for unary RPCs (`Vote`, `PreVote`,
+    /// `Fetch`). Streaming `FetchSnapshot` only retries the *initial* RPC
+    /// invocation, never mid-stream — see `xraft-transport` for details.
+    #[serde(default = "default_max_rpc_retries")]
+    pub max_rpc_retries: usize,
+    /// Initial backoff between retries (milliseconds). Doubles on each
+    /// subsequent failure up to `retry_max_backoff_ms`.
+    #[serde(default = "default_retry_initial_backoff_ms")]
+    pub retry_initial_backoff_ms: u64,
+    /// Cap on the exponential backoff between retries (milliseconds).
+    #[serde(default = "default_retry_max_backoff_ms")]
+    pub retry_max_backoff_ms: u64,
+    /// Maximum decoded gRPC message size in bytes. Defaults to 64 MiB so
+    /// large `FetchResponse` batches and snapshot chunks are not capped by
+    /// tonic's default 4 MiB limit. Applied to both client and server.
+    #[serde(default = "default_max_message_size")]
+    pub max_message_size: usize,
 }
 
 fn default_election_timeout_min() -> u64 {
@@ -89,6 +147,24 @@ fn default_data_dir() -> PathBuf {
 }
 fn default_snapshot_retention_count() -> usize {
     3
+}
+fn default_connect_timeout_ms() -> u64 {
+    5_000
+}
+fn default_rpc_timeout_ms() -> u64 {
+    10_000
+}
+fn default_max_rpc_retries() -> usize {
+    3
+}
+fn default_retry_initial_backoff_ms() -> u64 {
+    100
+}
+fn default_retry_max_backoff_ms() -> u64 {
+    5_000
+}
+fn default_max_message_size() -> usize {
+    64 * 1024 * 1024
 }
 
 impl ClusterConfig {
@@ -385,7 +461,78 @@ impl ClusterConfig {
                 "snapshot_retention_count must be >= 1 (use a positive number to retain N snapshots; default is 3)".into(),
             ));
         }
+
+        // gRPC transport validation (Stage 4.1) ---------------------------
+        if self.tls_enabled {
+            if self.tls_cert_path.is_none() {
+                return Err(XRaftError::Config(
+                    "tls_enabled = true requires tls_cert_path to be set".into(),
+                ));
+            }
+            if self.tls_key_path.is_none() {
+                return Err(XRaftError::Config(
+                    "tls_enabled = true requires tls_key_path to be set".into(),
+                ));
+            }
+        }
+        if self.connect_timeout_ms == 0 {
+            return Err(XRaftError::Config("connect_timeout_ms must be > 0".into()));
+        }
+        if self.rpc_timeout_ms == 0 {
+            return Err(XRaftError::Config("rpc_timeout_ms must be > 0".into()));
+        }
+        if self.retry_initial_backoff_ms == 0 {
+            return Err(XRaftError::Config(
+                "retry_initial_backoff_ms must be > 0".into(),
+            ));
+        }
+        if self.retry_max_backoff_ms < self.retry_initial_backoff_ms {
+            return Err(XRaftError::Config(format!(
+                "retry_max_backoff_ms ({}) must be >= retry_initial_backoff_ms ({})",
+                self.retry_max_backoff_ms, self.retry_initial_backoff_ms
+            )));
+        }
+        if self.max_message_size == 0 {
+            return Err(XRaftError::Config("max_message_size must be > 0".into()));
+        }
         Ok(())
+    }
+
+    /// Resolve a peer's URL from the structured `voters` configuration.
+    ///
+    /// Returns `Some(url)` for any voter whose `node_id` matches `peer`,
+    /// excluding `self.node_id`. The URL scheme is `https://` when
+    /// `tls_enabled` is `true`, otherwise `http://`. Returns `None` if no
+    /// matching voter is configured.
+    ///
+    /// **Note:** the flat `peers: Vec<String>` field cannot be used for
+    /// outbound RPC routing because it lacks `NodeId` keys. Configure the
+    /// `voters` array for any deployment that needs the gRPC transport.
+    pub fn peer_endpoint(&self, peer: NodeId) -> Option<String> {
+        if peer == self.node_id {
+            return None;
+        }
+        let scheme = if self.tls_enabled { "https" } else { "http" };
+        self.voters
+            .iter()
+            .find(|v| v.node_id == peer.0)
+            .map(|v| format!("{scheme}://{}:{}", v.host, v.port))
+    }
+
+    /// Build a `NodeId -> URL` map for every configured voter except this
+    /// node. Used by the gRPC client to seed its connection pool.
+    pub fn peer_endpoints(&self) -> std::collections::HashMap<NodeId, String> {
+        let scheme = if self.tls_enabled { "https" } else { "http" };
+        self.voters
+            .iter()
+            .filter(|v| v.node_id != self.node_id.0)
+            .map(|v| {
+                (
+                    NodeId(v.node_id),
+                    format!("{scheme}://{}:{}", v.host, v.port),
+                )
+            })
+            .collect()
     }
 
     /// Build a `VoterSet` from the structured `voters` configuration.
@@ -1325,5 +1472,295 @@ port = 6000
         assert!(result.is_ok(), "load() should succeed: {:?}", result.err());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 4.1 transport-config tests
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn config_transport_defaults_applied() {
+        // No transport keys set in TOML — every transport field should fall
+        // back to its `default_*` value (or `None` for the optional fields).
+        let cfg = ClusterConfig::from_toml_str(valid_toml()).unwrap();
+        assert!(!cfg.tls_enabled, "tls_enabled defaults to false");
+        assert!(cfg.tls_cert_path.is_none());
+        assert!(cfg.tls_key_path.is_none());
+        assert!(cfg.tls_ca_path.is_none());
+        assert!(cfg.tls_domain_name.is_none());
+        assert_eq!(cfg.connect_timeout_ms, 5_000);
+        assert_eq!(cfg.rpc_timeout_ms, 10_000);
+        assert_eq!(cfg.max_rpc_retries, 3);
+        assert_eq!(cfg.retry_initial_backoff_ms, 100);
+        assert_eq!(cfg.retry_max_backoff_ms, 5_000);
+        assert_eq!(cfg.max_message_size, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn config_tls_enabled_missing_cert_path_errors() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["node1:7000"]
+tls_enabled = true
+tls_key_path = "/tmp/k.pem"
+"#;
+        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("tls_cert_path"), "got: {msg}");
+    }
+
+    #[test]
+    fn config_tls_enabled_missing_key_path_errors() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["node1:7000"]
+tls_enabled = true
+tls_cert_path = "/tmp/c.pem"
+"#;
+        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("tls_key_path"), "got: {msg}");
+    }
+
+    #[test]
+    fn config_tls_cert_and_key_only_validates() {
+        // Brief contract: cert + key alone is a valid, complete TLS config.
+        // No CA path is required.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["node1:7000"]
+tls_enabled = true
+tls_cert_path = "/tmp/c.pem"
+tls_key_path = "/tmp/k.pem"
+"#;
+        let cfg = ClusterConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.tls_enabled);
+        assert_eq!(cfg.tls_cert_path.unwrap(), PathBuf::from("/tmp/c.pem"));
+        assert_eq!(cfg.tls_key_path.unwrap(), PathBuf::from("/tmp/k.pem"));
+        assert!(
+            cfg.tls_ca_path.is_none(),
+            "CA path not required when cert+key suffice"
+        );
+    }
+
+    #[test]
+    fn config_tls_disabled_defaults_ok() {
+        // Sanity: when tls_enabled is false, missing cert/key paths must NOT
+        // produce a validation error.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["node1:7000"]
+tls_enabled = false
+"#;
+        let cfg = ClusterConfig::from_toml_str(toml).unwrap();
+        assert!(!cfg.tls_enabled);
+    }
+
+    #[test]
+    fn config_validate_zero_connect_timeout_errors() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["node1:7000"]
+connect_timeout_ms = 0
+"#;
+        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
+        assert!(format!("{err}").contains("connect_timeout_ms"));
+    }
+
+    #[test]
+    fn config_validate_zero_rpc_timeout_errors() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["node1:7000"]
+rpc_timeout_ms = 0
+"#;
+        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
+        assert!(format!("{err}").contains("rpc_timeout_ms"));
+    }
+
+    #[test]
+    fn config_validate_zero_retry_initial_backoff_errors() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["node1:7000"]
+retry_initial_backoff_ms = 0
+"#;
+        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
+        assert!(format!("{err}").contains("retry_initial_backoff_ms"));
+    }
+
+    #[test]
+    fn config_validate_retry_max_lt_initial_errors() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["node1:7000"]
+retry_initial_backoff_ms = 500
+retry_max_backoff_ms = 100
+"#;
+        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("retry_max_backoff_ms"), "got: {msg}");
+    }
+
+    #[test]
+    fn config_validate_zero_max_message_size_errors() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["node1:7000"]
+max_message_size = 0
+"#;
+        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
+        assert!(format!("{err}").contains("max_message_size"));
+    }
+
+    #[test]
+    fn config_peer_endpoint_http_scheme_when_tls_disabled() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440001"
+host = "10.0.0.2"
+port = 6001
+"#;
+        let cfg = ClusterConfig::from_toml_str(toml).unwrap();
+        let url = cfg.peer_endpoint(NodeId(2)).unwrap();
+        assert_eq!(url, "http://10.0.0.2:6001");
+    }
+
+    #[test]
+    fn config_peer_endpoint_https_scheme_when_tls_enabled() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+tls_enabled = true
+tls_cert_path = "/tmp/c.pem"
+tls_key_path = "/tmp/k.pem"
+
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440001"
+host = "10.0.0.2"
+port = 6001
+"#;
+        let cfg = ClusterConfig::from_toml_str(toml).unwrap();
+        let url = cfg.peer_endpoint(NodeId(2)).unwrap();
+        assert_eq!(url, "https://10.0.0.2:6001");
+    }
+
+    #[test]
+    fn config_peer_endpoint_returns_none_for_self() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440001"
+host = "10.0.0.2"
+port = 6001
+"#;
+        let cfg = ClusterConfig::from_toml_str(toml).unwrap();
+        assert!(
+            cfg.peer_endpoint(NodeId(1)).is_none(),
+            "self has no peer URL"
+        );
+    }
+
+    #[test]
+    fn config_peer_endpoint_returns_none_for_unknown_peer() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+"#;
+        let cfg = ClusterConfig::from_toml_str(toml).unwrap();
+        assert!(
+            cfg.peer_endpoint(NodeId(99)).is_none(),
+            "unknown peer id returns None"
+        );
+    }
+
+    #[test]
+    fn config_peer_endpoints_excludes_self_and_uses_correct_scheme() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+tls_enabled = true
+tls_cert_path = "/tmp/c.pem"
+tls_key_path = "/tmp/k.pem"
+
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440001"
+host = "10.0.0.2"
+port = 6001
+
+[[voters]]
+node_id = 3
+directory_id = "550e8400-e29b-41d4-a716-446655440002"
+host = "10.0.0.3"
+port = 6002
+"#;
+        let cfg = ClusterConfig::from_toml_str(toml).unwrap();
+        let map = cfg.peer_endpoints();
+        assert_eq!(map.len(), 2, "self is excluded");
+        assert!(!map.contains_key(&NodeId(1)), "self not present");
+        assert_eq!(map.get(&NodeId(2)).unwrap(), "https://10.0.0.2:6001");
+        assert_eq!(map.get(&NodeId(3)).unwrap(), "https://10.0.0.3:6002");
     }
 }

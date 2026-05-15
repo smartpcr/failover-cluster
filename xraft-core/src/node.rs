@@ -2584,6 +2584,17 @@ port = 6000
             max_log_entries_before_compaction: 100_000,
             data_dir: std::path::PathBuf::from("data"),
             snapshot_retention_count: 3,
+            tls_enabled: false,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_ca_path: None,
+            tls_domain_name: None,
+            connect_timeout_ms: 5_000,
+            rpc_timeout_ms: 10_000,
+            max_rpc_retries: 3,
+            retry_initial_backoff_ms: 100,
+            retry_max_backoff_ms: 5_000,
+            max_message_size: 64 * 1024 * 1024,
         };
         let err = RaftNode::new_with_seed(cfg, 1).expect_err(
             "RaftNode::new_with_seed must propagate invalid voter config as Err, \
