@@ -36,6 +36,26 @@
 //! cannot mask safety bugs that would manifest only against the
 //! file-backed store (a hole the iter-2 evaluator flagged).
 //!
+//! # Stage 2.2 acceptance test mapping
+//!
+//! Per `docs/stories/failover-cluster-XRAFT/implementation-plan.md`
+//! lines 95-110, Stage 2.2 has three named acceptance scenarios. Each
+//! one is covered by at least one named test in the `tests` module
+//! below AND by the `xraft-storage/tests/stage_2_2_acceptance.rs`
+//! integration crate that exercises the public API surface:
+//!
+//! * **state-persistence** -- `file_store_round_trip`,
+//!   `file_store_survives_reopen`,
+//!   `stage_2_2_acceptance_state_persistence_round_trip`.
+//! * **atomic-write-safety** --
+//!   `file_store_recovers_from_bak_when_canonical_missing`,
+//!   `file_store_keeps_canonical_when_both_canonical_and_bak_present`,
+//!   `file_store_removes_orphan_tmp_on_open`,
+//!   `stage_2_2_acceptance_atomic_write_safety_no_partial_state_after_replace`.
+//! * **term-monotonicity** -- `assert_invariants`,
+//!   `file_store_validation_runs_before_disk_write`,
+//!   `stage_2_2_acceptance_term_monotonicity_and_vote_invariants_match_plan`.
+//!
 //! # Atomic-replace pattern (cross-platform, including Windows)
 //!
 //! `FileHardStateStore::persist` uses the same recoverable-replace
@@ -735,5 +755,82 @@ mod tests {
         drop(store);
         let store = FileHardStateStore::open(tmp.path()).unwrap();
         assert_eq!(store.load().unwrap(), Some(good));
+    }
+
+    // -- Stage 2.2 acceptance scenarios (implementation-plan.md:95-110) -
+
+    /// Stage 2.2 acceptance: **state-persistence**. A multi-step
+    /// persist sequence (covering term advance + vote grant + term
+    /// advance) must round-trip cleanly across an open/close cycle.
+    /// This is the cumulative version of `file_store_survives_reopen`,
+    /// which only persists once.
+    #[test]
+    fn stage_2_2_acceptance_state_persistence_round_trip() {
+        let tmp = TempDir::new().unwrap();
+
+        // Persist a sequence of valid transitions, then drop the store.
+        {
+            let mut store = FileHardStateStore::open(tmp.path()).unwrap();
+            store.persist(&hs(1, None)).unwrap();
+            store.persist(&hs(1, Some(2))).unwrap();
+            store.persist(&hs(2, Some(3))).unwrap();
+            store.persist(&hs(5, None)).unwrap();
+        }
+
+        // Reopen — the latest persisted state must survive verbatim.
+        let reopened = FileHardStateStore::open(tmp.path()).unwrap();
+        assert_eq!(reopened.load().unwrap(), Some(hs(5, None)));
+    }
+
+    /// Stage 2.2 acceptance: **atomic-write-safety**. The on-disk
+    /// triple (`quorum-state`, `quorum-state.bak`, `quorum-state.tmp`)
+    /// must always allow recovery to a single committed state.
+    /// Specifically: after a successful persist, neither `.tmp` nor
+    /// `.bak` may remain on disk -- both are removed by the persist
+    /// finalizer so a subsequent open sees only the canonical file.
+    #[test]
+    fn stage_2_2_acceptance_atomic_write_safety_no_partial_state_after_replace() {
+        let tmp = TempDir::new().unwrap();
+        let canonical = tmp.path().join(STATE_FILE_NAME);
+        let bak = tmp.path().join(format!("{STATE_FILE_NAME}{BAK_SUFFIX}"));
+        let tmp_path = tmp.path().join(format!("{STATE_FILE_NAME}{TMP_SUFFIX}"));
+
+        let mut store = FileHardStateStore::open(tmp.path()).unwrap();
+        store.persist(&hs(1, None)).unwrap();
+        store.persist(&hs(2, Some(7))).unwrap();
+        store.persist(&hs(3, Some(7))).unwrap();
+
+        assert!(
+            canonical.exists(),
+            "canonical file must exist after persist"
+        );
+        assert!(
+            !bak.exists(),
+            ".bak must be cleaned up after successful persist"
+        );
+        assert!(
+            !tmp_path.exists(),
+            ".tmp must be cleaned up after successful persist"
+        );
+
+        // Final-state recovery yields exactly the last persisted value.
+        let reopened = FileHardStateStore::open(tmp.path()).unwrap();
+        assert_eq!(reopened.load().unwrap(), Some(hs(3, Some(7))));
+    }
+
+    /// Stage 2.2 acceptance: **term-monotonicity**. The invariant
+    /// matrix from `assert_invariants` is re-asserted explicitly here
+    /// against the file store to make the plan-to-test mapping
+    /// grep-able under the `stage_2_2_acceptance_` prefix.
+    #[test]
+    fn stage_2_2_acceptance_term_monotonicity_and_vote_invariants_match_plan() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = FileHardStateStore::open(tmp.path()).unwrap();
+        assert_invariants(&mut store);
+
+        // After the invariant matrix runs, the store should be at
+        // term=3, voted_for=None (the last accepted persist), even
+        // though the matrix attempted several rejected transitions.
+        assert_eq!(store.load().unwrap(), Some(hs(3, None)));
     }
 }
