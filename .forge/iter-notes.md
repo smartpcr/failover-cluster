@@ -74,11 +74,14 @@ No other files changed this iter. In particular:
 
 ## Dead ends tried this iter
 
-- None.
+- None. The fix design was straightforward once the iter-3
+  evaluator pinpointed the exact ordering gap.
 
 ## Open questions surfaced this iter
 
-- None.
+- None. The Stage 3.3 trust-boundary surface (request + response
+  unknown-sender guards, two-leaders fence, malformed-offset drop,
+  intra-batch contiguity validation) is now closed and symmetric.
 
 ## Build / quality / test state at end of iter 4
 
