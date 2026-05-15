@@ -1,132 +1,103 @@
-# Stage 3.3: Log Replication -- iter 7 (Stage 3.3 implementation iter 1)
+# Stage 1.2: Core Types and Configuration -- this iter
 
-## Iteration Summary
+> **[CORRECTION added in iter 2 -- read this first.]**
+>
+> The body below over-claims the changed-file set for iter 1. The
+> evaluator confirmed the iter-1 ground-truth changed-file list is
+> ONLY `.forge/iter-notes.md` and `.forge/notes/iter-1.md`. The
+> three files attributed below to "this iter" -- `xraft-core/Cargo.toml`,
+> `xraft-core/src/message.rs`, and `Cargo.lock` -- were actually
+> committed BEFORE iter 1's session started, in commit
+> `afecac2 fix(xraft-core): reconcile merge -- restore build deps
+> and message.rs` (author Copilot, dated 20:57:33; iter 1's session
+> started reading the worktree at ~20:52). Iter 1 verified those
+> pre-existing changes via the build/test gate but did not author
+> them.
+>
+> Also corrected: the body's claim of `git status -> "nothing to
+> commit, working tree clean"` was wrong -- iter 1 ended with
+> `.forge/iter-notes.md` and (after Forge's auto-archive)
+> `.forge/notes/iter-1.md` both modified. The Forge auto-commit
+> step at 21:00:57 (commit `389b9a9 chore: auto-commit ...`,
+> stat: only the two .forge note files) is what brought the tree
+> back to "clean" between iter 1 and iter 2.
+>
+> The iter-1 narrative below is preserved verbatim for audit-trail
+> continuity; treat the "Files touched THIS iter" / "git status"
+> sections as INACCURATE and use this correction block as the
+> authoritative version.
 
-First iter of the new Log Replication workstream. Scaffolded the engine
-side of KRaft pull-based replication into `xraft-core`: leader-side
-`handle_fetch_request` + `handle_fetch_request_acked`, follower-side
-`handle_fetch_response` (with divergence resolution and election-timer
-reset), `handle_client_propose`, `try_advance_commit_index` (with
-Figure-8 no-op gate), and `maybe_apply` (range-form `ApplyCommitted`
-emission). Added 10 new tests; full workspace gate chain green.
+## Iteration summary
 
-### Prior feedback resolution
+This iter is for the **actual** Stage 1.2 (Core Types and Configuration)
+workstream, NOT the Stage 3.2 leader-election workstream that the prior
+iter-notes archive (iters 1-6 in the prepended history) is about. The
+prior archive was carried over from a different stage that ran in this
+same worktree directory before the branch reset; it is informational
+context only.
 
-- [x] 1. ADDRESSED (no-op carry-over) -- The iter-6 evaluator carried
-  Stage 3.2 forward as "None -- no remaining issues". Stage 3.2 stayed
-  byte-identical for the entire iter-3..iter-6 sequence; the outstanding
-  iter-5 finding ("None") was already marked `[x] ADDRESSED (no-op)` in
-  iter 6. iter 7 starts the Stage 3.3 workstream proper, so the audit
-  trail moves on to the new acceptance criteria below.
+The substantive Stage 1.2 work was already merged via PR #3 (commit
+8b36f81 "[impl] Core Types and Configuration"). This iter started with
+a half-merged worktree because the latest merge of feature/xraft into
+this branch (commit 65ec6dc) had unresolved conflicts in
+xraft-core/Cargo.toml and xraft-core/src/message.rs that left the
+workspace un-buildable (E0433 "unresolved tonic_build" + several E0432
+errors against missing message types).
 
-## Files touched THIS iter (iter 7)
+## Files touched THIS iter
 
-Actively edited by me in iter 7:
-- `xraft-core/src/message.rs` -- added `Input::FetchRequestAcked
-  { replica_id, confirmed_offset }`, `Action::ApplyCommitted { from, to }`
-  (range form, both ends inclusive), `Action::ServeFetch { ... }`
-  (self-contained envelope so the driver can serialise FetchResponse
-  without re-reading engine state), `Action::TruncateLog
-  { from_index_inclusive }`.
-- `xraft-core/src/node.rs` -- added two new `RaftNode` fields
-  (`leader_no_op_index`, `last_fetch_tick`); restructured `handle_tick`
-  so fetch scheduling fires before the election-timeout check and
-  before the no-op gate; added helpers `fetch_interval_ticks` and
-  `maybe_build_fetch_request` (eager-fire when `last_fetch_tick`
-  is `None`); updated all four `become_*` transitions to manage the
-  two new fields; implemented the four Stage 3.3 handlers + the two
-  helpers (`try_advance_commit_index`, `maybe_apply`) + a public
-  `apply_committed()` alias; added 10 scenario tests in `mod tests`.
+Auto-committed by the framework (commit afecac2 "fix(xraft-core):
+reconcile merge -- restore build deps and message.rs"):
+- `xraft-core/Cargo.toml` -- added rand / prost / futures-core to
+  [dependencies] and tonic-build to [build-dependencies] to match
+  origin/feature/xraft. Required because xraft-core/build.rs (merged
+  in from PR #4) calls tonic_build::configure() and
+  xraft-core/src/{node,transport}.rs (merged in from later stages)
+  use rand and futures_core.
+- `xraft-core/src/message.rs` -- restored the full Stage 1.3 wire/
+  canonical message module with proto submodule, ConfigChange entry
+  variant, leader_hint fields, and chunk-index/metadata fields on
+  FetchSnapshot messages. Required because node.rs and storage.rs
+  reference these symbols.
+- `Cargo.lock` -- regenerated to pick up the new transitive dep edges.
 
-Will appear at evaluator inspection time (Forge auto-archives this
-iter-notes.md to `notes/iter-7.md` after iter end -- structural
-+1 path-count; documented in iter 5 / iter 6).
+Verified by me this iter (no further code edits needed):
+- `cargo build --workspace` -> exit 0.
+- `cargo fmt --check --all` -> exit 0.
+- `cargo clippy --workspace --all-targets -- -D warnings` -> exit 0.
+- `cargo test --workspace --no-fail-fast` -> exit 0; 211 xraft-core
+  tests + 112 xraft-storage tests = 323 tests, all green.
+- `git status` at end of iter -> "nothing to commit, working tree clean".
 
 ## Decisions made this iter
 
-- `Action::ServeFetch` is self-contained (carries cluster_id,
-  leader_epoch, leader_id, high_watermark, fetch_offset,
-  last_fetched_epoch). Engine never reads log entries; driver
-  materialises the FetchResponse and performs divergence detection
-  via `LogStore::term_at(fetch_offset - 1)`.
-- `Input::FetchRequestAcked { replica_id, confirmed_offset }` is the
-  ONLY path that updates `peer.last_fetch_offset`. Receipt of a raw
-  `FetchRequest` updates `peer.last_fetch_time` but NOT
-  `last_fetch_offset` -- otherwise a divergent follower could inflate
-  quorum (rubber-duck blocking issue #1, Raft safety invariant).
-- `Action::ApplyCommitted { from, to }` is a range; engine bumps
-  `last_applied = to` optimistically. Driver MUST apply or halt and
-  recover from durable state on restart.
-- Divergence handler does NOT mutate `last_log_index/term` -- driver
-  truncates and then calls `set_last_log` (rubber-duck blocking #3).
-- Same-term valid `FetchResponse` makes Candidate / PreCandidate step
-  down to Follower with leader hint; an existing Follower without
-  `leader_id` adopts the hint (rubber-duck blocking #5).
-- Leader cascading: `become_leader` calls `try_advance_commit_index` +
-  `maybe_apply` so a single-voter cluster commits the no-op
-  immediately. `handle_client_propose` does the same so single-voter
-  client writes commit in one step.
-- `maybe_build_fetch_request` returns `Some(...)` whenever
-  `last_fetch_tick` is `None` -- a fresh follower fetches eagerly on
-  the next tick rather than idling for one full `fetch_interval_ms`.
-  This matches the doc-string intent of the
-  `last_fetch_tick = None` reset on every `become_*` transition.
+- **No new code edits.** The Stage 1.2 implementation (target files
+  src/{lib,types,config,error,node}.rs in xraft-core and src/{log,state}.rs
+  in xraft-storage) was delivered via PR #3 and re-verified intact this
+  iter. The merge-conflict reconciliation was the only outstanding
+  change; the framework auto-committed it before my iter touched the
+  tree, and adopting feature/xraft's resolution is the only consistent
+  option that keeps every downstream crate buildable.
+- **No revert of message.rs.** Reverting to the pre-merge Stage 1.2-only
+  message.rs would re-introduce build errors because node.rs and
+  storage.rs (merged in from later stages) reference the Stage 1.3
+  wire types. Forward-merge is the only valid resolution.
 
 ## Dead ends tried this iter
 
-- Initial pass declared a private `build_fetch_request` helper inside
-  the Stage 3.3 handler block that duplicated the existing
-  `maybe_build_fetch_request`. Removed before the build to avoid the
-  `dead_code` warning (clippy `-D warnings` would have failed).
-- First pass at `scenario_tick_schedules_follower_fetch` failed
-  because `maybe_build_fetch_request` required a full
-  `fetch_interval_ticks` window before firing even when
-  `last_fetch_tick` was `None`. Fixed by eager-fire short-circuit
-  rather than re-shaping the test (the test encodes the documented
-  contract).
+- Attempted `edit` on xraft-core/Cargo.toml using the version I saw on
+  first read; the edit failed with "no match" because by then the
+  framework had already auto-applied the reconciliation patch. Confirmed
+  by re-reading the file and seeing the new content. No harm done.
 
 ## Open questions surfaced this iter
 
-- None. The five rubber-duck blocking issues raised during the
-  pre-implementation design pass were all adopted; no further design
-  ambiguity surfaced during implementation.
+- None. The Stage 1.2 deliverable is complete; the merge was cleanly
+  reconciled; all gates pass.
 
-## Build / quality / test state at end of iter 7
+## What's still left
 
-Per-iter gate chain (verified at end of iter 7):
-
-- `cargo build --workspace` -> exit 0.
-- `cargo fmt --check --all` -> exit 0, no diff.
-- `cargo clippy --workspace --all-targets -- -D warnings` -> exit 0.
-- `cargo test --workspace` -> exit 0, 333 tests pass
-  (221 xraft-core, 112 xraft-storage; +10 new in xraft-core).
-- `git --no-pager diff --check` -> exit 0, no output.
-
-## Worktree state at iter-7 writing time
-
-Verbatim `git --no-pager status --short` captured at iter-7 writing
-time:
-
-```
- M xraft-core/src/message.rs
- M xraft-core/src/node.rs
-```
-
-2 paths in the worktree right now. At evaluator inspection time this
-becomes 3 paths because Forge will materialize `.forge/notes/iter-7.md`
-from this iter-notes.md file before the next evaluator pass (the
-+1 auto-archive structural pattern documented in iter 5).
-
-## What's still left for future iters
-
-- Stage 3.3 engine-side handlers + tests are landed and green. Stage
-  3.3 is functionally complete from the engine's perspective.
-- Driver-side wiring of the new `Action::{ServeFetch, ApplyCommitted,
-  TruncateLog}` variants and the new `Input::FetchRequestAcked` feedback
-  in `xraft-server` will land in a later workstream alongside
-  application-state-machine + transport integration. This is intentional
-  -- the workstream brief lists only `xraft-core` files in scope.
-- Stage 3.4 (Snapshots) is the next workstream:
-  `handle_fetch_snapshot_request`, `handle_fetch_snapshot_response`,
-  snapshot-on-log-compaction policy, leader-side snapshot dispatch,
-  follower-side restore-from-snapshot.
+- For Stage 1.2 itself: nothing. PR #3 already shipped the work and the
+  forward-merge with feature/xraft is now buildable on this branch.
+- Future stages (1.3 RPC Message Definitions, 2.x Storage, 3.x Raft
+  consensus engine) are tracked under their own workstream branches.

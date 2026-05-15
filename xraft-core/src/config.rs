@@ -91,6 +91,23 @@ fn default_snapshot_retention_count() -> usize {
     3
 }
 
+/// Classification of a host literal for self-membership validation.
+///
+/// Produced by [`ClusterConfig::classify_host`]. The variants intentionally
+/// collapse syntactic spellings of loopback and wildcard, so different
+/// representations of the same logical address (`127.0.0.1` vs `localhost`,
+/// `::` vs `[::]`, etc.) compare equal at the variant level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostKind {
+    /// An unspecified / wildcard address (e.g. `0.0.0.0`, `::`).
+    Wildcard,
+    /// A loopback address (e.g. `127.0.0.1`, `::1`, `localhost`).
+    Loopback,
+    /// Any other literal — opaque hostname or routable IP. The string is
+    /// normalised to lowercase for case-insensitive equality.
+    Specific(String),
+}
+
 impl ClusterConfig {
     /// Parse a TOML string into a validated `ClusterConfig`.
     ///
@@ -280,21 +297,37 @@ impl ClusterConfig {
         }
 
         // Self-membership: listen_addr should not appear in peers.
-        // Compare parsed (host, port) tuples so that wildcard listen hosts
-        // (0.0.0.0, [::], ::) are recognised as matching any peer host on the
-        // same port. For non-wildcard hosts we fall back to exact string
-        // comparison since DNS resolution is out of scope at config time.
+        //
+        // We compare parsed (host, port) tuples and classify each host as
+        // `Wildcard` (e.g. `0.0.0.0`, `::`, `[::]`), `Loopback` (e.g.
+        // `127.0.0.1`, `::1`, `[::1]`, `localhost`), or `Specific(_)` (any
+        // other literal). A peer is "definitely self" only when the ports
+        // match AND one of these holds:
+        //   - both hosts are byte-equal (after lowercasing) — trivial alias;
+        //   - one side is wildcard and the other is wildcard or loopback;
+        //   - both sides are loopback.
+        // Crucially, when listen is a wildcard like `0.0.0.0`, an arbitrary
+        // remote hostname like `node2:6000` is NOT classified as self: at
+        // config-validation time we cannot perform DNS or interface lookups
+        // to know whether `node2` resolves to this machine, and rejecting
+        // it would block valid multi-node deployments where every host
+        // listens on the same Raft port.
         if let Some((listen_host, listen_port)) = Self::parse_host_port(&self.listen_addr) {
-            let listen_is_wildcard = matches!(listen_host.as_str(), "0.0.0.0" | "::" | "[::]");
+            let listen_kind = Self::classify_host(&listen_host);
             for peer in &self.peers {
                 let is_self = if let Some((peer_host, peer_port)) = Self::parse_host_port(peer) {
                     if listen_port != peer_port {
                         false
-                    } else if listen_is_wildcard {
-                        // A wildcard listen address matches any peer on the same port
-                        true
                     } else {
-                        listen_host == peer_host
+                        let peer_kind = Self::classify_host(&peer_host);
+                        match (&listen_kind, &peer_kind) {
+                            (HostKind::Wildcard, HostKind::Wildcard)
+                            | (HostKind::Wildcard, HostKind::Loopback)
+                            | (HostKind::Loopback, HostKind::Wildcard)
+                            | (HostKind::Loopback, HostKind::Loopback) => true,
+                            (HostKind::Specific(a), HostKind::Specific(b)) => a == b,
+                            _ => false,
+                        }
                     }
                 } else {
                     // Unparseable peer — fall back to exact string match
@@ -432,6 +465,39 @@ impl ClusterConfig {
         }
         let port: u16 = port_str.parse().ok()?;
         Some((host.to_lowercase(), port))
+    }
+
+    /// Strip optional `[...]` brackets from an IPv6 host literal so that
+    /// `[::1]` parses the same way as `::1` via `std::net::IpAddr`.
+    fn strip_brackets(host: &str) -> &str {
+        host.strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host)
+    }
+
+    /// Classify a host literal for self-membership detection.
+    ///
+    /// Uses `std::net::IpAddr` parsing so that all syntactic spellings of
+    /// loopback (`127.0.0.1`, `::1`, `[::1]`, `0:0:0:0:0:0:0:1`) and
+    /// wildcard (`0.0.0.0`, `::`, `[::]`, `0:0:0:0:0:0:0:0`) collapse to
+    /// the same `HostKind` variant. The literal string `"localhost"` is
+    /// also treated as loopback, since at config-validation time we do
+    /// not perform DNS resolution but `localhost` is by convention the
+    /// machine itself in any reasonable deployment.
+    fn classify_host(host: &str) -> HostKind {
+        let stripped = Self::strip_brackets(host);
+        if stripped.eq_ignore_ascii_case("localhost") {
+            return HostKind::Loopback;
+        }
+        if let Ok(ip) = stripped.parse::<std::net::IpAddr>() {
+            if ip.is_loopback() {
+                return HostKind::Loopback;
+            }
+            if ip.is_unspecified() {
+                return HostKind::Wildcard;
+            }
+        }
+        HostKind::Specific(host.to_lowercase())
     }
 
     /// Validate that an address string is in `host:port` format with a
@@ -1061,19 +1127,14 @@ peers = ["127.0.0.1:6000"]
         assert!(msg.contains("127.0.0.1:6000"), "got: {msg}");
     }
 
-    #[test]
-    fn config_validate_self_in_peers_wildcard_catches_hostname() {
-        // 0.0.0.0 wildcard — any host on the same port is self.
-        let toml = r#"
-node_id = 1
-cluster_id = "c"
-listen_addr = "0.0.0.0:6000"
-peers = ["myhost:6000"]
-"#;
-        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("must not appear in peers"), "got: {msg}");
-    }
+    // Note: an earlier test `config_validate_self_in_peers_wildcard_catches_hostname`
+    // asserted that listen=`0.0.0.0:6000` + peer=`myhost:6000` was rejected.
+    // That behavior was a bug — config-time validation cannot know whether a
+    // remote hostname resolves to this machine, and rejecting it blocked
+    // standard multi-node deployments where every node binds the same Raft
+    // port. The replacement test
+    // `config_validate_wildcard_listen_remote_hostname_ok` (above) asserts the
+    // corrected semantics.
 
     #[test]
     fn config_validate_self_in_peers_wildcard_different_port_ok() {
@@ -1086,6 +1147,78 @@ peers = ["127.0.0.1:6001"]
 "#;
         let cfg = ClusterConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.peers, vec!["127.0.0.1:6001"]);
+    }
+
+    #[test]
+    fn config_validate_wildcard_listen_remote_hostname_ok() {
+        // Regression test: a wildcard listen address (0.0.0.0:6000) does NOT
+        // mean every peer on port 6000 is "self". Remote hostnames like
+        // `myhost:6000` are valid peers — at config-validation time we
+        // cannot know whether `myhost` resolves to this machine, and
+        // rejecting them would block standard multi-node deployments where
+        // every node binds the same Raft port. Only loopback / wildcard
+        // peers on the same port are considered definite self.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["myhost:6000"]
+"#;
+        let cfg =
+            ClusterConfig::from_toml_str(toml).expect("remote hostname peer must be accepted");
+        assert_eq!(cfg.peers, vec!["myhost:6000"]);
+    }
+
+    #[test]
+    fn config_validate_wildcard_listen_wildcard_peer_alias_caught() {
+        // 0.0.0.0 (IPv4 wildcard) listen + [::]:6000 (IPv6 wildcard) peer
+        // on the same port: both classify as Wildcard, so the peer is
+        // flagged as self even though the literal strings differ. This
+        // protects against a wildcard-alias spelling slipping past the
+        // self-membership check.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["[::]:6000"]
+"#;
+        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("must not appear in peers"), "got: {msg}");
+        assert!(msg.contains("[::]:6000"), "got: {msg}");
+    }
+
+    #[test]
+    fn config_validate_wildcard_listen_ipv6_loopback_peer_caught() {
+        // 0.0.0.0 (IPv4 wildcard) listen + ::1:6000 (IPv6 loopback) peer
+        // on the same port: classifies as (Wildcard, Loopback) and is
+        // therefore self. Covers the cross-family loopback case that the
+        // earlier string-based check missed.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "0.0.0.0:6000"
+peers = ["[::1]:6000"]
+"#;
+        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("must not appear in peers"), "got: {msg}");
+    }
+
+    #[test]
+    fn config_validate_localhost_listen_loopback_peer_caught() {
+        // listen=`localhost` is loopback; peer=`127.0.0.1` on same port
+        // is also loopback, so the pair is self even though neither side
+        // is wildcard and the literal strings differ.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "localhost:6000"
+peers = ["127.0.0.1:6000"]
+"#;
+        let err = ClusterConfig::from_toml_str(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("must not appear in peers"), "got: {msg}");
     }
 
     #[test]
