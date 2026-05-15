@@ -1,5 +1,32 @@
 # Stage 1.2: Core Types and Configuration -- this iter
 
+> **[CORRECTION added in iter 2 -- read this first.]**
+>
+> The body below over-claims the changed-file set for iter 1. The
+> evaluator confirmed the iter-1 ground-truth changed-file list is
+> ONLY `.forge/iter-notes.md` and `.forge/notes/iter-1.md`. The
+> three files attributed below to "this iter" -- `xraft-core/Cargo.toml`,
+> `xraft-core/src/message.rs`, and `Cargo.lock` -- were actually
+> committed BEFORE iter 1's session started, in commit
+> `afecac2 fix(xraft-core): reconcile merge -- restore build deps
+> and message.rs` (author Copilot, dated 20:57:33; iter 1's session
+> started reading the worktree at ~20:52). Iter 1 verified those
+> pre-existing changes via the build/test gate but did not author
+> them.
+>
+> Also corrected: the body's claim of `git status -> "nothing to
+> commit, working tree clean"` was wrong -- iter 1 ended with
+> `.forge/iter-notes.md` and (after Forge's auto-archive)
+> `.forge/notes/iter-1.md` both modified. The Forge auto-commit
+> step at 21:00:57 (commit `389b9a9 chore: auto-commit ...`,
+> stat: only the two .forge note files) is what brought the tree
+> back to "clean" between iter 1 and iter 2.
+>
+> The iter-1 narrative below is preserved verbatim for audit-trail
+> continuity; treat the "Files touched THIS iter" / "git status"
+> sections as INACCURATE and use this correction block as the
+> authoritative version.
+
 ## Iteration summary
 
 This iter is for the **actual** Stage 1.2 (Core Types and Configuration)
