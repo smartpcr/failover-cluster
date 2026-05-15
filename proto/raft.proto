@@ -74,10 +74,14 @@ message FetchResponse {
 // Log entries
 // ---------------------------------------------------------------------------
 
+// proto3 best practice: zero must be an explicit "unspecified" sentinel so a
+// missing/default-encoded enum field never silently decodes as a valid type.
+// Conversion code in xraft-core/src/message.rs rejects ENTRY_TYPE_UNSPECIFIED.
 enum EntryType {
-  COMMAND  = 0;
-  NO_OP    = 1;
-  CONFIG   = 2;
+  ENTRY_TYPE_UNSPECIFIED = 0;
+  ENTRY_TYPE_COMMAND     = 1;
+  ENTRY_TYPE_NO_OP       = 2;
+  ENTRY_TYPE_CONFIG      = 3;
 }
 
 message LogEntry {
@@ -109,11 +113,17 @@ message VoterSet {
 message SnapshotMetadata {
   uint64   last_included_index = 1;
   uint64   last_included_term  = 2;
+  // Required: every snapshot must carry the voter set in effect at
+  // last_included_index. The Rust wire conversion in xraft-core/src/message.rs
+  // rejects messages where voter_set is missing or contains zero voters.
   VoterSet voter_set           = 3;
   string   snapshot_id         = 4;
-  // Size of the snapshot payload data in bytes (populated by store on save/load).
+  // Size of the snapshot payload data in bytes. Populated by the snapshot
+  // store on save/load; absent for in-memory bootstrap markers.
   optional uint64 size_bytes   = 5;
-  // CRC32 checksum of the snapshot payload, zero-extended to u64.
+  // CRC32 checksum of the snapshot payload data, zero-extended to u64.
+  // Populated by the snapshot store on save/load; absent for in-memory
+  // bootstrap markers.
   optional uint64 checksum     = 6;
 }
 
@@ -122,30 +132,24 @@ message FetchSnapshotRequest {
   uint64 leader_epoch = 2;
   uint64 replica_id   = 3;
   string snapshot_id  = 4;
-  // Byte offset into the snapshot payload for resumable transfer.
-  // 0 means start from the beginning.
-  uint64 offset       = 5;
-  // Maximum bytes to return in this response. 0 means no limit.
-  uint64 max_bytes    = 6;
 }
 
 message FetchSnapshotChunk {
   string cluster_id            = 1;
   uint64 leader_epoch          = 2;
+  // u64 to support pathological chunk counts (very large snapshots with
+  // small chunk sizes) without overflow — matches `SnapshotChunkItem`.
   uint64 chunk_index           = 3;
   bytes  data                  = 4;
   bool   done                  = 5;
   optional SnapshotMetadata metadata = 6;
 }
 
-// ---------------------------------------------------------------------------
-// Raft gRPC service
-// ---------------------------------------------------------------------------
-
-service RaftService {
-  rpc Vote(VoteRequest)                       returns (VoteResponse);
-  rpc PreVote(PreVoteRequest)                 returns (PreVoteResponse);
-  rpc Fetch(FetchRequest)                     returns (FetchResponse);
-  // Server-streaming: leader streams snapshot chunks to the requesting follower.
-  rpc FetchSnapshot(FetchSnapshotRequest)     returns (stream FetchSnapshotChunk);
-}
+// NOTE: The Raft gRPC service definition is intentionally omitted from this
+// stage. Stage 1.3 ("RPC Message Definitions") owns wire *messages* only.
+// The transport layer (introduced in a later stage) will own the gRPC service
+// contract and its tonic-build configuration, at which point a `service
+// RaftService { ... }` definition will live in the transport crate's proto
+// (or be added back here once the transport crate enables client/server
+// generation). Declaring a service here while xraft-core/build.rs disables
+// both `build_server` and `build_client` would produce dead wire surface.

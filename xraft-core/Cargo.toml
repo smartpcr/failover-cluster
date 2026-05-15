@@ -20,8 +20,9 @@ rand = { workspace = true }
 prost = { workspace = true }
 futures-core = "0.3"
 
-[dev-dependencies]
-serde_json = { workspace = true }
-
 [build-dependencies]
 tonic-build = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+prost = { workspace = true }
