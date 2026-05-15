@@ -4359,4 +4359,169 @@ data_dir = "{}"
         }
         assert_eq!(reassembled, payload);
     }
+
+    /// KRaft-style FetchSnapshot loop with arbitrary, non-chunk-aligned
+    /// byte offsets. The follower tracks its byte position via the actual
+    /// number of bytes received and re-issues `FetchSnapshotRequest` with
+    /// `position = next_offset` and a server-side `max_bytes` cap that is
+    /// **not** a multiple of the leader's internal chunk size. This is the
+    /// real-world FetchSnapshot pattern: the receiver does not know — and
+    /// must not assume — the leader's chunking granularity.
+    ///
+    /// Stresses:
+    ///   - payload length not divisible by chunk_size or max_bytes
+    ///   - chunk_size and max_bytes are coprime small values
+    ///   - offsets accumulate from `data.len()` so the next request's
+    ///     `offset` is generally not chunk-aligned on the leader side
+    ///   - first yielded chunk of every response carries metadata
+    ///     (regardless of offset), enabling per-response identity checks
+    ///   - `done` is `false` on every intermediate response and only `true`
+    ///     on the request whose window covers the tail of the payload
+    ///   - reassembled payload byte-for-byte equals the original
+    #[test]
+    fn kraft_style_resumable_fetch_snapshot_arbitrary_offsets() {
+        let dir = temp_dir();
+        let mut store = FileSnapshotStore::open_with_retention(dir.path(), 0).unwrap();
+
+        // Coprime, non-power-of-2 sizes so neither chunk_size nor max_bytes
+        // ever divides the payload evenly. 100 % 7 != 0; 100 % 13 != 0.
+        let payload: Vec<u8> = (0..100u8).collect();
+        store
+            .save_snapshot(test_meta("kraft-resumable", 99, 5), &payload)
+            .unwrap();
+
+        let meta = store
+            .find_by_id("snapshot-0000000005-00000000000000000099")
+            .unwrap()
+            .unwrap();
+
+        let chunk_size: usize = 7;
+        let max_bytes: u64 = 13;
+
+        let mut reassembled: Vec<u8> = Vec::with_capacity(payload.len());
+        let mut next_offset: u64 = 0;
+        let mut request_count = 0usize;
+
+        loop {
+            request_count += 1;
+            assert!(
+                request_count < 1024,
+                "infinite loop guard: payload={}, next_offset={}",
+                payload.len(),
+                next_offset
+            );
+
+            let chunks: Vec<_> = store
+                .snapshot_reader_from_offset(&meta, chunk_size, next_offset, Some(max_bytes))
+                .expect("snapshot_reader_from_offset must succeed for valid in-range offset")
+                .map(|r| r.expect("chunk read must not error"))
+                .collect();
+
+            assert!(
+                !chunks.is_empty(),
+                "leader must yield at least one chunk per request (got 0 at offset {next_offset})"
+            );
+
+            // Every response's FIRST chunk must carry metadata — the receiver
+            // verifies snapshot identity (id, last_included_index/term,
+            // voter_set) on every FetchSnapshotResponse, not just the first.
+            assert!(
+                chunks[0].metadata.is_some(),
+                "request #{request_count} (offset={next_offset}): first chunk must carry metadata"
+            );
+            let resp_meta = chunks[0].metadata.as_ref().unwrap();
+            assert_eq!(resp_meta.last_included_index, LogIndex(99));
+            assert_eq!(resp_meta.last_included_term, Term(5));
+            assert!(
+                resp_meta.voter_set.is_some(),
+                "voter_set must be propagated on every response"
+            );
+
+            // Subsequent chunks within the same response must NOT duplicate
+            // metadata (the metadata is per-response, not per-chunk).
+            for c in &chunks[1..] {
+                assert!(
+                    c.metadata.is_none(),
+                    "non-first chunk in response #{request_count} must not carry metadata"
+                );
+            }
+
+            // Accumulate bytes and advance the follower's byte position.
+            let bytes_in_response: usize = chunks.iter().map(|c| c.data.len()).sum();
+            assert!(
+                bytes_in_response <= max_bytes as usize,
+                "leader must not return more than max_bytes={} (got {})",
+                max_bytes,
+                bytes_in_response
+            );
+            for c in &chunks {
+                reassembled.extend_from_slice(&c.data);
+            }
+            next_offset += bytes_in_response as u64;
+
+            // `done` semantics: only the response whose window reaches
+            // EOF of the full payload may set done=true on its last chunk.
+            // Intermediate responses must report done=false on every chunk.
+            let last = chunks.last().unwrap();
+            let window_reaches_eof = (next_offset as usize) >= payload.len();
+            if last.done {
+                assert!(
+                    window_reaches_eof,
+                    "done=true requires window to reach EOF (next_offset={}, payload_len={})",
+                    next_offset,
+                    payload.len()
+                );
+                // No earlier chunk in the final response should also set done
+                // (only the very last chunk emitted carries the EOF signal).
+                for c in &chunks[..chunks.len() - 1] {
+                    assert!(
+                        !c.done,
+                        "only the FINAL chunk of the FINAL response may set done=true"
+                    );
+                }
+                break;
+            } else {
+                // Intermediate response: every chunk must have done=false.
+                for c in &chunks {
+                    assert!(
+                        !c.done,
+                        "intermediate response chunks must have done=false (offset={})",
+                        next_offset - bytes_in_response as u64
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            next_offset as usize,
+            payload.len(),
+            "follower must have received exactly payload bytes"
+        );
+        assert_eq!(
+            reassembled, payload,
+            "reassembled snapshot must be byte-for-byte identical to original"
+        );
+
+        // After EOF, an extra request at offset == payload.len() must yield
+        // a single empty done=true chunk with metadata — a transfer-complete
+        // signal that still carries identity (per the SnapshotStore trait
+        // doc contract). This protects followers that issue one extra
+        // request after reassembly to confirm completion.
+        let post_eof: Vec<_> = store
+            .snapshot_reader_from_offset(&meta, chunk_size, payload.len() as u64, Some(max_bytes))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            post_eof.len(),
+            1,
+            "post-EOF request must yield exactly one chunk"
+        );
+        assert!(post_eof[0].data.is_empty(), "post-EOF chunk must be empty");
+        assert!(post_eof[0].done, "post-EOF chunk must be done=true");
+        assert!(
+            post_eof[0].metadata.is_some(),
+            "post-EOF chunk must still carry metadata for identity verification"
+        );
+    }
 }

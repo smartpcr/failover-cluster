@@ -113,7 +113,7 @@ storyId: "failover-cluster:XRAFT"
 
 ### Implementation Steps
 - [ ] Define `SnapshotStore` trait in `xraft-core/src/storage.rs` with methods: `save_snapshot(metadata, data)`, `load_latest_snapshot()`, `list_snapshots()`, `delete_snapshot(id)` — trait lives in `xraft-core` per `architecture.md` §4.1
-- [ ] Implement `FileSnapshotStore` in `xraft-storage/src/snapshot.rs` that writes snapshots to `snapshots/` directory with filename pattern `snapshot-{term}-{index}.bin`
+- [ ] Implement `FileSnapshotStore` in `xraft-storage/src/snapshot_store.rs` that writes snapshots to `snapshots/` directory with filename pattern `snapshot-{term}-{index}.bin` (the file is `snapshot_store.rs` to avoid conflict with the inner `snapshot` symbol re-exported by `xraft-storage/src/lib.rs`)
 - [ ] Implement snapshot metadata header format: `[magic: u32][version: u16][last_included_index: u64][last_included_term: u64][voter_set_len: u32][voter_set: bytes][data_len: u64]`
 - [ ] Implement snapshot cleanup: retain only the N most recent snapshots (configurable, default 3)
 - [ ] Implement chunked snapshot reading for `FetchSnapshot` RPC support, returning iterators over fixed-size chunks (default 1 MB)
