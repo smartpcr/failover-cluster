@@ -21,7 +21,7 @@ pub use config::ClusterConfig;
 pub use error::{Result, XRaftError};
 pub use message::{Action, Entry, EntryPayload, Input, OutboundMessage};
 pub use node::{ElectionTimer, PeerState, RaftNode};
-pub use state_machine::{NoOpStateMachine, StateMachineCallback};
+pub use state_machine::{NoOpStateMachine, StateMachine};
 pub use types::{
     HardState, LogIndex, NodeId, NodeRole, Term, VoteGrantedSet, VoterRecord, VoterSet,
 };
