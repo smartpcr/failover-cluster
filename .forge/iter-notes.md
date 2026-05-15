@@ -46,7 +46,7 @@ counter scans.
   resolution upgraded to FIXED. The empty-array signal is
   re-emitted in this iter's reply to maintain the cleared state.
 
-## Files touched THIS iter (iter 6)
+Actively edited by me in iter 4:
 
 Actively edited by me in iter 6 (one file, by me only):
 - `.forge/iter-notes.md` -- this file. Replaces the iter-5 body
@@ -93,6 +93,7 @@ Verbatim `git --no-pager status --porcelain`:
 
 ```
  M .forge/iter-notes.md
+ M .forge/notes/iter-1.md
  M .forge/notes/iter-2.md
  M .forge/notes/iter-3.md
  M .forge/notes/iter-4.md
@@ -129,9 +130,9 @@ becomes ten paths.
   the reply is a withdrawal-maintenance signal, not a new
   question.
 
-## Build / quality / test state at end of iter 6
+## Build / quality / test state at end of iter 4
 
-Per-iter gate chain (re-verified at end of iter 6):
+Per-iter gate chain (re-verified at end of iter 4):
 
 - `cargo build --workspace` -> exit 0 (0.55s).
 - `cargo fmt --check --all` -> exit 0, no diff.

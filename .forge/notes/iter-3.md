@@ -186,7 +186,84 @@ above is the AUTHORITATIVE list for the evaluator's scoring.
 
 ## Open questions surfaced this iter
 
-- None.
+Verbatim `git --no-pager status --short` captured while writing
+these notes:
+
+```
+ M .forge/iter-notes.md
+ M .forge/notes/iter-1.md
+ M .forge/notes/iter-2.md
+ M xraft-core/src/message.rs
+ M xraft-core/src/node.rs
+```
+
+5 paths total (5 modified, 0 untracked). At evaluator inspection
+time this becomes 6 paths because Forge will materialize
+`.forge/notes/iter-3.md` from this iter-notes.md file before the
+next evaluator pass — the structural +1 auto-archive pattern
+documented in the cumulative iter-5 (Stage 3.2) notes continues to
+hold for Stage 3.3. Policy statement: for every iter N, the
+evaluator's inspection-time path count = the in-iter
+`git status --short` line count + 1.
+
+## Decisions made this iter
+
+- All three findings are FIX (not DEFER). All three live in
+  xraft-core and require zero cross-workstream coupling.
+
+- Finding 1's guard is placed at the VERY TOP of
+  `handle_fetch_response`, before the higher-term branch. Rationale:
+  if we put it inside the same-term branch only, an unknown sender
+  could still force a term bump by sending a higher-term response
+  (the higher-term branch runs first and would call
+  `become_follower(Term(higher), Some(unknown))` before the guard
+  could fire). Placing the guard above both branches makes the
+  unknown-leader drop unconditional and eliminates the race entirely.
+
+- Finding 2's loop also rejects in-batch term-regress
+  (`w[1].term < w[0].term`) on top of the index-contiguity check
+  the evaluator asked for. Rationale: defense in depth. Within a
+  single FetchResponse from a single leader epoch, terms must be
+  non-decreasing (a leader cannot create entries with a smaller
+  term than its own). Catching this here is one extra line and
+  closes a related malformed-batch path. The evaluator did not
+  require it but the symmetry felt valuable.
+
+- Finding 3's guard is placed AFTER the self-fetch check (so a
+  self-fetch with offset=0 still hits the self-fetch drop and
+  doesn't generate two log lines) but BEFORE the unknown-replica
+  check (so a malformed-but-unknown sender is rejected on the
+  cheaper structural check first). The guard runs BEFORE the
+  per-peer liveness update so a malformed request cannot refresh
+  the leader's last_fetch_time stamp.
+
+- Re-used the existing `is_known_voter || peers.contains_key`
+  predicate shape (already used in `handle_fetch_request` from
+  iter 2's finding-6 fix) for the new finding-1 guard. Symmetry
+  between request and response handlers makes the trust boundary
+  legible: requests AND responses both require known sender.
+
+- No changes to message.rs this iter. The `Action` and `Input`
+  variant shapes are correct and stable as of iter 2.
+
+- Test `scenario_fetch_response_from_unknown_leader_dropped`
+  collapses both higher-term and same-term unknown-leader cases
+  into one test function (separated by `// ---------- Case (a/b)
+  ----------` comment markers). Rationale: they both verify the
+  SAME guard (the new top-of-function leader-id check), so a single
+  test exercising both cases is more legible than two near-duplicate
+  tests, and a regression in either case will fail this single test.
+
+## Dead ends tried this iter
+
+- None. All three fix designs were straightforward once the
+  iter-2 evaluator findings pinpointed the exact line ranges and
+  semantics.
+
+## Open questions surfaced this iter
+
+- None. All three findings have been addressed within xraft-core;
+  no cross-workstream coupling discovered.
 
 ## Build / quality / test state at end of iter 3
 
