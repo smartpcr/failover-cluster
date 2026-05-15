@@ -47,9 +47,16 @@ pub struct SnapshotChunkItem {
     pub chunk_index: u64,
     /// Raw payload bytes for this chunk.
     pub data: Vec<u8>,
-    /// `true` when this is the final chunk.
+    /// `true` when this is the final chunk (full snapshot payload exhausted).
+    /// Note: `done` reflects EOF of the *full* snapshot, not just the current
+    /// transfer window. A resumable response that ends mid-payload (limited
+    /// by `max_bytes`) yields `done = false` on its last chunk.
     pub done: bool,
-    /// Present only on the first chunk (`chunk_index == 0`).
+    /// Snapshot metadata. Present on the **first chunk yielded by a reader**,
+    /// regardless of the chunk's logical `chunk_index`. For resumable
+    /// transfers (`offset > 0`) the first yielded chunk has a non-zero
+    /// `chunk_index` but still carries metadata so the receiver can verify
+    /// the snapshot identity on every response.
     pub metadata: Option<SnapshotMeta>,
 }
 
@@ -199,7 +206,9 @@ pub trait SnapshotStore: Send + Sync {
     /// verify identity.
     ///
     /// `max_bytes` of `None` or `Some(0)` means read until the end. If
-    /// `offset >= payload_size`, an empty iterator is returned.
+    /// `offset >= payload_size`, the iterator yields a single empty chunk
+    /// with `done = true` and the snapshot metadata attached, so the
+    /// receiver still gets a transfer-complete signal carrying identity.
     ///
     /// The default implementation loads the full snapshot and slices it.
     /// File-backed implementations may override this with a seek-based reader.
