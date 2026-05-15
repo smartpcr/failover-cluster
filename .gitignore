@@ -3,3 +3,8 @@
 *.swo
 *~
 .DS_Store
+# Backup-file extensions that accumulate from Forge doc-rotation
+# tooling and code-review snapshotting; ignored so they don't
+# pollute future diffs.
+*.iter-snapshot.bak
+*.review-backup

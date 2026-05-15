@@ -158,6 +158,28 @@ pub enum Action {
     TruncateLog {
         from_index_inclusive: LogIndex,
     },
+    /// Visible rejection of an [`Input`] variant whose handler is deferred
+    /// to a future stage.
+    ///
+    /// Stages 3.1 and 3.2 implement Tick + Vote/PreVote handling but defer
+    /// `FetchRequest` / `FetchResponse` / `ClientPropose` / `FetchRequestAcked`
+    /// to Stage 3.3 (Log Replication). Rather than silently returning an
+    /// empty `Vec<Action>` for those inputs — which would be invisible to
+    /// the driver and to operators — the engine emits this structured
+    /// rejection so the driver can reply over RPC, surface a metric, or
+    /// forward an "unsupported" error to the client.
+    ///
+    /// `input_kind` is a `&'static str` naming the rejected `Input` variant
+    /// (e.g. `"ClientPropose"`); `reason` is a human-readable string the
+    /// driver may surface verbatim. The engine guarantees that emitting
+    /// this action does not mutate any Raft state — the rejection is a pure
+    /// pass-through; see the integration test
+    /// `scenario_stage_3_3_inputs_emit_visible_rejection` for the exact
+    /// no-mutation contract.
+    RejectUnsupportedInput {
+        input_kind: &'static str,
+        reason: String,
+    },
 }
 
 /// Messages sent over the network.

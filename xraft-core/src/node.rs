@@ -380,6 +380,19 @@ impl RaftNode {
         self.role == NodeRole::Leader
     }
 
+    /// The candidate this node has voted for in the current term, if any.
+    /// Mirrors the durable [`HardState::voted_for`](crate::types::HardState)
+    /// field; exposed as a method for symmetry with [`current_term()`](Self::current_term)
+    /// and so callers (including tests) describe the semantic public API
+    /// rather than reaching into `hard_state` directly. The Stage 3.1
+    /// no-mutation rejection test
+    /// (`scenario_stage_3_3_inputs_emit_visible_rejection`) reads this to
+    /// pin that `step()` does not silently mutate the vote on a
+    /// deferred-input rejection.
+    pub fn voted_for(&self) -> Option<NodeId> {
+        self.hard_state.voted_for
+    }
+
     /// Mirror an updated `last_log_index` / `last_log_term` from the durable
     /// `LogStore` into the node. The driver calls this after applying an
     /// [`Action::AppendEntries`] (or on startup recovery) so subsequent
@@ -402,13 +415,19 @@ impl RaftNode {
     /// the driver can drive the full Pre-Vote → Vote → Leader cascade
     /// across a real cluster by simply pumping `Input`s into `step()`.
     ///
-    /// Stage 3.3 territory (fetch traffic and client proposals) is still
-    /// **accept-and-drop with a `tracing::debug!` breadcrumb** so the
-    /// driver can be wired without crashing on out-of-stage inputs while
-    /// the drop remains observable. If an integration starts pumping
-    /// `FetchRequest`/`FetchResponse`/`ClientPropose` before the matching
-    /// stage lands, the operator sees an obvious "input not yet handled"
-    /// signal at debug level rather than a silent black hole.
+    /// Stage 3.3 territory (fetch traffic, fetch acks, and client
+    /// proposals) is **rejected visibly** via
+    /// [`Action::RejectUnsupportedInput`] rather than silently dropped.
+    /// `step()` must never return an empty `Vec<Action>` for an
+    /// unsupported input — silent drops are invisible to the driver and
+    /// to operators, while a structured rejection lets the driver reply
+    /// with an "unsupported / not-yet-implemented" error, increment a
+    /// metric, and surface the `reason` (which references the deferred
+    /// stage) to the operator. The contract is pinned by
+    /// `scenario_stage_3_3_inputs_emit_visible_rejection` in
+    /// `xraft-core/tests/raft_node_state_machine.rs`, which also verifies
+    /// the rejection arm does not mutate role/term/vote/commit/last-applied/
+    /// log-tip/election-timer state.
     ///
     /// The match deliberately enumerates each placeholder variant rather
     /// than using a `_` wildcard. Rust's exhaustiveness checker will then
@@ -425,24 +444,60 @@ impl RaftNode {
             Input::PreVoteResponse { from, response } => {
                 self.handle_pre_vote_response(from, response)
             }
-            // Stage 3.3 territory — accept-and-drop so the driver can be
-            // wired without crashing on out-of-stage inputs, but emit a
-            // `tracing::debug!` so the drop is observable. `input @ (..)`
-            // binds the value through the disjunctive pattern so the trace
-            // can record the actual variant; this preserves the explicit
-            // per-variant enumeration (no wildcard) so the compiler still
-            // forces a decision on any future `Input` variant.
-            input
-            @ (Input::FetchRequest(_) | Input::FetchResponse(_) | Input::ClientPropose(_)) => {
-                tracing::debug!(
-                    node_id = %self.id,
-                    role = ?self.role,
-                    current_term = %self.hard_state.current_term,
-                    ?input,
-                    "input not yet handled (Stage 3.3 placeholder); dropping"
-                );
-                Vec::new()
-            }
+            // Stage 3.3 territory — rejected VISIBLY (no silent drop).
+            // Each arm names the variant explicitly so:
+            //   1. Rust's exhaustiveness checker still flags any future
+            //      `Input` variant added in a later stage as a missing
+            //      arm, forcing the engineer wiring it up to decide
+            //      whether it's a real handler or another rejection.
+            //   2. The `input_kind` string is a stable, hand-picked label
+            //      (driver consumers depend on it for metrics / logs), so
+            //      it cannot drift from a `Debug` rendering.
+            //   3. `FetchRequestAcked` (struct variant added by the
+            //      upstream Stage 3.3 message-shape merge) gets the same
+            //      visible-rejection contract as the three tuple-variant
+            //      deferred inputs until the per-peer replication-progress
+            //      handler lands in Stage 3.3.
+            // Each arm constructs its own
+            // `vec![Action::RejectUnsupportedInput { .. }]` inline
+            // (deliberately, without a shared helper) so the per-variant
+            // `input_kind` label and the per-variant `reason` string are
+            // co-located with the matching pattern; this keeps the
+            // contract grep-able and makes the no-mutation invariant
+            // obvious (the arm bodies do not touch `self`). Every
+            // `reason` references "Stage 3.3" — the
+            // `scenario_stage_3_3_inputs_emit_visible_rejection` test
+            // asserts `reason.contains("Stage 3.3")`.
+            Input::ClientPropose(_) => vec![Action::RejectUnsupportedInput {
+                input_kind: "ClientPropose",
+                reason: "client proposals are deferred to Stage 3.3 \
+                         (Log Replication); the engine cannot append \
+                         entries until the leader-side replication \
+                         pipeline lands"
+                    .to_string(),
+            }],
+            Input::FetchRequest(_) => vec![Action::RejectUnsupportedInput {
+                input_kind: "FetchRequest",
+                reason: "follower fetch handling is deferred to Stage 3.3 \
+                         (Log Replication); the engine has no log entries \
+                         to serve until the replication pipeline lands"
+                    .to_string(),
+            }],
+            Input::FetchResponse(_) => vec![Action::RejectUnsupportedInput {
+                input_kind: "FetchResponse",
+                reason: "follower-side fetch-response ingestion is deferred \
+                         to Stage 3.3 (Log Replication); the engine cannot \
+                         append the carried entries until the replication \
+                         pipeline lands"
+                    .to_string(),
+            }],
+            Input::FetchRequestAcked { .. } => vec![Action::RejectUnsupportedInput {
+                input_kind: "FetchRequestAcked",
+                reason: "leader-side fetch-ack progress tracking is deferred \
+                         to Stage 3.3 (Log Replication); per-peer replication \
+                         tip / high-watermark advancement is not yet wired"
+                    .to_string(),
+            }],
         }
     }
 

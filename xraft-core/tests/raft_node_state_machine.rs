@@ -38,13 +38,15 @@
 //! RequestVote RPCs") is verified in addition to the Pre-Vote-first
 //! intermediate snapshot.
 
+use std::collections::BTreeMap;
+
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use xraft_core::message::PreVoteResponse;
 use xraft_core::{
     Action, ClusterConfig, ElectionTimer, EntryPayload, Input, LogIndex, NodeId, NodeRole,
-    OutboundMessage, RaftNode, Term,
+    OutboundMessage, PeerState, RaftNode, Term,
 };
 
 /// Cluster_id used in [`three_voter_config`]; injected `PreVoteResponse`s
@@ -474,11 +476,19 @@ fn scenario_stage_3_3_inputs_emit_visible_rejection() {
     /// contractually forbidden from causing on a Stage-3.3-deferred input.
     /// The snapshot covers role/term/vote/commit/last-applied (the durable
     /// election surface), the volatile log tip (`last_log_index`/
-    /// `last_log_term`), and the full election-timer surface
-    /// (`elapsed`/`timeout_ticks`/`min_ticks`/`max_ticks`) so the test
-    /// fails LOUDLY if a future refactor accidentally calls
-    /// `election_timer.tick()` or `election_timer.reset()` from inside a
-    /// rejection arm.
+    /// `last_log_term`), the full election-timer surface
+    /// (`elapsed`/`timeout_ticks`/`min_ticks`/`max_ticks`), the leader-
+    /// contact tracking surface (`leader_id`, `last_leader_contact_tick`),
+    /// the logical-clock surface (`logical_tick`), the in-flight election-
+    /// vote surfaces (`votes_received`, `pre_votes_received` — captured as
+    /// sorted `Vec<NodeId>` so equality is deterministic regardless of the
+    /// underlying `HashSet` iteration order), and the per-peer replication-
+    /// progress map (`peers` — captured as `BTreeMap<NodeId, PeerState>`
+    /// so equality is deterministic regardless of `HashMap` iteration
+    /// order). The test fails LOUDLY if a future refactor accidentally
+    /// calls `election_timer.tick()`, `election_timer.reset()`, bumps a
+    /// peer's `last_fetch_offset`, or otherwise mutates any of these
+    /// fields from inside a rejection arm.
     #[derive(Debug, PartialEq, Eq)]
     struct RaftStateSnapshot {
         role: NodeRole,
@@ -492,9 +502,24 @@ fn scenario_stage_3_3_inputs_emit_visible_rejection() {
         timer_timeout_ticks: u64,
         timer_min_ticks: u64,
         timer_max_ticks: u64,
+        leader_id: Option<NodeId>,
+        last_leader_contact_tick: Option<u64>,
+        logical_tick: u64,
+        votes_received: Vec<NodeId>,
+        pre_votes_received: Vec<NodeId>,
+        peers: BTreeMap<NodeId, PeerState>,
     }
 
     fn snapshot(node: &RaftNode) -> RaftStateSnapshot {
+        let mut votes_received: Vec<NodeId> = node.votes_received.iter().copied().collect();
+        votes_received.sort();
+        let mut pre_votes_received: Vec<NodeId> = node.pre_votes_received.iter().copied().collect();
+        pre_votes_received.sort();
+        let peers: BTreeMap<NodeId, PeerState> = node
+            .peers
+            .iter()
+            .map(|(id, state)| (*id, state.clone()))
+            .collect();
         RaftStateSnapshot {
             role: node.role,
             term: node.current_term(),
@@ -507,7 +532,54 @@ fn scenario_stage_3_3_inputs_emit_visible_rejection() {
             timer_timeout_ticks: node.election_timer.timeout_ticks(),
             timer_min_ticks: node.election_timer.min_ticks(),
             timer_max_ticks: node.election_timer.max_ticks(),
+            leader_id: node.leader_id,
+            last_leader_contact_tick: node.last_leader_contact_tick,
+            logical_tick: node.logical_tick,
+            votes_received,
+            pre_votes_received,
+            peers,
         }
+    }
+
+    /// Assert that feeding `input` into `node` yields exactly one
+    /// `Action::RejectUnsupportedInput { input_kind: expected_kind, .. }`
+    /// with a non-empty `reason` that explicitly references the deferred
+    /// "Stage 3.3" wiring, and that the call did NOT mutate any
+    /// Raft-state field captured by [`snapshot`].
+    fn assert_rejection(node: &mut RaftNode, input: Input, expected_kind: &str) {
+        let before = snapshot(node);
+        let actions = node.step(input);
+        let after = snapshot(node);
+        assert_eq!(
+            actions.len(),
+            1,
+            "{expected_kind} must yield exactly one rejection action, got {actions:?}",
+        );
+        let Action::RejectUnsupportedInput { input_kind, reason } = &actions[0] else {
+            panic!(
+                "{expected_kind} must yield Action::RejectUnsupportedInput, got {:?}",
+                actions[0],
+            );
+        };
+        assert_eq!(
+            *input_kind, expected_kind,
+            "{expected_kind} rejection must carry input_kind=\"{expected_kind}\", got {input_kind:?}",
+        );
+        assert!(
+            !reason.is_empty(),
+            "{expected_kind} rejection must carry a non-empty `reason` so the driver can surface it; got empty string",
+        );
+        assert!(
+            reason.contains("Stage 3.3"),
+            "{expected_kind} rejection `reason` must explicitly reference the deferred Stage 3.3 (Log Replication) wiring so operators know which stage replaces the rejection; got {reason:?}",
+        );
+        assert_eq!(
+            after, before,
+            "{expected_kind} rejection must NOT mutate any Raft-state field \
+             (role/term/vote/commit/last_applied/last_log_index/last_log_term/election_timer/\
+             leader_id/last_leader_contact_tick/logical_tick/votes_received/pre_votes_received/peers); \
+             before={before:?}, after={after:?}",
+        );
     }
 
     let mut node = RaftNode::new_with_seed(three_voter_config(), 21).unwrap();
@@ -520,41 +592,10 @@ fn scenario_stage_3_3_inputs_emit_visible_rejection() {
     assert_eq!(node.voted_for(), None);
 
     // ClientPropose -- the most operator-visible Stage 3.3 input.
-    let before_propose = snapshot(&node);
-    let propose_actions = node.step(Input::ClientPropose(b"hello".to_vec().into()));
-    let after_propose = snapshot(&node);
-    assert_eq!(
-        propose_actions.len(),
-        1,
-        "ClientPropose must surface a non-empty action list (visible rejection), got {propose_actions:?}",
-    );
-    let Action::RejectUnsupportedInput {
-        input_kind: propose_kind,
-        reason: propose_reason,
-    } = &propose_actions[0]
-    else {
-        panic!(
-            "ClientPropose must yield Action::RejectUnsupportedInput, got {:?}",
-            propose_actions[0],
-        );
-    };
-    assert_eq!(
-        *propose_kind, "ClientPropose",
-        "ClientPropose rejection must carry input_kind=\"ClientPropose\", got {propose_kind:?}",
-    );
-    assert!(
-        !propose_reason.is_empty(),
-        "ClientPropose rejection must carry a non-empty `reason` so the driver can surface it; got empty string",
-    );
-    assert!(
-        propose_reason.contains("Stage 3.3"),
-        "ClientPropose rejection `reason` must explicitly reference the deferred Stage 3.3 (Log Replication) wiring so operators know which stage replaces the rejection; got {propose_reason:?}",
-    );
-    assert_eq!(
-        after_propose, before_propose,
-        "ClientPropose rejection must NOT mutate any Raft-state field \
-         (role/term/vote/commit/last_applied/last_log_index/last_log_term/election_timer); \
-         before={before_propose:?}, after={after_propose:?}",
+    assert_rejection(
+        &mut node,
+        Input::ClientPropose(b"hello".to_vec().into()),
+        "ClientPropose",
     );
 
     // FetchRequest -- driver should see a rejection it can forward over RPC.
@@ -565,42 +606,7 @@ fn scenario_stage_3_3_inputs_emit_visible_rejection() {
         fetch_offset: LogIndex(0),
         last_fetched_epoch: Term(0),
     };
-    let before_fetch_req = snapshot(&node);
-    let fetch_req_actions = node.step(Input::FetchRequest(fetch_req));
-    let after_fetch_req = snapshot(&node);
-    assert_eq!(
-        fetch_req_actions.len(),
-        1,
-        "FetchRequest must yield exactly one rejection action, got {fetch_req_actions:?}",
-    );
-    let Action::RejectUnsupportedInput {
-        input_kind: fetch_req_kind,
-        reason: fetch_req_reason,
-    } = &fetch_req_actions[0]
-    else {
-        panic!(
-            "FetchRequest must yield Action::RejectUnsupportedInput, got {:?}",
-            fetch_req_actions[0],
-        );
-    };
-    assert_eq!(
-        *fetch_req_kind, "FetchRequest",
-        "FetchRequest rejection must carry input_kind=\"FetchRequest\", got {fetch_req_kind:?}",
-    );
-    assert!(
-        !fetch_req_reason.is_empty(),
-        "FetchRequest rejection must carry a non-empty `reason` so the driver can surface it; got empty string",
-    );
-    assert!(
-        fetch_req_reason.contains("Stage 3.3"),
-        "FetchRequest rejection `reason` must explicitly reference the deferred Stage 3.3 (Log Replication) wiring so operators know which stage replaces the rejection; got {fetch_req_reason:?}",
-    );
-    assert_eq!(
-        after_fetch_req, before_fetch_req,
-        "FetchRequest rejection must NOT mutate any Raft-state field \
-         (role/term/vote/commit/last_applied/last_log_index/last_log_term/election_timer); \
-         before={before_fetch_req:?}, after={after_fetch_req:?}",
-    );
+    assert_rejection(&mut node, Input::FetchRequest(fetch_req), "FetchRequest");
 
     // FetchResponse -- the follower-side variant; same rejection contract.
     let fetch_resp = FetchResponse {
@@ -611,49 +617,30 @@ fn scenario_stage_3_3_inputs_emit_visible_rejection() {
         entries: Vec::new(),
         diverging_epoch: None,
     };
-    let before_fetch_resp = snapshot(&node);
-    let fetch_resp_actions = node.step(Input::FetchResponse(fetch_resp));
-    let after_fetch_resp = snapshot(&node);
-    assert_eq!(
-        fetch_resp_actions.len(),
-        1,
-        "FetchResponse must yield exactly one rejection action, got {fetch_resp_actions:?}",
-    );
-    let Action::RejectUnsupportedInput {
-        input_kind: fetch_resp_kind,
-        reason: fetch_resp_reason,
-    } = &fetch_resp_actions[0]
-    else {
-        panic!(
-            "FetchResponse must yield Action::RejectUnsupportedInput, got {:?}",
-            fetch_resp_actions[0],
-        );
-    };
-    assert_eq!(
-        *fetch_resp_kind, "FetchResponse",
-        "FetchResponse rejection must carry input_kind=\"FetchResponse\", got {fetch_resp_kind:?}",
-    );
-    assert!(
-        !fetch_resp_reason.is_empty(),
-        "FetchResponse rejection must carry a non-empty `reason` so the driver can surface it; got empty string",
-    );
-    assert!(
-        fetch_resp_reason.contains("Stage 3.3"),
-        "FetchResponse rejection `reason` must explicitly reference the deferred Stage 3.3 (Log Replication) wiring so operators know which stage replaces the rejection; got {fetch_resp_reason:?}",
-    );
-    assert_eq!(
-        after_fetch_resp, before_fetch_resp,
-        "FetchResponse rejection must NOT mutate any Raft-state field \
-         (role/term/vote/commit/last_applied/last_log_index/last_log_term/election_timer); \
-         before={before_fetch_resp:?}, after={after_fetch_resp:?}",
+    assert_rejection(&mut node, Input::FetchResponse(fetch_resp), "FetchResponse");
+
+    // FetchRequestAcked -- the leader-side per-peer replication-progress
+    // feedback added by the upstream Stage 3.3 message-shape merge. Same
+    // visible-rejection contract until the per-peer progress handler
+    // lands in Stage 3.3.
+    assert_rejection(
+        &mut node,
+        Input::FetchRequestAcked {
+            replica_id: NodeId(2),
+            confirmed_offset: LogIndex(0),
+        },
+        "FetchRequestAcked",
     );
 
-    // Final cumulative check: across all three rejections combined, the
+    // Final cumulative check: across all four rejections combined, the
     // node remains in its canonical Stage 3.1 initial state -- no role
     // transition, no term/vote bump, no commit advance, no log tip
-    // movement, and the election timer has neither ticked nor been reset
-    // (so a Tick-driven election timeout fires on the same schedule it
-    // would have without these inputs).
+    // movement, no leader-contact recording, no logical-tick advance,
+    // and no in-flight vote tallies. The election timer has neither
+    // ticked nor been reset (so a Tick-driven election timeout fires
+    // on the same schedule it would have without these inputs), and
+    // every peer's replication-progress fields stay at their
+    // construction-time defaults.
     assert_eq!(node.role, NodeRole::Follower);
     assert_eq!(node.current_term(), Term(0));
     assert_eq!(node.voted_for(), None);
@@ -666,4 +653,41 @@ fn scenario_stage_3_3_inputs_emit_visible_rejection() {
         0,
         "election_timer must not have been ticked by any rejection arm",
     );
+    assert_eq!(
+        node.leader_id, None,
+        "leader_id must not have been set by any rejection arm",
+    );
+    assert_eq!(
+        node.last_leader_contact_tick, None,
+        "last_leader_contact_tick must not have been set by any rejection arm",
+    );
+    assert_eq!(
+        node.logical_tick, 0,
+        "logical_tick must not have advanced (only Input::Tick may advance it)",
+    );
+    assert_eq!(
+        node.votes_received.iter().count(),
+        0,
+        "votes_received must remain empty (no rejection arm runs an election)",
+    );
+    assert_eq!(
+        node.pre_votes_received.iter().count(),
+        0,
+        "pre_votes_received must remain empty (no rejection arm runs a pre-election)",
+    );
+    for (peer_id, peer) in node.peers.iter() {
+        assert_eq!(
+            peer.last_fetch_offset,
+            LogIndex(0),
+            "peer {peer_id:?} last_fetch_offset must stay at construction-time default",
+        );
+        assert_eq!(
+            peer.last_fetch_time, 0,
+            "peer {peer_id:?} last_fetch_time must stay at construction-time default",
+        );
+        assert_eq!(
+            peer.last_caught_up_time, 0,
+            "peer {peer_id:?} last_caught_up_time must stay at construction-time default",
+        );
+    }
 }
