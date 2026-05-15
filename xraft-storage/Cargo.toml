@@ -1,13 +1,18 @@
 [package]
 name = "xraft-storage"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 xraft-core = { path = "../xraft-core" }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-bytes = { workspace = true }
-tracing = { workspace = true }
-crc32fast = { workspace = true }
+bincode.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+crc32fast = "1"
+
+[dev-dependencies]
+tempfile = "3"
+uuid = { workspace = true }
