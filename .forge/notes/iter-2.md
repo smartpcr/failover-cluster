@@ -1,5 +1,37 @@
 # Snapshot Store -- iter 2
 
+> [annotation added in iter 3]
+>
+> READ THIS FIRST. The narrative below was written DURING iter 2
+> and was accurate at the moment it was authored (Engineer had just
+> deleted `xraft-storage/src/snapshot.rs`, edited
+> `docs/stories/failover-cluster-XRAFT/implementation-plan.md`,
+> and edited `.forge/notes/iter-1.md`; all three paths were live
+> in `git status --short` at the time). Five minutes later, while
+> the Engineer was still in iter 2, an external actor
+> (Author: `Xiaodong Li <xiaodoli@microsoft.com>`, NOT this
+> Engineer agent) committed all worktree changes — Engineer's
+> AND a concurrent agent's `xraft-core/src/storage.rs` doc fixes
+> AND a concurrent agent's new `kraft_style_resumable_fetch_snapshot_arbitrary_offsets`
+> test in `xraft-storage/src/snapshot_store.rs` — as commit
+> `7db8fae impl(snapshot-store): drop orphan snapshot.rs, fix doc
+> invariants, add KRaft-style resumable transfer test`. Forge then
+> auto-committed Engineer's iter-2 postscript edit to this file
+> as `231fa5b chore: auto-commit for ws-...-snapshot-store`.
+>
+> By the time the iter-2 evaluator inspected the worktree, those
+> paths were no longer in `git status --short` (they were now in
+> `git log` instead). The narrative below therefore reads as
+> stale-attribution to a fresh evaluator: it lists files as
+> "touched this iter" that, at evaluator-inspection time, had
+> already moved from "modified" to "committed". The fix at
+> iter-2 evaluator's request is structural -- iter 3's
+> iter-notes.md reframes the same work as "landed in commit
+> 7db8fae" rather than "in this iter's worktree diff", and the
+> body of THIS iter-2 archive is preserved verbatim below as
+> the historical record of what the Engineer saw at iter-2
+> writing time.
+
 ## Iteration Summary
 
 Resolved all 3 numbered items from iter-1's evaluator feedback

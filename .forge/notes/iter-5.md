@@ -1,123 +1,142 @@
-# Stage 3.2: Leader Election -- iter 5
+# Snapshot Store -- iter 5
 
 ## Iteration Summary
 
-Structural fix for the recurring "files-touched narrative under-reports
-the worktree delta by exactly one path" finding. This is the 3rd
-iteration where the evaluator has flagged a stale path count (iter 3
-claimed 5, actual was 7; iter 4 claimed 7, actual was 8). Per the
-STRICT-PER-ITEM-ATTENTION protocol, repeating the same word-tweak shape
-would loop forever -- the fix has to be structural.
+Structural rephrasing iter. The iter-4 evaluator (score 89) raised
+exactly one item: my iter-4 narrative said "No other files changed
+this iter" and "No prior-iter notes archives changed" while the
+SAME file's `git status` block listed `.forge/notes/iter-2.md` and
+`.forge/notes/iter-3.md` as `M`. That was an internal contradiction
+caused by imprecise wording -- I conflated "actively edited this
+iter" with "cumulative worktree diff vs branch base".
 
-### Root cause (verified)
+The fix the evaluator explicitly requested: "rephrase this as no
+source/planning-doc changes, not no other file changes." This iter
+adopts that exact rephrasing AND structurally separates two
+distinct concepts that the prior wording smashed together:
 
-Forge's archival mechanism runs AFTER an iter ends and BEFORE the next
-evaluator pass. The step copies `.forge/iter-notes.md` to
-`.forge/notes/iter-N.md` (where N is the iter that just ended). So
-between the moment I write iter-notes.md and the moment the evaluator
-inspects the worktree, exactly one new file appears: the auto-archive
-of THIS iter's notes. Any specific path count I commit to is therefore
-guaranteed to be 1 less than what the evaluator will see -- which is
-the failure mode that has repeated three iters in a row.
+  (A) Files actively edited THIS iter (i.e. files I opened and
+      wrote to during iter-N's session).
+  (B) Cumulative worktree delta visible to the evaluator
+      (i.e. all paths that `git status --short` shows as
+      M/?? at evaluator inspection time, regardless of which
+      iter originally modified them).
 
-### Structural fix (iter 5 onwards)
-
-This iter's notes do NOT commit to a single fixed path count. Instead
-they document Forge's auto-archive policy in plain language, list the
-worktree delta as observed AT ITER START via verbatim
-`git --no-pager status --short` output, AND explicitly predict the
-post-archive delta the evaluator will see (current count + 1, because
-Forge will materialize `.forge/notes/iter-5.md` from this file before
-the next evaluator pass). Both counts are correct for their respective
-inspection times; neither will go stale.
+These two sets are different. (A) is small (usually just
+`.forge/iter-notes.md`). (B) carries forward across iters because
+edits made in iter 2 or iter 3 stay in the worktree until Forge
+commits the workstream at end of life. Saying "no other files
+changed this iter" without that distinction reads as a flat
+contradiction the moment the reader sees more than one path in
+the next section's `git status` paste.
 
 ### Prior feedback resolution
 
-- [x] 1. ADDRESSED via structural rewrite -- Files-touched narrative
-  now accounts for Forge's auto-archive of iter-notes.md to
-  notes/iter-N.md.
-  Verbatim `git --no-pager status --short` AT START OF ITER 5 (i.e.
-  what I see while writing these notes):
-  ```
-   M .forge/iter-notes.md
-   M .forge/notes/iter-2.md
-   M .forge/notes/iter-3.md
-   M .forge/notes/iter-4.md
-   M xraft-core/src/lib.rs
-   M xraft-core/src/node.rs
-   M xraft-core/src/types.rs
-  ?? .forge/notes/iter-1.md
-  ```
-  8 paths total (7 modified + 1 untracked). AT EVALUATOR INSPECTION
-  TIME (after Forge auto-archives iter-notes.md to notes/iter-5.md):
-  9 paths -- the 8 above PLUS `.forge/notes/iter-5.md`. The +1
-  delta is structural and unavoidable; the narrative now documents
-  it instead of trying to outguess Forge's archive step.
-  Defensive annotation also added to the top of `.forge/notes/iter-4.md`
-  (the iter-4 archive) explaining why iter-4's "7-path" claim went
-  stale 0.0 seconds after iter 4 ended.
-
-- [x] 2. ADDRESSED via the same structural rewrite -- Cumulative diff
-  stat is presented as policy + verbatim status output + predicted
-  delta, not as a fixed N-path claim.
-  The diff stat section below ("Cumulative git diff --stat") includes:
-  * The verbatim 8-path `git status --short` output captured at
-    iter-5 writing time.
-  * An explicit "at evaluator inspection time, this list becomes
-    9 paths because Forge will materialize notes/iter-5.md" line.
-  * A policy statement: "for every iter N, the evaluator's
-    inspection-time path count = the in-iter `git status --short`
-    line count + 1, due to Forge's iter-notes.md -> notes/iter-N.md
-    auto-archive". The audit trail is now correct regardless of
-    which exact iter the evaluator inspects.
+- [x] 1. ADDRESSED via structural rephrasing -- The contradictory
+  iter-4 wording is replaced this iter. The "Files touched THIS
+  iter" section below is now split into two explicit subsections
+  labelled (A) Actively edited THIS iter and (B) Cumulative
+  worktree delta inherited from earlier iters, so the
+  relationship between the Files-touched narrative and the
+  Worktree-state `git status` paste is unambiguous and consistent.
+  Defensive annotation also prepended to the top of
+  `.forge/notes/iter-4.md` (the iter-4 archive) explaining why
+  the iter-4 wording read as a contradiction; the iter-4
+  narrative body is preserved verbatim as historical record.
 
 ## Files touched THIS iter (iter 5)
 
-Actively edited by me in iter 5:
-- `.forge/iter-notes.md` -- this file. New iter-5 reflection with
-  structural fix for the recurring +1 file-count finding.
-- `.forge/notes/iter-4.md` -- prepended an "[annotation added in
-  iter 5]" NOTE block explaining why the file's "7-path" claim was
-  truthful at iter-4 writing time but went stale 0.0 seconds later.
-  The iter-4 narrative body is preserved.
+### (A) Actively edited THIS iter
 
-Already in the worktree delta from prior iters (NOT actively edited
-this iter, but visible to the evaluator via `git status`):
-- `xraft-core/src/lib.rs`, `xraft-core/src/node.rs`,
-  `xraft-core/src/types.rs` -- byte-identical to end-of-iter-2 state.
-  These carry the Stage 3.2 implementation (real-vote and pre-vote
-  handlers, `start_election`, `VoteGrantedSet`, five scenario tests).
-- `.forge/notes/iter-1.md` -- untracked. Auto-archived by Forge from
-  the prior Stage 3.1 workstream's end-of-life iter-notes.
-- `.forge/notes/iter-2.md`, `.forge/notes/iter-3.md` -- defensive
-  overwrites of the iter-1 and iter-3 narratives, made in iters 3
-  and 4 respectively; unchanged in iter 5.
+These are files I opened and wrote to during iter 5's session:
 
-Will appear at evaluator inspection time (NOT in the worktree while
-I am writing these notes, but Forge will materialize it before the
-next evaluator pass):
-- `.forge/notes/iter-5.md` -- Forge's auto-archive of this very
-  iter-notes.md file. Same content as this file at end of iter 5.
+- `.forge/iter-notes.md` -- this file. New iter-5 reflection that
+  structurally rephrases iter-4's contradictory "no other files
+  changed" wording per the evaluator's explicit instruction.
+- `.forge/notes/iter-4.md` -- prepended a `> [annotation added in
+  iter 5]` NOTE block explaining the rephrasing and pointing to
+  this iter-notes.md for the corrected language. The iter-4
+  narrative body is preserved verbatim.
+
+### (B) Cumulative worktree delta inherited from earlier iters
+
+These paths show as `M` in `git status` at iter-5 inspection time
+because they were modified in iters 2 or 3 and the workstream
+has not yet been committed; iter 5 did NOT re-edit them:
+
+- `.forge/notes/iter-2.md` -- carries the `> [annotation added in
+  iter 3]` block prepended in iter 3. Last actively modified in
+  iter 3.
+- `.forge/notes/iter-3.md` -- the auto-archived iter-3 iter-notes;
+  Forge materialized it between iter 3 and iter 4. Last actively
+  modified by Forge's archive step at end of iter 3.
+
+### What is NOT in either set this iter
+
+- No source-code changes. `xraft-storage/src/snapshot_store.rs`,
+  `xraft-core/src/storage.rs`, `xraft-storage/src/lib.rs`, and
+  every other Rust file remain byte-identical to their
+  end-of-commit-7db8fae state.
+- No planning-doc changes.
+  `docs/stories/failover-cluster-XRAFT/implementation-plan.md`
+  remains as iter 2 left it (line 116 points to
+  `xraft-storage/src/snapshot_store.rs`).
+- No test changes. The 113 storage tests + 229 core tests are
+  unchanged from end of iter 2.
+
+## Worktree state at iter-5 writing time
+
+Verbatim `git --no-pager status --short` captured at the moment
+this iter-notes.md was written:
+
+```
+ M .forge/iter-notes.md
+ M .forge/notes/iter-2.md
+ M .forge/notes/iter-3.md
+ M .forge/notes/iter-4.md
+```
+
+4 paths, all under `.forge/`. At evaluator inspection time this
+becomes 5 paths because Forge will materialize
+`.forge/notes/iter-5.md` from this iter-notes.md file before the
+next evaluator pass -- the +1 auto-archive pattern documented in
+prior iters continues to hold.
+
+The relationship between this list and the previous section is:
+- `.forge/iter-notes.md` and `.forge/notes/iter-4.md` -- in (A);
+  actively edited this iter.
+- `.forge/notes/iter-2.md` and `.forge/notes/iter-3.md` -- in (B);
+  cumulative diffs from iters 2-3, NOT re-edited this iter.
+
+There is no contradiction between "iter 5 actively edited 2
+files" and "git status shows 4 modified paths" -- the difference
+is exactly the (B) inheritance set, which is now called out by
+name.
 
 ## Decisions made this iter
 
-- Structural change instead of another word-tweak. The same finding
-  ("file count is N+1, you claimed N") has now appeared three iters
-  in a row with different specific numbers (5->7, 7->8). The
-  protocol says: stop trying the same edit shape. Iter 5 documents
-  Forge's auto-archive policy explicitly so the audit trail is
-  inspection-time-aware. There is no specific number I can commit to
-  that will be true after Forge's next archive step; the structural
-  fix is to NOT commit to a single number.
-- Defensive annotation on notes/iter-4.md instead of full rewrite.
-  The iter-4 narrative body remains historically accurate for what
-  iter-4 actually saw and did; only the "7-path" count went stale.
-  A small NOTE block at the top is the minimum-blast-radius fix.
-- No further changes to notes/iter-1.md / iter-2.md / iter-3.md.
-  Those archives are already LF + ASCII clean from iter 4, and
-  their narrative bodies are already correct for their respective
-  iters. Touching them again would needlessly re-modify files that
-  are not in the latest evaluator finding.
+- Structural rephrasing instead of another word-tweak. This is
+  iter 5; iter 4's evaluator listed exactly one item (a wording
+  problem). The protocol says: when a finding repeats in shape,
+  switch from word-tweak to structure. The structural change is
+  splitting "Files touched THIS iter" into two labelled
+  subsections (A) and (B) so the audit trail is
+  inspection-time-aware AND distinguishes "I edited this" from
+  "the worktree diff includes this".
+- Defensive annotation on `.forge/notes/iter-4.md` instead of a
+  full rewrite. The iter-4 narrative body is historically
+  accurate for what iter-4's wording said; the contradiction is
+  in the wording itself, not in the data. Minimum-blast-radius
+  fix is a top NOTE block explaining the disconnect, identical
+  in shape to the iter-3 annotation on `.forge/notes/iter-2.md`
+  and (per the prior-iters archive) the iter-5 annotation on
+  the prior workstream's `.forge/notes/iter-4.md`.
+- No further changes to `.forge/notes/iter-1.md` /
+  `.forge/notes/iter-2.md` / `.forge/notes/iter-3.md`. Their
+  bodies are accurate for their respective iters and the
+  iter-4 evaluator did NOT flag them. Touching them again
+  would needlessly add files to the worktree delta that the
+  iter-5 evaluator did not ask me to modify.
 
 ## Dead ends tried this iter
 
@@ -134,48 +153,26 @@ Per-iter gate chain (re-verified at end of iter 5):
 - `cargo build --workspace` -> exit 0.
 - `cargo fmt --check --all` -> exit 0, no diff.
 - `cargo clippy --workspace --all-targets -- -D warnings` -> exit 0.
-- `cargo test --workspace` -> exit 0, 323 tests pass
-  (211 xraft-core + 112 xraft-storage). Unchanged from end of
+- `cargo test --workspace --no-fail-fast` -> exit 0, 342 tests pass
+  (229 xraft-core + 113 xraft-storage). Unchanged from end of
   iter 2; no Rust source has been touched in iter 3, 4, or 5.
 - `git --no-pager diff --check` -> exit 0, no output. LF line
   endings preserved across all .forge markdown.
 
-## Cumulative git diff --stat (vs. branch base)
-
-Verbatim `git --no-pager status --short` captured at iter-5 writing
-time:
-
-```
- M .forge/iter-notes.md
- M .forge/notes/iter-2.md
- M .forge/notes/iter-3.md
- M .forge/notes/iter-4.md
- M xraft-core/src/lib.rs
- M xraft-core/src/node.rs
- M xraft-core/src/types.rs
-?? .forge/notes/iter-1.md
-```
-
-8 paths in the worktree right now (7 modified + 1 untracked).
-
-At evaluator inspection time, this list becomes 9 paths because Forge
-will materialize `.forge/notes/iter-5.md` from this iter-notes.md file
-before the evaluator pass. That is Forge's normal auto-archive step
-running between iter-end and evaluator-start; it is not a state
-mutation iter 5 has any control over.
-
-Policy statement so the audit trail stays accurate iter-over-iter:
-for every iter N, the evaluator's inspection-time path count equals
-the in-iter `git status --short` line count plus exactly 1, due to
-Forge's iter-notes.md -> notes/iter-N.md auto-archive step.
-
 ## What's still left for future iters
 
-- Stage 3.2 scope is fully implemented (real-vote and pre-vote
-  handlers, `start_election` real-election entrypoint,
-  `VoteGrantedSet` deliverable, five scenario-tagged acceptance
-  tests). Per-iter gate chain is green; `git diff --check` is clean.
-- Stage 3.3 (Log Replication) is the next workstream:
+- Stage 2.3 scope (Snapshot Store) is fully implemented and
+  the iter-3, iter-4 evaluators both confirmed the substantive
+  surface is correct: `snapshot.rs` orphan deleted,
+  `implementation-plan.md:116` points to `snapshot_store.rs`,
+  `SnapshotStore` lives in `xraft-core/src/storage.rs`,
+  `FileSnapshotStore` / `SnapshotChunkReader` / KRaft-style
+  resumable test all present in
+  `xraft-storage/src/snapshot_store.rs`.
+- The only outstanding category of finding is narrative
+  precision; iter 5 addresses the iter-4 evaluator's single
+  remaining wording item structurally.
+- The next workstream is Stage 3.3 (Log Replication):
   `handle_fetch_request`, `handle_fetch_response`, leader-side
-  per-peer progress updates, and `ClientPropose` handling on the
-  leader.
+  per-peer progress updates, `ClientPropose` handling on the
+  leader. Not in scope for this workstream.
