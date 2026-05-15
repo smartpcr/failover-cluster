@@ -79,7 +79,12 @@ pub enum NodeRole {
 /// Only `current_term` and `voted_for` are persisted; `commit_index` and
 /// `last_applied` are volatile and rebuilt from the log on recovery
 /// (per `architecture.md` §3.3 / `implementation-plan.md` Stage 1.2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` returns the canonical first-boot state: `Term(0)` with no
+/// vote granted. The Stage 2.2 `HardStateStore::load` contract returns
+/// `Ok(None)` when no state has ever been persisted; the driver maps
+/// that to `HardState::default()` before constructing a `RaftNode`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HardState {
     pub current_term: Term,
     pub voted_for: Option<NodeId>,

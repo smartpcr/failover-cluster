@@ -1,111 +1,149 @@
-# Stage 3.2: Leader Election -- iter 6
+# Stage 2.2: Persistent Raft State -- iter 3
 
 ## Iteration Summary
 
-No-op iter. The iter-5 evaluator (score 96, iterate) explicitly listed
-"None -- no remaining Stage 3.2 issues" as the only checkbox under
-"Still needs improvement". The score was held below pass not by any
-substantive finding but by the convergence detector's checklist-format
-rule: iter-5's reply did not include an explicit
-`### Prior feedback resolution` block marking that single "None"
-checkbox as `[x] ADDRESSED`. This iter (iter 6) provides exactly that
-block, in both this iter-notes.md AND the agent's reply, so the
-convergence detector can move past it.
+Iter 2 (score 77, iterate) flagged that the existing `state.rs` was
+broken: it had a Windows-unsafe `fs::rename`, no invariants on
+`MemoryHardStateStore`, and no recovery path on `RaftNode`. Investigation
+also surfaced that `state.rs` was actually **orphaned**: not declared
+in `xraft-storage/src/lib.rs` AND it imported `fs2` which was not in
+`xraft-storage/Cargo.toml`, so the file did not compile and its tests
+never ran. The "iter-2 evaluator described features that don't exist
+in the code" was the symptom of this orphaning.
+
+This iter rewrote `state.rs` against the canonical
+`xraft_core::storage::HardStateStore` trait + `xraft_core::types::HardState`,
+wired it into `lib.rs`, added matching invariants in both Memory and
+File implementations, used the same atomic-replace pattern as
+`snapshot_store.rs::atomic_write` (proven Windows-portable), and added
+recovery constructors on `RaftNode`.
 
 ### Prior feedback resolution
 
-- [x] 1. ADDRESSED (no-op) -- The iter-5 evaluator's verdict was
-  "None -- no remaining Stage 3.2 issues identified in the changed
-  files reviewed." There is nothing to fix this iter. No code, test,
-  or doc change can address a non-finding. This checkbox is marked
-  ADDRESSED to satisfy the convergence detector's requirement that
-  every prior checkbox be explicitly resolved. (Same pattern as
-  Stage 3.1 iter 5, which the prior-iters archive shows handled the
-  identical "None" verdict with a `[x] 1. ADDRESSED (no-op)` line.)
+- [x] 1. ADDRESSED -- `xraft-storage/src/state.rs::FileHardStateStore::atomic_write`.
+  Replaced `fs::rename(tmp, final_path)` (which on Windows can fail with
+  sharing violations on in-use destinations) with the snapshot_store's
+  recoverable five-step sequence: write+sync tmp, remove stale .bak,
+  rename existing -> .bak, rename tmp -> canonical, remove .bak,
+  fsync parent dir on Unix. New test
+  `file_store_repeated_persist_succeeds_on_windows_and_unix` exercises
+  20 back-to-back persists and passed on this Windows worktree.
 
-### Why iter 5's BLOCKED message lists "2 items"
+- [x] 2. ADDRESSED -- `xraft-storage/src/state.rs::validate_transition`
+  is a single shared helper called from BOTH
+  `MemoryHardStateStore::persist` and `FileHardStateStore::persist`.
+  Identical semantics in both implementations means in-memory tests
+  cannot mask file-store-only safety bugs. New test
+  `memory_store_enforces_invariants` runs the same matrix as
+  `file_store_enforces_invariants` (same-vote idempotent OK, different-vote
+  same-term rejected, vote-clear same-term rejected, term-advance OK,
+  term-regression rejected).
 
-The BLOCKED message in iter 6's prompt refers to the iter-4 prior list
-(2 items: file-count narrative and diff-stat narrative), but those
-were structurally fixed in iter 5 -- the iter-5 evaluator's
-verification block confirms the audit trail now matches the 9-path
-inspection-time delta and the +1 auto-archive pattern is explicit. The
-BLOCKED detector apparently re-checks against the most recent prior
-list (iter-5's "None" list) and trips on the single unchecked item.
-Marking that item ADDRESSED in this iter's notes + reply unblocks it.
+- [x] 3. ADDRESSED -- `xraft-core/src/node.rs` adds two recovery
+  constructors: `RaftNode::new_with_initial_hard_state(config, hard_state)`
+  (production, system entropy) and
+  `RaftNode::new_with_seed_and_initial_hard_state(config, seed, hard_state)`
+  (deterministic, for tests). The driver opens the store, calls
+  `load()?.unwrap_or_default()`, and passes the result in -- keeping
+  `xraft-core` I/O-free per `architecture.md` §4.1. Volatile state
+  (commit_index / last_applied / last_log_*) still resets per spec.
+  Four new tests cover recovered term+vote, recovered term without vote,
+  default-state equivalence with `new_with_seed`, and config-error
+  propagation through the recovery path.
 
-## Files touched THIS iter (iter 6)
+- [x] 4. DEFERRED -- WAL `append()` fsync is explicitly outside this
+  workstream per the iter-2 evaluator's own note ("outside the narrow
+  hard-state scope"). Belongs to Stage 2.1 (Write-Ahead Log) and would
+  ship as a follow-up to commits 8a109fe / e61e514 in that workstream.
 
-Actively edited by me in iter 6:
-- `.forge/iter-notes.md` -- this file. Minimal iter-6 reflection that
-  explicitly marks the iter-5 "None" finding as `[x] ADDRESSED (no-op)`.
+## Files touched THIS iter (iter 3)
 
-No other files changed this iter. In particular:
-- No Rust source changed. `xraft-core/src/lib.rs`,
-  `xraft-core/src/node.rs`, and `xraft-core/src/types.rs` remain
-  byte-identical to their end-of-iter-2 state.
-- No prior-iter notes archives changed. The iter-5 evaluator
-  verified `git --no-pager diff --check` exits 0; all .forge
-  markdown files are still LF + ASCII clean.
+- `xraft-storage/src/state.rs` -- full rewrite. Removed local
+  `HardStateStore` trait + local `HardState` (which were duplicates
+  of canonical types in xraft-core). Implemented canonical trait
+  with `&mut self` for `persist`. Added `validate_transition` shared
+  helper. Added envelope-versioned JSON (`PersistedHardState { version,
+  state }`) with schema-version check on load. Added recoverable atomic
+  write + crash-recovery in `open` for both `.bak` cases + orphan `.tmp`
+  cleanup. 15 tests; all pass on this Windows worktree.
 
-## Worktree state at iter-6 writing time
+- `xraft-storage/src/lib.rs` -- added `mod state;` and re-exported
+  `FileHardStateStore` + `MemoryHardStateStore`. Also re-exported
+  `xraft_core::storage::HardStateStore` alongside `SnapshotStore`
+  for downstream-driver convenience.
 
-Verbatim `git --no-pager status --short` captured while writing
-these notes:
+- `xraft-storage/Cargo.toml` -- added `serde.workspace`,
+  `serde_json.workspace` to `[dependencies]`. Did NOT add `fs2`:
+  the rewrite drops the per-directory file lock (it was a
+  nice-to-have not required by `implementation-plan.md` Stage 2.2,
+  and avoiding the dep keeps the surface smaller).
 
-```
- M .forge/iter-notes.md
- M .forge/notes/iter-2.md
- M .forge/notes/iter-3.md
- M .forge/notes/iter-4.md
- M .forge/notes/iter-5.md
- M xraft-core/src/lib.rs
- M xraft-core/src/node.rs
- M xraft-core/src/types.rs
-?? .forge/notes/iter-1.md
-```
+- `xraft-core/src/types.rs` -- derived `Default` on `HardState` so
+  the driver can do `store.load()?.unwrap_or_default()` without
+  re-stating the canonical first-boot values. Updated docstring.
 
-9 paths total (8 modified + 1 untracked). At evaluator inspection
-time this becomes 10 paths because Forge will materialize
-`.forge/notes/iter-6.md` from this iter-notes.md file before the
-next evaluator pass -- the structural +1 auto-archive pattern
-documented in iter 5 continues to hold.
+- `xraft-core/src/node.rs` -- added
+  `RaftNode::new_with_initial_hard_state` and
+  `RaftNode::new_with_seed_and_initial_hard_state`. Refactored
+  existing `new_inner` to take `hard_state: HardState`; existing
+  `new` and `new_with_seed` pass `HardState::default()` and remain
+  observationally identical. Added 4 tests for the recovery path.
+
+- `Cargo.lock` -- regenerated by Cargo to reflect the new
+  `serde_json` dependency on `xraft-storage`.
 
 ## Decisions made this iter
 
-- Minimum-edit iter. The iter-5 evaluator found nothing to fix; the
-  only outstanding item is a checklist formality. Touching code, tests,
-  or other notes would risk introducing new evaluator findings on a
-  workstream that is otherwise at score 96. The single new file edited
-  this iter is iter-notes.md itself, which the protocol explicitly
-  requires to be overwritten every iter.
+- Dropped the `fs2` advisory file lock the prior iter's `state.rs`
+  used. The lock was useful but added a 3rd-party dep and the spec
+  doesn't require it. The snapshot store also doesn't lock, so
+  parity is preserved.
+- Added a versioned envelope `PersistedHardState { version, state }`
+  rather than serializing `HardState` directly. Forward-compat
+  insurance for future fields (e.g. if Stage X adds a coarse
+  commit-index hint) without breaking existing on-disk files.
+- Validation runs BEFORE `atomic_write` so a rejected transition
+  leaves both the in-memory cache AND the on-disk file untouched
+  (rubber-duck non-blocking finding #2). A test asserts this:
+  `file_store_validation_runs_before_disk_write`.
+- Added `RaftNode::new_with_seed_and_initial_hard_state` even
+  though the production driver only needs the entropy variant --
+  having the seeded variant lets future tests (Stage 3.3 / 4.x)
+  exercise recovery deterministically.
 
 ## Dead ends tried this iter
 
-- None.
+- Initial config-error test used `tick_interval_ms = 0` via TOML;
+  that turned out to deserialize to a valid (if degenerate) config.
+  Switched to the same pattern `new_returns_err_on_invalid_voter_directory_id`
+  uses: build `ClusterConfig` directly with `directory_id = "not-a-valid-uuid"`.
 
 ## Open questions surfaced this iter
 
-- None.
+- None. The implementation-plan + iter-2 feedback fully specified
+  the work; no operator decision needed.
 
-## Build / quality / test state at end of iter 6
-
-Per-iter gate chain (re-verified at end of iter 6):
+## Build / quality / test state at end of iter 3
 
 - `cargo build --workspace` -> exit 0.
-- `cargo fmt --check --all` -> exit 0, no diff.
+- `cargo fmt --check --all` -> exit 0, no diff (after one round of
+  `cargo fmt --all` to reflow two long expect_err lines).
 - `cargo clippy --workspace --all-targets -- -D warnings` -> exit 0.
-- `cargo test --workspace` -> exit 0, 323 tests pass
-  (211 xraft-core + 112 xraft-storage). Unchanged from end of iter 2;
-  no Rust source has been touched in iter 3, 4, 5, or 6.
-- `git --no-pager diff --check` -> exit 0, no output.
+- `cargo test --workspace` -> exit 0:
+  - xraft-core: 215 passed (was 211; +4 recovery-constructor tests)
+  - xraft-storage: 127 passed (was 112; +15 state.rs tests)
+  - all other crates: 0 tests (unchanged)
+  - 342 total tests, all green.
+- `git --no-pager diff --check` -> exit 0, no whitespace issues.
 
 ## What's still left for future iters
 
-- Stage 3.2 scope is fully implemented and the iter-5 evaluator
-  confirmed "None -- no remaining Stage 3.2 issues". This iter (6)
-  exists only to satisfy the convergence detector's checklist rule.
-- Stage 3.3 (Log Replication) is the next workstream:
-  `handle_fetch_request`, `handle_fetch_response`, leader-side
-  per-peer progress updates, and `ClientPropose` handling on the
-  leader.
+- Stage 2.2 deliverables are now live in the binary and exercised
+  by the test suite. Pending iter-3 evaluator review.
+- Stage 2.1 follow-up (WAL `append()` fsync) is a separate
+  workstream; deferred per iter-2 evaluator's own note.
+- Stage 4.x driver wiring: `xraft-server` will need a small
+  `RaftDriver::recover(data_dir)` that opens the
+  `FileHardStateStore`, loads, and constructs the node via
+  `RaftNode::new_with_initial_hard_state`. Not in scope for
+  Stage 2.2 (the driver lives in `xraft-server`, not this stage).

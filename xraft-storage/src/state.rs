@@ -3,123 +3,185 @@
 // Licensed under the MIT License.
 // -----------------------------------------------------------------------
 
-//! Persistent and in-memory implementations of the Raft hard-state store.
+//! Concrete implementations of the canonical
+//! [`xraft_core::storage::HardStateStore`] trait.
 //!
-//! The [`HardStateStore`] trait abstracts how a Raft node persists its
-//! `term`, `voted_for`, and `commit` index across restarts.  Two concrete
-//! implementations are provided:
+//! The trait + the [`HardState`] struct
+//! (`xraft_core::types::HardState { current_term, voted_for }`) live in
+//! `xraft-core` per `architecture.md` §4.1 so the consensus engine
+//! stays I/O-free; this module provides the durable file-backed
+//! implementation and an in-memory implementation used by tests and
+//! deterministic simulators.
 //!
-//! * [`MemoryHardStateStore`] – volatile, for tests.
-//! * [`FileHardStateStore`] – durable, backed by an atomic-write file.
+//! # Safety invariants enforced by every store
+//!
+//! Per `implementation-plan.md` Stage 2.2 + `architecture.md` §3.3,
+//! both [`MemoryHardStateStore`] and [`FileHardStateStore`] reject any
+//! [`persist`](xraft_core::storage::HardStateStore::persist) that would
+//! violate Raft safety:
+//!
+//! * **Term monotonicity** — the new `current_term` must be `>=` the
+//!   previously persisted term. Term regression would let a stale
+//!   leader's writes be re-acked.
+//! * **Single vote per term** — within a single term, `voted_for` may
+//!   transition from `None -> Some(x)` exactly once and may then only
+//!   be re-persisted as `Some(x)` (idempotent retries are allowed).
+//!   Switching to a different candidate in the same term, or clearing
+//!   a previously-granted vote, are both rejected.
+//! * **Term advance resets vote** — when the new term is strictly
+//!   greater, any `voted_for` is allowed (the new term carries fresh
+//!   vote eligibility).
+//!
+//! Identical invariants in both implementations means in-memory tests
+//! cannot mask safety bugs that would manifest only against the
+//! file-backed store (a hole the iter-2 evaluator flagged).
+//!
+//! # Atomic-replace pattern (cross-platform, including Windows)
+//!
+//! `FileHardStateStore::persist` uses the same recoverable-replace
+//! sequence as [`crate::FileSnapshotStore`]:
+//!
+//! 1. Write JSON to `quorum-state.tmp`, flush, `sync_all`.
+//! 2. If `quorum-state` exists, rename it to `quorum-state.bak`
+//!    (after first removing any stale `.bak`).
+//! 3. Rename `quorum-state.tmp` to `quorum-state`.
+//! 4. Remove `quorum-state.bak`.
+//! 5. Best-effort `sync_all` on the parent directory (Unix only;
+//!    Windows does not require directory fsync).
+//!
+//! Every step targets a path that does **not** exist at the moment of
+//! the call, so the sequence is portable to Windows where
+//! `MoveFileExW(REPLACE_EXISTING)` semantics are not always
+//! sharing-violation-free for in-use destinations.
+//!
+//! On `open`, the store recovers any incomplete write by inspecting
+//! the canonical / `.bak` / `.tmp` triple and restoring whichever
+//! file is the surviving committed state.
 
-use std::fs;
-use std::io::{self, Write};
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
+use tracing::{debug, warn};
+
+use xraft_core::error::{Result, XRaftError};
+use xraft_core::storage::HardStateStore;
+use xraft_core::types::HardState;
 
 // ---------------------------------------------------------------------------
-// Error types
+// File-name constants (KRaft-style `quorum-state` per tech-spec §5.3)
 // ---------------------------------------------------------------------------
 
-/// Errors that can occur when loading or persisting hard state.
-#[derive(Debug, Error)]
-pub enum HardStateError {
-    #[error("I/O error: {0}")]
-    Io(#[from] io::Error),
-
-    #[error("serialization error: {0}")]
-    Serialize(#[from] serde_json::Error),
-
-    #[error("data directory is locked by another process: {0}")]
-    Locked(PathBuf),
-}
-
-pub type Result<T> = std::result::Result<T, HardStateError>;
+const STATE_FILE_NAME: &str = "quorum-state";
+const TMP_SUFFIX: &str = ".tmp";
+const BAK_SUFFIX: &str = ".bak";
 
 // ---------------------------------------------------------------------------
-// HardState
+// On-disk envelope
 // ---------------------------------------------------------------------------
 
-/// The durable state that a Raft node must persist before responding to RPCs.
+/// Versioned wrapper persisted to `quorum-state`. Wrapping `HardState`
+/// in an envelope lets future iterations evolve the on-disk schema
+/// without breaking older snapshots: `version` is checked on load and
+/// unknown versions are surfaced as `XRaftError::Storage` rather than
+/// silently mis-deserializing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HardState {
-    /// The latest term the server has seen.
-    pub term: u64,
-
-    /// The candidate ID that received a vote in the current term (if any).
-    pub voted_for: Option<u64>,
-
-    /// The index of the highest log entry known to be committed.
-    pub commit: u64,
+struct PersistedHardState {
+    version: u32,
+    state: HardState,
 }
 
-impl Default for HardState {
-    fn default() -> Self {
-        Self {
-            term: 0,
-            voted_for: None,
-            commit: 0,
+const SCHEMA_VERSION: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// Shared validation
+// ---------------------------------------------------------------------------
+
+/// Validate that `next` is a legal Raft hard-state transition from
+/// `prev`. Both [`MemoryHardStateStore`] and [`FileHardStateStore`]
+/// call this from `persist`; sharing the helper guarantees identical
+/// semantics across implementations.
+///
+/// Returns [`XRaftError::Storage`] (the canonical error variant for
+/// storage-layer failures, including invariant violations) on rejection.
+fn validate_transition(prev: &HardState, next: &HardState) -> Result<()> {
+    // Term monotonicity --------------------------------------------------
+    if next.current_term < prev.current_term {
+        return Err(XRaftError::Storage(format!(
+            "hard-state term regression rejected: prev={}, next={}",
+            prev.current_term.0, next.current_term.0,
+        )));
+    }
+
+    // Same-term vote invariants -----------------------------------------
+    // A new (strictly higher) term resets vote eligibility, so any
+    // `voted_for` is allowed there. Only the same-term case is
+    // constrained.
+    if next.current_term == prev.current_term {
+        match (prev.voted_for, next.voted_for) {
+            // Identical re-persist (idempotent retry, e.g. on commit-
+            // index advance once that field is added) is allowed.
+            (Some(a), Some(b)) if a == b => {}
+            // Granting a fresh vote in a term that had none is allowed.
+            (None, Some(_)) => {}
+            // No-op (still unvoted in this term) is allowed.
+            (None, None) => {}
+            // Switching to a different candidate in the same term
+            // would split-vote / double-vote.
+            (Some(a), Some(b)) => {
+                return Err(XRaftError::Storage(format!(
+                    "vote already cast in term {}: prev=NodeId({}), next=NodeId({})",
+                    prev.current_term.0, a.0, b.0,
+                )));
+            }
+            // Clearing a vote within the same term would let the node
+            // re-vote for someone else after a crash + reload, which
+            // violates the single-vote-per-term invariant.
+            (Some(a), None) => {
+                return Err(XRaftError::Storage(format!(
+                    "cannot clear voted_for=NodeId({}) within term {}",
+                    a.0, prev.current_term.0,
+                )));
+            }
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Trait
-// ---------------------------------------------------------------------------
-
-/// Abstraction over durable Raft hard-state storage.
-///
-/// # Contract
-///
-/// * [`load()`](HardStateStore::load) returns `Ok(None)` when **no state has
-///   ever been persisted** (first boot).  It returns `Ok(Some(state))` when a
-///   previously-persisted state exists (crash recovery).
-/// * [`persist()`](HardStateStore::persist) durably stores the given state so
-///   that a subsequent `load()` returns `Some`.
-pub trait HardStateStore: Send + Sync {
-    /// Load the most recently persisted hard state.
-    ///
-    /// Returns `Ok(None)` if no state has been persisted yet (first boot).
-    fn load(&self) -> Result<Option<HardState>>;
-
-    /// Durably persist the given hard state.
-    fn persist(&self, state: &HardState) -> Result<()>;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // MemoryHardStateStore
 // ---------------------------------------------------------------------------
 
-/// A volatile, in-memory implementation of [`HardStateStore`].
+/// Volatile in-memory implementation of [`HardStateStore`].
 ///
-/// Useful for unit tests where durability is unnecessary.
+/// Useful for unit tests and deterministic simulation harnesses where
+/// durability is unnecessary. Enforces the same term-monotonicity and
+/// single-vote-per-term invariants as [`FileHardStateStore`] so test
+/// coverage of safety bugs does not depend on which store is wired in.
 #[derive(Debug, Default)]
 pub struct MemoryHardStateStore {
-    state: RwLock<Option<HardState>>,
+    state: Option<HardState>,
 }
 
 impl MemoryHardStateStore {
     pub fn new() -> Self {
-        Self {
-            state: RwLock::new(None),
-        }
+        Self { state: None }
     }
 }
 
 impl HardStateStore for MemoryHardStateStore {
-    fn load(&self) -> Result<Option<HardState>> {
-        let guard = self.state.read().expect("lock poisoned");
-        Ok(guard.clone())
+    fn persist(&mut self, state: &HardState) -> Result<()> {
+        if let Some(prev) = self.state.as_ref() {
+            validate_transition(prev, state)?;
+        }
+        self.state = Some(state.clone());
+        Ok(())
     }
 
-    fn persist(&self, state: &HardState) -> Result<()> {
-        let mut guard = self.state.write().expect("lock poisoned");
-        *guard = Some(state.clone());
-        Ok(())
+    fn load(&self) -> Result<Option<HardState>> {
+        Ok(self.state.clone())
     }
 }
 
@@ -127,55 +189,26 @@ impl HardStateStore for MemoryHardStateStore {
 // FileHardStateStore
 // ---------------------------------------------------------------------------
 
-/// File name used inside the state directory.
-const STATE_FILE_NAME: &str = "quorum-state";
-
-/// Lock file name used to guarantee single-process access.
-const LOCK_FILE_NAME: &str = "lock";
-
-/// Durable, file-backed implementation of [`HardStateStore`].
+/// Durable file-backed implementation of [`HardStateStore`].
 ///
-/// State is serialised as JSON and written atomically (write-to-temp then
-/// rename).  An in-memory cache avoids repeated disk reads on every
-/// `load()` call.
-///
-/// # Exclusive access
-///
-/// `open()` acquires an exclusive advisory lock on a `lock` file inside the
-/// data directory.  The lock is held for the lifetime of the store, ensuring
-/// that at most one process can operate on the same directory at a time.
-/// This prevents silent state corruption that would violate term
-/// monotonicity and the single-vote-per-term invariant.
-///
-/// # First-boot vs crash-recovery
-///
-/// `open()` inspects whether the state file already exists on disk.  If it
-/// does **not**, `load()` will return `None` until the first successful
-/// `persist()` call — honouring the trait contract that `None` means "no
-/// state was ever persisted."
+/// State is serialized as JSON to `<dir>/quorum-state` using the
+/// crash-safe atomic-replace sequence documented at the module level.
+/// An in-memory cache mirrors the on-disk state to make `load()` cheap
+/// and to drive the safety-invariant checks without an extra disk read.
 pub struct FileHardStateStore {
     /// Directory that contains the state file.
     dir: PathBuf,
 
-    /// In-memory cache of the last-known state.
-    cached: RwLock<HardState>,
-
-    /// `true` once a state file existed on disk at `open()` time **or**
-    /// `persist()` has been called at least once during this lifetime.
-    ///
-    /// When `false`, `load()` returns `None` to signal first-boot.
-    has_persisted: RwLock<bool>,
-
-    /// Exclusive lock on the data directory.  Held for the lifetime of the
-    /// store; the OS releases the advisory lock when this handle is dropped.
-    _lock_file: fs::File,
+    /// Mirror of the most recently persisted state. `None` until either
+    /// `open` recovered an existing file or `persist` succeeded once.
+    cached: Option<HardState>,
 }
 
 impl std::fmt::Debug for FileHardStateStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileHardStateStore")
             .field("dir", &self.dir)
-            .field("has_persisted", &self.has_persisted)
+            .field("cached", &self.cached)
             .finish()
     }
 }
@@ -183,124 +216,228 @@ impl std::fmt::Debug for FileHardStateStore {
 impl FileHardStateStore {
     /// Open (or create) a hard-state store rooted at `dir`.
     ///
-    /// Acquires an exclusive lock on `dir/lock` to prevent concurrent access
-    /// by another process.  Returns [`HardStateError::Locked`] if the
-    /// directory is already locked.
+    /// Creates `dir` if it does not exist. Recovers any incomplete
+    /// write left behind by a prior crash:
     ///
-    /// If a `quorum-state` file already exists in `dir`, its contents are
-    /// loaded into the in-memory cache and subsequent `load()` calls will
-    /// return `Some`.  Otherwise the cache is seeded with a default
-    /// `HardState` and `load()` returns `None` until `persist()` is called.
+    /// * If `quorum-state` exists, it is the canonical state. Any
+    ///   stale `quorum-state.bak` or `quorum-state.tmp` is removed.
+    /// * If `quorum-state` is missing but `quorum-state.bak` exists,
+    ///   the `.bak` is renamed back to canonical (this corresponds
+    ///   to a crash after step 2 but before step 3 of the atomic
+    ///   write sequence). A `tracing::warn!` records the recovery.
+    /// * If neither exists, the store starts empty and `load` returns
+    ///   `Ok(None)` until the first successful `persist`.
     pub fn open<P: AsRef<Path>>(dir: P) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
-
-        // Acquire exclusive lock before touching any data files.
-        let lock_path = dir.join(LOCK_FILE_NAME);
-        let lock_file = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)?;
-
-        lock_file.try_lock_exclusive().map_err(|_| {
-            HardStateError::Locked(dir.clone())
+        fs::create_dir_all(&dir).map_err(|e| {
+            XRaftError::Storage(format!(
+                "failed to create hard-state directory {}: {e}",
+                dir.display(),
+            ))
         })?;
 
-        let path = dir.join(STATE_FILE_NAME);
+        let final_path = dir.join(STATE_FILE_NAME);
+        let bak_path = dir.join(format!("{STATE_FILE_NAME}{BAK_SUFFIX}"));
+        let tmp_path = dir.join(format!("{STATE_FILE_NAME}{TMP_SUFFIX}"));
 
-        let (cached, has_persisted) = if path.exists() {
-            let data = fs::read_to_string(&path)?;
-            let state: HardState = serde_json::from_str(&data)?;
-            (state, true)
+        // Always remove orphan `.tmp` — partially-written temp files
+        // can never be authoritative state because they were never
+        // renamed into place.
+        if tmp_path.exists()
+            && let Err(e) = fs::remove_file(&tmp_path)
+        {
+            warn!(
+                path = %tmp_path.display(),
+                error = %e,
+                "failed to remove orphan hard-state temp file (continuing)",
+            );
+        }
+
+        // Recover from a crash between rename-existing-to-bak and
+        // rename-tmp-to-target: only `.bak` survives.
+        if !final_path.exists() && bak_path.exists() {
+            warn!(
+                path = %final_path.display(),
+                bak  = %bak_path.display(),
+                "recovering hard-state from .bak after interrupted write",
+            );
+            fs::rename(&bak_path, &final_path).map_err(|e| {
+                XRaftError::Storage(format!(
+                    "failed to recover hard-state from {}: {e}",
+                    bak_path.display(),
+                ))
+            })?;
+        } else if final_path.exists() && bak_path.exists() {
+            // Both present means the prior write completed step 3 but
+            // crashed before step 4. The canonical file is authoritative;
+            // the `.bak` is a stale prior version.
+            debug!(
+                bak = %bak_path.display(),
+                "removing stale hard-state .bak (canonical state present)",
+            );
+            if let Err(e) = fs::remove_file(&bak_path) {
+                warn!(
+                    bak = %bak_path.display(),
+                    error = %e,
+                    "failed to remove stale hard-state .bak (continuing)",
+                );
+            }
+        }
+
+        let cached = if final_path.exists() {
+            let data = fs::read_to_string(&final_path).map_err(|e| {
+                XRaftError::Storage(format!(
+                    "failed to read hard-state from {}: {e}",
+                    final_path.display(),
+                ))
+            })?;
+            let envelope: PersistedHardState = serde_json::from_str(&data).map_err(|e| {
+                XRaftError::Storage(format!(
+                    "failed to deserialize hard-state at {}: {e}",
+                    final_path.display(),
+                ))
+            })?;
+            if envelope.version != SCHEMA_VERSION {
+                return Err(XRaftError::Storage(format!(
+                    "unsupported hard-state schema version {} (expected {}) at {}",
+                    envelope.version,
+                    SCHEMA_VERSION,
+                    final_path.display(),
+                )));
+            }
+            Some(envelope.state)
         } else {
-            (HardState::default(), false)
+            None
         };
 
-        Ok(Self {
-            dir,
-            cached: RwLock::new(cached),
-            has_persisted: RwLock::new(has_persisted),
-            _lock_file: lock_file,
-        })
+        Ok(Self { dir, cached })
     }
 
-    /// Full path to the state file.
+    /// Full path to the canonical state file.
     fn state_path(&self) -> PathBuf {
         self.dir.join(STATE_FILE_NAME)
     }
 
-    /// Atomically write `state` to disk (write-tmp + rename).
+    /// Atomically write `state` to disk (write tmp + sync, swap via
+    /// `.bak`, remove `.bak`, fsync parent dir on Unix).
     fn atomic_write(&self, state: &HardState) -> Result<()> {
-        let tmp_path = self.dir.join(format!("{}.tmp", STATE_FILE_NAME));
         let final_path = self.state_path();
+        let tmp_path = self.dir.join(format!("{STATE_FILE_NAME}{TMP_SUFFIX}"));
+        let bak_path = self.dir.join(format!("{STATE_FILE_NAME}{BAK_SUFFIX}"));
 
-        let serialized = serde_json::to_string_pretty(state)?;
+        let envelope = PersistedHardState {
+            version: SCHEMA_VERSION,
+            state: state.clone(),
+        };
+        let serialized = serde_json::to_vec_pretty(&envelope)
+            .map_err(|e| XRaftError::Storage(format!("failed to serialize hard-state: {e}")))?;
 
-        let mut file = fs::File::create(&tmp_path)?;
-        file.write_all(serialized.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
+        // Step 1: write tmp + flush + fsync.
+        {
+            let mut f = File::create(&tmp_path).map_err(|e| {
+                XRaftError::Storage(format!(
+                    "failed to create temp hard-state file {}: {e}",
+                    tmp_path.display(),
+                ))
+            })?;
+            f.write_all(&serialized).map_err(|e| {
+                XRaftError::Storage(format!(
+                    "failed to write temp hard-state file {}: {e}",
+                    tmp_path.display(),
+                ))
+            })?;
+            f.sync_all().map_err(|e| {
+                XRaftError::Storage(format!(
+                    "failed to fsync temp hard-state file {}: {e}",
+                    tmp_path.display(),
+                ))
+            })?;
+        }
 
-        fs::rename(&tmp_path, &final_path)?;
+        // Step 2: clear any stale `.bak` first so a failed rename
+        // below cannot leave the directory in a state where two
+        // historical versions race for authority.
+        if bak_path.exists()
+            && let Err(e) = fs::remove_file(&bak_path)
+        {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(XRaftError::Storage(format!(
+                "failed to remove stale hard-state .bak {}: {e}",
+                bak_path.display(),
+            )));
+        }
+        if final_path.exists()
+            && let Err(e) = fs::rename(&final_path, &bak_path)
+        {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(XRaftError::Storage(format!(
+                "failed to swap hard-state to .bak ({} -> {}): {e}",
+                final_path.display(),
+                bak_path.display(),
+            )));
+        }
+
+        // Step 3: rename tmp -> canonical.
+        if let Err(e) = fs::rename(&tmp_path, &final_path) {
+            // Best-effort rollback: if we still have the .bak, put it
+            // back so the caller can retry without losing the prior
+            // committed state.
+            if bak_path.exists() {
+                let _ = fs::rename(&bak_path, &final_path);
+            }
+            let _ = fs::remove_file(&tmp_path);
+            return Err(XRaftError::Storage(format!(
+                "failed to commit hard-state ({} -> {}): {e}",
+                tmp_path.display(),
+                final_path.display(),
+            )));
+        }
+
+        // Step 4: drop the `.bak`. Failure here is non-fatal — the
+        // canonical file is already authoritative; a stale `.bak` will
+        // be cleaned up by the next `open` call.
+        if bak_path.exists()
+            && let Err(e) = fs::remove_file(&bak_path)
+        {
+            warn!(
+                bak = %bak_path.display(),
+                error = %e,
+                "failed to remove hard-state .bak after commit (will be cleaned on next open)",
+            );
+        }
+
+        // Step 5: best-effort directory fsync (Unix only). Windows
+        // does not need (and `File::open` on a directory is not
+        // supported there).
+        #[cfg(unix)]
+        {
+            if let Ok(dir_file) = File::open(&self.dir) {
+                let _ = dir_file.sync_all();
+            }
+        }
+
         Ok(())
     }
 }
 
 impl HardStateStore for FileHardStateStore {
-    fn load(&self) -> Result<Option<HardState>> {
-        let has_persisted = self.has_persisted.read().expect("lock poisoned");
-        if !*has_persisted {
-            return Ok(None);
+    fn persist(&mut self, state: &HardState) -> Result<()> {
+        // Validate BEFORE touching the filesystem so a rejected
+        // transition leaves both the cache and the disk untouched.
+        if let Some(prev) = self.cached.as_ref() {
+            validate_transition(prev, state)?;
         }
 
-        let cached = self.cached.read().expect("lock poisoned");
-        Ok(Some(cached.clone()))
-    }
-
-    fn persist(&self, state: &HardState) -> Result<()> {
         self.atomic_write(state)?;
 
-        // Update cache and mark as persisted.
-        {
-            let mut cached = self.cached.write().expect("lock poisoned");
-            *cached = state.clone();
-        }
-        {
-            let mut flag = self.has_persisted.write().expect("lock poisoned");
-            *flag = true;
-        }
-
+        // Cache update is the LAST step so a partial-write failure
+        // above does not desynchronize the in-memory mirror from disk.
+        self.cached = Some(state.clone());
         Ok(())
     }
-}
 
-// ---------------------------------------------------------------------------
-// Thread-safe wrapper
-// ---------------------------------------------------------------------------
-
-/// Cheaply cloneable, thread-safe handle to any [`HardStateStore`].
-#[derive(Clone)]
-pub struct SharedHardStateStore {
-    inner: Arc<dyn HardStateStore>,
-}
-
-impl SharedHardStateStore {
-    pub fn new<S: HardStateStore + 'static>(store: S) -> Self {
-        Self {
-            inner: Arc::new(store),
-        }
-    }
-}
-
-impl HardStateStore for SharedHardStateStore {
     fn load(&self) -> Result<Option<HardState>> {
-        self.inner.load()
-    }
-
-    fn persist(&self, state: &HardState) -> Result<()> {
-        self.inner.persist(state)
+        Ok(self.cached.clone())
     }
 }
 
@@ -312,8 +449,76 @@ impl HardStateStore for SharedHardStateStore {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use xraft_core::types::{NodeId, Term};
 
-    // -- MemoryHardStateStore -----------------------------------------------
+    fn hs(term: u64, voted_for: Option<u64>) -> HardState {
+        HardState {
+            current_term: Term(term),
+            voted_for: voted_for.map(NodeId),
+        }
+    }
+
+    // -- shared invariant matrix ----------------------------------------
+
+    /// Run the full term-monotonicity + vote-invariant test matrix
+    /// against any [`HardStateStore`] implementation. Both
+    /// [`MemoryHardStateStore`] and [`FileHardStateStore`] must pass
+    /// every case so in-memory tests cannot mask file-store-only bugs
+    /// (or vice versa).
+    fn assert_invariants<S: HardStateStore>(store: &mut S) {
+        // First persist always succeeds.
+        store.persist(&hs(1, None)).expect("first persist");
+
+        // Idempotent re-persist of identical state succeeds.
+        store.persist(&hs(1, None)).expect("idempotent re-persist");
+
+        // Granting a vote in the current term succeeds.
+        store
+            .persist(&hs(1, Some(7)))
+            .expect("first vote in term 1");
+
+        // Re-persisting the SAME vote is idempotent and succeeds.
+        store
+            .persist(&hs(1, Some(7)))
+            .expect("same-vote re-persist");
+
+        // Switching to a DIFFERENT vote in the same term is rejected.
+        let err = store
+            .persist(&hs(1, Some(8)))
+            .expect_err("same-term vote switch must fail");
+        assert!(
+            matches!(err, XRaftError::Storage(_)),
+            "expected Storage error, got: {err:?}",
+        );
+
+        // Clearing a vote in the same term is rejected.
+        let err = store
+            .persist(&hs(1, None))
+            .expect_err("same-term vote clear must fail");
+        assert!(
+            matches!(err, XRaftError::Storage(_)),
+            "expected Storage error, got: {err:?}",
+        );
+
+        // Term advance with a DIFFERENT vote is allowed.
+        store
+            .persist(&hs(2, Some(8)))
+            .expect("higher-term different vote");
+
+        // Term advance with NO vote is allowed.
+        store.persist(&hs(3, None)).expect("higher-term no vote");
+
+        // Term regression (3 -> 2) is rejected.
+        let err = store
+            .persist(&hs(2, None))
+            .expect_err("term regression must fail");
+        assert!(
+            matches!(err, XRaftError::Storage(_)),
+            "expected Storage error, got: {err:?}",
+        );
+    }
+
+    // -- MemoryHardStateStore -------------------------------------------
 
     #[test]
     fn memory_store_load_returns_none_before_persist() {
@@ -323,138 +528,212 @@ mod tests {
 
     #[test]
     fn memory_store_round_trip() {
-        let store = MemoryHardStateStore::new();
-        let state = HardState {
-            term: 3,
-            voted_for: Some(7),
-            commit: 42,
-        };
-        store.persist(&state).unwrap();
-        assert_eq!(store.load().unwrap(), Some(state));
+        let mut store = MemoryHardStateStore::new();
+        let s = hs(3, Some(7));
+        store.persist(&s).unwrap();
+        assert_eq!(store.load().unwrap(), Some(s));
     }
 
-    // -- FileHardStateStore -------------------------------------------------
+    #[test]
+    fn memory_store_enforces_invariants() {
+        let mut store = MemoryHardStateStore::new();
+        assert_invariants(&mut store);
+    }
+
+    // -- FileHardStateStore ---------------------------------------------
 
     #[test]
     fn file_store_load_returns_none_on_fresh_directory() {
         let tmp = TempDir::new().unwrap();
         let store = FileHardStateStore::open(tmp.path()).unwrap();
-
-        // No state file exists yet — trait contract requires None.
         assert_eq!(store.load().unwrap(), None);
     }
 
     #[test]
     fn file_store_round_trip() {
         let tmp = TempDir::new().unwrap();
-        let store = FileHardStateStore::open(tmp.path()).unwrap();
+        let mut store = FileHardStateStore::open(tmp.path()).unwrap();
+        let s = hs(5, Some(2));
+        store.persist(&s).unwrap();
+        assert_eq!(store.load().unwrap(), Some(s));
+    }
 
-        let state = HardState {
-            term: 5,
-            voted_for: Some(2),
-            commit: 99,
-        };
-        store.persist(&state).unwrap();
-        assert_eq!(store.load().unwrap(), Some(state));
+    #[test]
+    fn file_store_enforces_invariants() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = FileHardStateStore::open(tmp.path()).unwrap();
+        assert_invariants(&mut store);
     }
 
     #[test]
     fn file_store_survives_reopen() {
         let tmp = TempDir::new().unwrap();
+        let s = hs(10, Some(4));
 
-        let state = HardState {
-            term: 10,
-            voted_for: None,
-            commit: 200,
-        };
-
-        // Persist, drop, reopen.
         {
-            let store = FileHardStateStore::open(tmp.path()).unwrap();
-            store.persist(&state).unwrap();
+            let mut store = FileHardStateStore::open(tmp.path()).unwrap();
+            store.persist(&s).unwrap();
         }
 
         let store = FileHardStateStore::open(tmp.path()).unwrap();
-        assert_eq!(store.load().unwrap(), Some(state));
+        assert_eq!(store.load().unwrap(), Some(s));
     }
 
     #[test]
-    fn file_store_reopen_with_existing_file_returns_some() {
+    fn file_store_repeated_persist_succeeds_on_windows_and_unix() {
+        // The iter-2 evaluator flagged a Windows-portability bug where
+        // a second `fs::rename(tmp, path)` with `path` already present
+        // would fail. The atomic-replace pattern here is portable;
+        // exercise it explicitly with multiple persists.
         let tmp = TempDir::new().unwrap();
+        let mut store = FileHardStateStore::open(tmp.path()).unwrap();
 
-        let state = HardState {
-            term: 1,
-            voted_for: Some(1),
-            commit: 0,
-        };
+        for term in 1..=20u64 {
+            let s = hs(term, Some(term % 3 + 1));
+            store
+                .persist(&s)
+                .expect("repeated persist must succeed on every supported platform");
+            assert_eq!(store.load().unwrap(), Some(s));
+        }
+    }
 
-        // First lifetime — persist state.
+    #[test]
+    fn file_store_recovers_from_bak_when_canonical_missing() {
+        // Simulate a crash between step 2 (rename canonical -> .bak)
+        // and step 3 (rename tmp -> canonical) of the atomic-write
+        // sequence by hand-staging the directory.
+        let tmp = TempDir::new().unwrap();
+        let s = hs(7, Some(3));
+
+        // First persist a valid state, then rename canonical -> .bak
+        // and verify recovery on reopen.
         {
-            let store = FileHardStateStore::open(tmp.path()).unwrap();
-            store.persist(&state).unwrap();
+            let mut store = FileHardStateStore::open(tmp.path()).unwrap();
+            store.persist(&s).unwrap();
         }
+        let canonical = tmp.path().join(STATE_FILE_NAME);
+        let bak = tmp.path().join(format!("{STATE_FILE_NAME}{BAK_SUFFIX}"));
+        fs::rename(&canonical, &bak).unwrap();
+        assert!(!canonical.exists(), "precondition: canonical removed");
+        assert!(bak.exists(), "precondition: .bak staged");
 
-        // Second lifetime — load should return Some (crash-recovery path).
         let store = FileHardStateStore::open(tmp.path()).unwrap();
-        let loaded = store.load().unwrap();
-        assert!(loaded.is_some(), "existing file ⇒ Some on reload");
-        assert_eq!(loaded.unwrap(), state);
+        assert_eq!(store.load().unwrap(), Some(s));
+        assert!(canonical.exists(), ".bak must be promoted to canonical");
+        assert!(!bak.exists(), ".bak must be consumed by recovery");
     }
 
     #[test]
-    fn file_store_rejects_concurrent_open() {
+    fn file_store_keeps_canonical_when_both_canonical_and_bak_present() {
+        // Simulate a crash AFTER step 3 (rename tmp -> canonical) but
+        // BEFORE step 4 (remove .bak): both files exist; canonical is
+        // the authoritative one.
         let tmp = TempDir::new().unwrap();
+        let new_state = hs(5, Some(2));
+        let stale_state = hs(3, Some(9));
 
-        // First open succeeds and holds the lock.
-        let _store1 = FileHardStateStore::open(tmp.path()).unwrap();
+        let canonical = tmp.path().join(STATE_FILE_NAME);
+        let bak = tmp.path().join(format!("{STATE_FILE_NAME}{BAK_SUFFIX}"));
 
-        // Second open on the same directory must fail.
-        let result = FileHardStateStore::open(tmp.path());
-        assert!(result.is_err(), "concurrent open must be rejected");
-        match result.unwrap_err() {
-            HardStateError::Locked(path) => {
-                assert_eq!(path, tmp.path().to_path_buf());
-            }
-            other => panic!("expected Locked error, got: {other}"),
-        }
-    }
-
-    #[test]
-    fn file_store_lock_released_on_drop() {
-        let tmp = TempDir::new().unwrap();
-
-        let state = HardState {
-            term: 42,
-            voted_for: Some(1),
-            commit: 10,
+        // Stage canonical = new_state (newer, authoritative).
+        let canonical_envelope = PersistedHardState {
+            version: SCHEMA_VERSION,
+            state: new_state.clone(),
         };
+        fs::write(
+            &canonical,
+            serde_json::to_vec_pretty(&canonical_envelope).unwrap(),
+        )
+        .unwrap();
 
-        // Open, persist, drop — lock must be released.
-        {
-            let store = FileHardStateStore::open(tmp.path()).unwrap();
-            store.persist(&state).unwrap();
-        }
+        // Stage .bak = stale_state (older, must be discarded).
+        let bak_envelope = PersistedHardState {
+            version: SCHEMA_VERSION,
+            state: stale_state,
+        };
+        fs::write(&bak, serde_json::to_vec_pretty(&bak_envelope).unwrap()).unwrap();
 
-        // Re-opening must succeed now that the first store is dropped.
         let store = FileHardStateStore::open(tmp.path()).unwrap();
-        assert_eq!(store.load().unwrap(), Some(state));
+        assert_eq!(
+            store.load().unwrap(),
+            Some(new_state),
+            "open must prefer canonical over stale .bak",
+        );
+        assert!(!bak.exists(), "stale .bak must be cleaned up on open");
     }
 
-    // -- SharedHardStateStore -----------------------------------------------
+    #[test]
+    fn file_store_removes_orphan_tmp_on_open() {
+        // A leftover `quorum-state.tmp` from a crash before step 3
+        // can never be authoritative. `open` must scrub it.
+        let tmp = TempDir::new().unwrap();
+        let tmp_path = tmp.path().join(format!("{STATE_FILE_NAME}{TMP_SUFFIX}"));
+        fs::write(&tmp_path, b"not-yet-committed").unwrap();
+        assert!(tmp_path.exists());
+
+        let store = FileHardStateStore::open(tmp.path()).unwrap();
+        assert!(!tmp_path.exists(), "orphan .tmp must be removed on open");
+        assert_eq!(store.load().unwrap(), None);
+    }
 
     #[test]
-    fn shared_wrapper_delegates() {
-        let inner = MemoryHardStateStore::new();
-        let shared = SharedHardStateStore::new(inner);
+    fn file_store_rejects_unknown_schema_version() {
+        let tmp = TempDir::new().unwrap();
+        let canonical = tmp.path().join(STATE_FILE_NAME);
+        // Future-version envelope an older binary cannot understand.
+        let envelope = serde_json::json!({
+            "version": 9999,
+            "state": { "current_term": 1, "voted_for": null },
+        });
+        fs::write(&canonical, envelope.to_string()).unwrap();
 
-        assert_eq!(shared.load().unwrap(), None);
+        let err =
+            FileHardStateStore::open(tmp.path()).expect_err("unknown schema version must error");
+        assert!(matches!(err, XRaftError::Storage(_)));
+    }
 
-        let state = HardState {
-            term: 1,
-            voted_for: None,
-            commit: 0,
-        };
-        shared.persist(&state).unwrap();
-        assert_eq!(shared.load().unwrap(), Some(state));
+    #[test]
+    fn file_store_rejects_corrupt_json() {
+        let tmp = TempDir::new().unwrap();
+        let canonical = tmp.path().join(STATE_FILE_NAME);
+        fs::write(&canonical, b"{not-valid-json").unwrap();
+
+        let err = FileHardStateStore::open(tmp.path()).expect_err("corrupt JSON must error");
+        assert!(matches!(err, XRaftError::Storage(_)));
+    }
+
+    #[test]
+    fn file_store_default_first_boot_matches_hard_state_default() {
+        // Per implementation-plan Stage 2.2: "fallback to default
+        // initial state (term=0, voted_for=None)". The trait contract
+        // returns Ok(None) for missing state; the driver maps that to
+        // HardState::default().
+        let tmp = TempDir::new().unwrap();
+        let store = FileHardStateStore::open(tmp.path()).unwrap();
+        assert_eq!(store.load().unwrap(), None);
+        assert_eq!(HardState::default(), hs(0, None));
+    }
+
+    #[test]
+    fn file_store_validation_runs_before_disk_write() {
+        // A rejected persist must leave the on-disk state untouched
+        // so subsequent loads still return the prior valid state.
+        let tmp = TempDir::new().unwrap();
+        let mut store = FileHardStateStore::open(tmp.path()).unwrap();
+
+        let good = hs(5, Some(2));
+        store.persist(&good).unwrap();
+
+        // Term regression — must fail and leave good state intact.
+        let _ = store
+            .persist(&hs(3, None))
+            .expect_err("term regression must fail");
+        assert_eq!(store.load().unwrap(), Some(good.clone()));
+
+        // Reopen and verify on-disk state is also the good one
+        // (proves validation ran before atomic_write touched disk).
+        drop(store);
+        let store = FileHardStateStore::open(tmp.path()).unwrap();
+        assert_eq!(store.load().unwrap(), Some(good));
     }
 }
