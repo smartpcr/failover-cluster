@@ -79,7 +79,31 @@ pub enum NodeRole {
 /// Only `current_term` and `voted_for` are persisted; `commit_index` and
 /// `last_applied` are volatile and rebuilt from the log on recovery
 /// (per `architecture.md` §3.3 / `implementation-plan.md` Stage 1.2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` returns the canonical first-boot state: `Term(0)` with no
+/// vote granted. The Stage 2.2 `HardStateStore::load` contract returns
+/// `Ok(None)` when no state has ever been persisted; the driver maps
+/// that to `HardState::default()` before constructing a `RaftNode`.
+///
+/// # Stage 2.2 acceptance scenarios (plan lines 95-110)
+///
+/// This type is the value object exchanged across the
+/// [`crate::storage::HardStateStore`] trait boundary. Three named
+/// scenarios pin its observable behavior end-to-end:
+///
+/// * `state-persistence` -- `HardState { current_term: Term(5), voted_for: Some(NodeId(3)) }`
+///   persisted, store dropped, store reopened, `load` returns the same
+///   value byte-for-byte.
+/// * `atomic-write-safety` -- a crash mid-`persist` leaves the previous
+///   durable `HardState` loadable; no partial-write residue is observable
+///   on the next `load`.
+/// * `term-monotonicity` -- `persist(HardState { current_term: Term(5), .. })`
+///   followed by `persist(HardState { current_term: Term(3), .. })`
+///   returns an error and leaves the term-5 state intact.
+///
+/// Plan-named acceptance tests live in
+/// `xraft-storage/tests/persistent_raft_state_acceptance.rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HardState {
     pub current_term: Term,
     pub voted_for: Option<NodeId>,

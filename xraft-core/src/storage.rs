@@ -31,10 +31,65 @@ pub trait LogStore: Send + Sync {
 }
 
 /// Persistent hard state (term + vote).
+///
+/// # Stage 2.2 contract (`docs/stories/failover-cluster-XRAFT/implementation-plan.md` lines 95-110)
+///
+/// Implementations of this trait are the durability boundary for Raft's
+/// safety-critical voting state and MUST honor the following invariants:
+///
+/// 1. **State persistence (round-trip)** -- after `persist(&HardState { current_term: Term(5), voted_for: Some(NodeId(3)) })`
+///    completes successfully, a subsequent `load()` (in the same process
+///    or after a restart against the same data directory) MUST return
+///    `Ok(Some(state))` where `state.current_term == Term(5)` and
+///    `state.voted_for == Some(NodeId(3))`.
+/// 2. **Term monotonicity** -- once `persist` has accepted a state with
+///    `current_term == Term(5)`, any subsequent `persist` call with a
+///    smaller `current_term` (e.g. `Term(3)`) MUST be rejected with an
+///    error and MUST NOT mutate the persisted state.
+/// 3. **Atomic write** -- a crash mid-`persist` MUST leave the previously
+///    durable state intact and loadable. Implementations achieve this
+///    via tmp-file + atomic-replace + recovery-on-open semantics
+///    (see `xraft-storage::FileHardStateStore` in the sibling crate;
+///    intentionally not an intra-doc link because `xraft-core` does
+///    not depend on `xraft-storage`).
+/// 4. **First-boot semantics** -- before any successful `persist`, `load`
+///    MUST return `Ok(None)`. Drivers map that to `HardState::default()`
+///    (Term(0), no vote) when constructing a `RaftNode`.
+/// 5. **Single vote per term** -- per `implementation-plan.md` line 102
+///    ("voted_for is only set once per term"), within a single
+///    `current_term` the persisted `voted_for` may transition
+///    `None -> Some(node_a)` exactly once and may then only be
+///    re-persisted as `Some(node_a)` (idempotent retries are allowed).
+///    Persisting `Some(node_b)` where `b != a` at the same term MUST
+///    be rejected; clearing the vote (`Some(node_a) -> None`) within
+///    the same term MUST also be rejected. A strictly-greater
+///    `current_term` resets vote eligibility (any `voted_for` is then
+///    allowed). The `xraft-storage` tests cover this in
+///    `memory_store_enforces_invariants`,
+///    `file_store_enforces_invariants`, and the plan-named
+///    `stage_2_2_acceptance_term_monotonicity_and_vote_invariants_match_plan`.
+///
+/// Both `xraft-storage::FileHardStateStore` (production) and
+/// `xraft-storage::MemoryHardStateStore` (test) implement these
+/// invariants. The plan-named acceptance tests live in
+/// `xraft-storage/tests/persistent_raft_state_acceptance.rs`
+/// (`plan_state_persistence_term_5_voted_for_3`,
+/// `plan_atomic_write_safety_quorum_state_recoverable`,
+/// `plan_term_monotonicity_term_5_then_3_errors`,
+/// `plan_first_boot_load_returns_none_on_empty_dir`,
+/// `plan_single_vote_per_term_rejects_conflicting_votes_at_same_term`).
 pub trait HardStateStore: Send + Sync {
     /// Persist the hard state to durable storage.
+    ///
+    /// MUST be atomic with respect to crashes (see trait-level docs,
+    /// invariant 3), MUST reject term regressions (invariant 2), and
+    /// MUST reject same-term vote conflicts (invariant 5).
     fn persist(&mut self, state: &HardState) -> Result<()>;
     /// Load the most recently persisted hard state.
+    ///
+    /// Returns `Ok(None)` on a fresh data directory (invariant 4) and
+    /// `Ok(Some(state))` after any prior successful `persist`
+    /// (invariant 1).
     fn load(&self) -> Result<Option<HardState>>;
 }
 

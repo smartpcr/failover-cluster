@@ -327,7 +327,7 @@ impl RaftNode {
     /// degrading into an unable-to-elect state.
     pub fn new(config: ClusterConfig) -> Result<Self> {
         let mut rng = StdRng::from_entropy();
-        Self::new_inner(config, &mut rng)
+        Self::new_inner(config, &mut rng, HardState::default())
     }
 
     /// Create a new `RaftNode` with a deterministic RNG seed. Intended for
@@ -335,10 +335,54 @@ impl RaftNode {
     /// as [`new`](Self::new).
     pub fn new_with_seed(config: ClusterConfig, seed: u64) -> Result<Self> {
         let mut rng = StdRng::seed_from_u64(seed);
-        Self::new_inner(config, &mut rng)
+        Self::new_inner(config, &mut rng, HardState::default())
     }
 
-    fn new_inner<R: RngCore + ?Sized>(config: ClusterConfig, rng: &mut R) -> Result<Self> {
+    /// Create a new `RaftNode` recovered from a previously persisted
+    /// [`HardState`]. The election timer is randomised from system
+    /// entropy. The node starts in `Follower` role at the recovered
+    /// term + vote so the first tick does not race with a stale leader.
+    ///
+    /// This is the production-driver constructor for Stage 2.2 hard-state
+    /// recovery. The driver is responsible for opening the
+    /// [`HardStateStore`](crate::storage::HardStateStore), calling
+    /// [`HardStateStore::load`](crate::storage::HardStateStore::load),
+    /// and mapping the returned `Option<HardState>` to either
+    /// [`HardState::default`] (first boot) or the recovered value.
+    /// Keeping the `load` call in the driver preserves the
+    /// `xraft-core` no-I/O invariant per `architecture.md` §4.1.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`new`](Self::new): config / voter-set validation
+    /// errors are surfaced at construction time.
+    pub fn new_with_initial_hard_state(
+        config: ClusterConfig,
+        hard_state: HardState,
+    ) -> Result<Self> {
+        let mut rng = StdRng::from_entropy();
+        Self::new_inner(config, &mut rng, hard_state)
+    }
+
+    /// Recovery constructor with a deterministic RNG seed. Intended for
+    /// tests and deterministic simulation harnesses that need both a
+    /// recovered hard state and reproducible election-timer behaviour.
+    /// Same error semantics as [`new_with_initial_hard_state`](
+    /// Self::new_with_initial_hard_state).
+    pub fn new_with_seed_and_initial_hard_state(
+        config: ClusterConfig,
+        seed: u64,
+        hard_state: HardState,
+    ) -> Result<Self> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        Self::new_inner(config, &mut rng, hard_state)
+    }
+
+    fn new_inner<R: RngCore + ?Sized>(
+        config: ClusterConfig,
+        rng: &mut R,
+        hard_state: HardState,
+    ) -> Result<Self> {
         // Validate the full configuration first so any misconfiguration is
         // surfaced as a typed `XRaftError::Config` rather than silently
         // degrading the engine into an unable-to-elect state.
@@ -365,10 +409,7 @@ impl RaftNode {
         Ok(Self {
             id: config.node_id,
             role: NodeRole::Follower,
-            hard_state: HardState {
-                current_term: Term(0),
-                voted_for: None,
-            },
+            hard_state,
             commit_index: LogIndex(0),
             last_applied: LogIndex(0),
             election_timer,
@@ -2584,17 +2625,6 @@ port = 6000
             max_log_entries_before_compaction: 100_000,
             data_dir: std::path::PathBuf::from("data"),
             snapshot_retention_count: 3,
-            tls_enabled: false,
-            tls_cert_path: None,
-            tls_key_path: None,
-            tls_ca_path: None,
-            tls_domain_name: None,
-            connect_timeout_ms: 5_000,
-            rpc_timeout_ms: 10_000,
-            max_rpc_retries: 3,
-            retry_initial_backoff_ms: 100,
-            retry_max_backoff_ms: 5_000,
-            max_message_size: 64 * 1024 * 1024,
         };
         let err = RaftNode::new_with_seed(cfg, 1).expect_err(
             "RaftNode::new_with_seed must propagate invalid voter config as Err, \
@@ -4759,5 +4789,124 @@ port = 6004
             !any_fetch,
             "back-to-back Ticks must not double-schedule a fetch"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 2.2 scenario: hard-state recovery on construction
+    //
+    // The driver opens the HardStateStore, calls load(), and passes the
+    // result into RaftNode::new_with_initial_hard_state (or its seeded
+    // variant). The node must come up at the recovered term + vote so
+    // it does not vote for a stale candidate after restart.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn new_with_initial_hard_state_recovers_term_and_vote() {
+        let recovered = HardState {
+            current_term: Term(7),
+            voted_for: Some(NodeId(2)),
+        };
+        let node = RaftNode::new_with_seed_and_initial_hard_state(
+            three_voter_config(),
+            42,
+            recovered.clone(),
+        )
+        .unwrap();
+
+        // Recovered term + vote are present on the node.
+        assert_eq!(node.current_term(), Term(7));
+        assert_eq!(node.hard_state.voted_for, Some(NodeId(2)));
+        assert_eq!(node.hard_state, recovered);
+
+        // Recovery still produces a Follower (no auto-promote).
+        assert_eq!(node.role, NodeRole::Follower);
+        assert!(!node.is_leader());
+        assert!(node.leader_id.is_none());
+
+        // Volatile state still resets per architecture.md §3.3:
+        // commit_index / last_applied / last_log_* are NOT recovered
+        // from the hard state; they are rebuilt from the WAL/snapshot.
+        assert_eq!(node.commit_index, LogIndex(0));
+        assert_eq!(node.last_applied, LogIndex(0));
+        assert_eq!(node.last_log_index, LogIndex(0));
+        assert_eq!(node.last_log_term, Term(0));
+    }
+
+    #[test]
+    fn new_with_initial_hard_state_default_matches_fresh_node() {
+        // HardState::default() is the canonical first-boot state
+        // (term=0, voted_for=None) per implementation-plan Stage 2.2.
+        // Recovery with the default must be observationally equivalent
+        // to `new` / `new_with_seed`, so a driver that always calls
+        // the recovery constructor (with `load()?.unwrap_or_default()`)
+        // does not need a special-case for first boot.
+        let fresh = RaftNode::new_with_seed(three_voter_config(), 42).unwrap();
+        let recovered = RaftNode::new_with_seed_and_initial_hard_state(
+            three_voter_config(),
+            42,
+            HardState::default(),
+        )
+        .unwrap();
+
+        assert_eq!(fresh.current_term(), recovered.current_term());
+        assert_eq!(fresh.hard_state, recovered.hard_state);
+        assert_eq!(fresh.role, recovered.role);
+    }
+
+    #[test]
+    fn new_with_initial_hard_state_propagates_config_errors() {
+        // Same error semantics as `new` / `new_with_seed`: a config
+        // that would fail validation must still error at construction
+        // time even on the recovery path. Bypass `from_toml_str` (which
+        // performs its own UUID validation) by constructing the
+        // `ClusterConfig` struct directly with a malformed
+        // `directory_id`, mirroring `new_returns_err_on_invalid_voter_directory_id`.
+        let cfg = ClusterConfig {
+            node_id: NodeId(1),
+            cluster_id: "test".into(),
+            listen_addr: "0.0.0.0:6000".into(),
+            peers: Vec::new(),
+            voters: vec![VoterConfig {
+                node_id: 1,
+                directory_id: "not-a-valid-uuid".into(),
+                host: "node1".into(),
+                port: 6000,
+            }],
+            election_timeout_min_ms: 100,
+            election_timeout_max_ms: 200,
+            fetch_interval_ms: 50,
+            tick_interval_ms: 10,
+            snapshot_interval: 10_000,
+            max_log_entries_before_compaction: 100_000,
+            data_dir: std::path::PathBuf::from("data"),
+            snapshot_retention_count: 3,
+        };
+        let recovered = HardState {
+            current_term: Term(3),
+            voted_for: None,
+        };
+        let err = RaftNode::new_with_seed_and_initial_hard_state(cfg, 1, recovered)
+            .expect_err("invalid config must propagate as Err on the recovery path");
+        assert!(
+            matches!(err, XRaftError::Config(_)),
+            "expected XRaftError::Config, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn new_with_initial_hard_state_recovers_term_without_vote() {
+        // Mid-term restart where this node had not voted yet:
+        // only the term is bumped, voted_for stays None. The node
+        // must NOT regress to term 0 (which would let it vote for
+        // a stale candidate).
+        let recovered = HardState {
+            current_term: Term(12),
+            voted_for: None,
+        };
+        let node =
+            RaftNode::new_with_seed_and_initial_hard_state(three_voter_config(), 7, recovered)
+                .unwrap();
+        assert_eq!(node.current_term(), Term(12));
+        assert_eq!(node.hard_state.voted_for, None);
     }
 }

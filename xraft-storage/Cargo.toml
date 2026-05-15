@@ -10,6 +10,8 @@ workspace = true
 xraft-core = { path = "../xraft-core" }
 bincode.workspace = true
 bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 crc32fast = "1"
 
