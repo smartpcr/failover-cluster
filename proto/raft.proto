@@ -118,6 +118,13 @@ message SnapshotMetadata {
   // rejects messages where voter_set is missing or contains zero voters.
   VoterSet voter_set           = 3;
   string   snapshot_id         = 4;
+  // Size of the snapshot payload data in bytes. Populated by the snapshot
+  // store on save/load; absent for in-memory bootstrap markers.
+  optional uint64 size_bytes   = 5;
+  // CRC32 checksum of the snapshot payload data, zero-extended to u64.
+  // Populated by the snapshot store on save/load; absent for in-memory
+  // bootstrap markers.
+  optional uint64 checksum     = 6;
 }
 
 message FetchSnapshotRequest {
@@ -130,7 +137,9 @@ message FetchSnapshotRequest {
 message FetchSnapshotChunk {
   string cluster_id            = 1;
   uint64 leader_epoch          = 2;
-  uint32 chunk_index           = 3;
+  // u64 to support pathological chunk counts (very large snapshots with
+  // small chunk sizes) without overflow — matches `SnapshotChunkItem`.
+  uint64 chunk_index           = 3;
   bytes  data                  = 4;
   bool   done                  = 5;
   optional SnapshotMetadata metadata = 6;

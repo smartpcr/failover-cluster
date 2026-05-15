@@ -285,7 +285,9 @@ pub struct FetchSnapshotRequest {
 pub struct FetchSnapshotChunk {
     pub cluster_id: String,
     pub leader_epoch: u64,
-    pub chunk_index: u32,
+    /// Zero-based chunk index. `u64` to mirror `SnapshotChunkItem.chunk_index`
+    /// and the wire schema (`uint64 chunk_index = 3` in proto/raft.proto).
+    pub chunk_index: u64,
     pub data: Vec<u8>,
     /// True when this is the final chunk.
     pub done: bool,
@@ -466,11 +468,9 @@ impl TryFrom<&Entry> for proto::LogEntry {
                 (proto::EntryType::Config as i32, data)
             }
             EntryPayload::Snapshot(_) => {
-                return Err(
-                    "EntryPayload::Snapshot is an in-memory compaction marker \
+                return Err("EntryPayload::Snapshot is an in-memory compaction marker \
                      and must not be serialised to the wire"
-                        .to_string(),
-                );
+                    .to_string());
             }
         };
         Ok(Self {
@@ -601,6 +601,8 @@ impl TryFrom<&SnapshotMeta> for proto::SnapshotMetadata {
             last_included_term: m.last_included_term.0,
             voter_set: Some(voter_set),
             snapshot_id: m.id.clone(),
+            size_bytes: m.size_bytes,
+            checksum: m.checksum,
         })
     }
 }
@@ -652,6 +654,8 @@ impl TryFrom<proto::SnapshotMetadata> for SnapshotMeta {
             last_included_term: Term(p.last_included_term),
             id: p.snapshot_id,
             voter_set: Some(voter_set),
+            size_bytes: p.size_bytes,
+            checksum: p.checksum,
         })
     }
 }
@@ -879,7 +883,10 @@ mod tests {
         let rt = Entry::try_from(decoded).unwrap();
         assert_eq!(rt.index, LogIndex(42));
         assert_eq!(rt.term, Term(3));
-        assert_eq!(rt.payload, EntryPayload::Command(Bytes::from_static(b"hello")));
+        assert_eq!(
+            rt.payload,
+            EntryPayload::Command(Bytes::from_static(b"hello"))
+        );
     }
 
     #[test]
@@ -928,6 +935,8 @@ mod tests {
                 last_included_term: Term(0),
                 id: "snap".into(),
                 voter_set: None,
+                size_bytes: None,
+                checksum: None,
             }),
         };
         let result = proto::LogEntry::try_from(&entry);
@@ -1025,6 +1034,8 @@ mod tests {
             last_included_term: Term(5),
             id: "snap-42".into(),
             voter_set: Some(vs.clone()),
+            size_bytes: Some(4096),
+            checksum: Some(0xDEAD_BEEF),
         };
         let proto_meta = proto::SnapshotMetadata::try_from(&meta).unwrap();
         let mut buf = Vec::new();
@@ -1035,6 +1046,30 @@ mod tests {
         assert_eq!(rt.last_included_term, Term(5));
         assert_eq!(rt.id, "snap-42");
         assert_eq!(rt.voter_set.as_ref().unwrap(), &vs);
+        assert_eq!(rt.size_bytes, Some(4096));
+        assert_eq!(rt.checksum, Some(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn proto_roundtrip_snapshot_metadata_without_optional_fields() {
+        // size_bytes and checksum are optional on the wire; when absent on the
+        // Rust side they MUST decode back as None (not silently 0).
+        let vs = make_voter_set();
+        let meta = SnapshotMeta {
+            last_included_index: LogIndex(7),
+            last_included_term: Term(1),
+            id: "snap-no-opts".into(),
+            voter_set: Some(vs),
+            size_bytes: None,
+            checksum: None,
+        };
+        let proto_meta = proto::SnapshotMetadata::try_from(&meta).unwrap();
+        let mut buf = Vec::new();
+        proto_meta.encode(&mut buf).unwrap();
+        let decoded = proto::SnapshotMetadata::decode(buf.as_slice()).unwrap();
+        let rt = SnapshotMeta::try_from(decoded).unwrap();
+        assert_eq!(rt.size_bytes, None);
+        assert_eq!(rt.checksum, None);
     }
 
     #[test]
@@ -1047,14 +1082,13 @@ mod tests {
             last_included_term: Term(3),
             id: "snap-empty".into(),
             voter_set: None,
+            size_bytes: None,
+            checksum: None,
         };
         let result = proto::SnapshotMetadata::try_from(&meta);
         assert!(result.is_err(), "expected serialisation error");
         let err = result.unwrap_err();
-        assert!(
-            err.contains("voter_set is None"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("voter_set is None"), "unexpected error: {err}");
     }
 
     #[test]
@@ -1067,11 +1101,16 @@ mod tests {
             last_included_term: 3,
             voter_set: None,
             snapshot_id: "snap-missing".into(),
+            size_bytes: None,
+            checksum: None,
         };
         let result = SnapshotMeta::try_from(p);
         assert!(result.is_err(), "expected decode error");
         let err = result.unwrap_err();
-        assert!(err.contains("voter_set is missing"), "unexpected error: {err}");
+        assert!(
+            err.contains("voter_set is missing"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1084,14 +1123,13 @@ mod tests {
             last_included_term: 3,
             voter_set: Some(proto::VoterSet { voters: vec![] }),
             snapshot_id: "snap-empty".into(),
+            size_bytes: None,
+            checksum: None,
         };
         let result = SnapshotMeta::try_from(p);
         assert!(result.is_err(), "expected decode error");
         let err = result.unwrap_err();
-        assert!(
-            err.contains("zero voters"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("zero voters"), "unexpected error: {err}");
     }
 
     #[test]
@@ -1121,6 +1159,8 @@ mod tests {
             last_included_term: Term(5),
             id: "snap-42".into(),
             voter_set: Some(vs),
+            size_bytes: Some(128),
+            checksum: Some(0xCAFEBABE),
         };
         let chunk = FetchSnapshotChunk {
             cluster_id: "c".into(),
@@ -1142,6 +1182,8 @@ mod tests {
         let rt_meta = rt.metadata.unwrap();
         assert_eq!(rt_meta.last_included_index, meta.last_included_index);
         assert_eq!(rt_meta.id, "snap-42");
+        assert_eq!(rt_meta.size_bytes, Some(128));
+        assert_eq!(rt_meta.checksum, Some(0xCAFEBABE));
     }
 
     #[test]
@@ -1178,6 +1220,8 @@ mod tests {
                 last_included_term: Term(1),
                 id: "bad".into(),
                 voter_set: None,
+                size_bytes: None,
+                checksum: None,
             }),
         };
         let result = proto::FetchSnapshotChunk::try_from(&chunk);
@@ -1189,7 +1233,10 @@ mod tests {
         // Verify all three entry types roundtrip with correct discriminants
         let vs = make_voter_set();
         let entries: Vec<(proto::EntryType, EntryPayload)> = vec![
-            (proto::EntryType::Command, EntryPayload::Command(Bytes::from_static(b"cmd"))),
+            (
+                proto::EntryType::Command,
+                EntryPayload::Command(Bytes::from_static(b"cmd")),
+            ),
             (proto::EntryType::NoOp, EntryPayload::NoOp),
             (proto::EntryType::Config, EntryPayload::ConfigChange(vs)),
         ];
@@ -1222,7 +1269,11 @@ mod tests {
         };
         let result = Entry::try_from(bad_entry);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unknown entry_type discriminant: 99"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("unknown entry_type discriminant: 99")
+        );
     }
 
     #[test]
@@ -1282,6 +1333,10 @@ mod tests {
         };
         let result = Entry::try_from(bad_config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("failed to deserialise VoterSet"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("failed to deserialise VoterSet")
+        );
     }
 }
