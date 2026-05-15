@@ -1,0 +1,15 @@
+# Rust source files: HEAD blobs in this Windows-checkout repo were committed
+# with CRLF endings. cargo fmt always writes LF on output, which produces a
+# noisy whole-file diff every time formatting runs. To keep diffs reviewable,
+# we preserve CRLF on .rs files on disk so they match the index, and we tell
+# git's whitespace checker that CR before LF is part of the line terminator
+# (cr-at-eol) rather than trailing whitespace. The other default whitespace
+# checks (blank-at-eol, space-before-tab, blank-at-eof) remain in force.
+*.rs whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+*.proto whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+
+# Protobuf sources: same Windows-checkout situation — HEAD blobs are CRLF, so
+# any newly inserted lines preserve CRLF to match the surrounding file. Apply
+# the same cr-at-eol exception so `git diff --check` does not flag CR-before-LF
+# on edited lines as trailing whitespace.
+*.proto whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
