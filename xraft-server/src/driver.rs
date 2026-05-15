@@ -4,7 +4,7 @@
 //! pluggable [`LogStore`](xraft_core::storage::LogStore),
 //! [`HardStateStore`](xraft_core::storage::HardStateStore),
 //! [`SnapshotStore`](xraft_core::storage::SnapshotStore),
-//! [`StateMachineCallback`](xraft_core::state_machine::StateMachineCallback),
+//! [`StateMachine`](xraft_core::state_machine::StateMachine),
 //! and [`Transport`](xraft_core::transport::Transport) backends. Its
 //! event loop pumps inputs from five sources via `tokio::select!`:
 //!
@@ -51,7 +51,7 @@ use xraft_core::message::{
     FetchSnapshotRequest, Input, OutboundMessage, PreVoteRequest, PreVoteResponse, VoteRequest,
     VoteResponse,
 };
-use xraft_core::state_machine::StateMachineCallback;
+use xraft_core::state_machine::StateMachine;
 use xraft_core::storage::{HardStateStore, LogStore, SnapshotStore};
 use xraft_core::transport::{RaftMessageHandler, SnapshotChunkStream, Transport};
 use xraft_core::types::{LogIndex, NodeId, NodeRole, Term};
@@ -400,11 +400,7 @@ impl<T: Transport + Send + Sync + 'static> MessageRouter<T> {
     /// [`DriverConfig`] via
     /// [`MessageRouter::new_with_fetch_snapshot_deadline`].
     pub fn new(transport: Arc<T>, tx: mpsc::Sender<OutboundResult>) -> Self {
-        Self::new_with_fetch_snapshot_deadline(
-            transport,
-            tx,
-            Self::DEFAULT_FETCH_SNAPSHOT_DEADLINE,
-        )
+        Self::new_with_fetch_snapshot_deadline(transport, tx, Self::DEFAULT_FETCH_SNAPSHOT_DEADLINE)
     }
 
     /// Construct a new `MessageRouter` with an explicit
@@ -693,7 +689,7 @@ where
     L: LogStore + Send + 'static,
     HS: HardStateStore + Send + 'static,
     SS: SnapshotStore + Send + 'static,
-    SM: StateMachineCallback + Send + Sync + 'static,
+    SM: StateMachine + Send + Sync + 'static,
 {
     node: RaftNode,
     log_store: L,
@@ -726,7 +722,7 @@ where
     L: LogStore + Send + 'static,
     HS: HardStateStore + Send + 'static,
     SS: SnapshotStore + Send + 'static,
-    SM: StateMachineCallback + Send + Sync + 'static,
+    SM: StateMachine + Send + Sync + 'static,
 {
     /// Construct a new driver.
     pub fn new(
@@ -1487,17 +1483,27 @@ where
             let mut apply_err: Option<XRaftError> = None;
             match &entry.payload {
                 EntryPayload::Command(bytes) => {
-                    if let Err(e) = self.state_machine.apply(entry.index, bytes) {
-                        error!(
-                            target: "xraft_server::driver",
-                            error = %e,
-                            index = %entry.index,
-                            "state machine apply failed"
-                        );
-                        apply_err = Some(XRaftError::Storage(format!(
-                            "state machine apply at {} failed: {e}",
-                            entry.index
-                        )));
+                    // The `StateMachine::apply` contract returns the
+                    // serialised command result (see `xraft-core`
+                    // `state_machine.rs` doc-comment). Stage 5.1 does not
+                    // yet pipe that result back to the proposing client —
+                    // that wiring belongs to the embedded-read / propose-
+                    // result work in a later stage — so we discard the
+                    // bytes here while still honouring the error path.
+                    match self.state_machine.apply(entry.index, bytes) {
+                        Ok(_result) => {}
+                        Err(e) => {
+                            error!(
+                                target: "xraft_server::driver",
+                                error = %e,
+                                index = %entry.index,
+                                "state machine apply failed"
+                            );
+                            apply_err = Some(XRaftError::Storage(format!(
+                                "state machine apply at {} failed: {e}",
+                                entry.index
+                            )));
+                        }
                     }
                 }
                 EntryPayload::NoOp | EntryPayload::ConfigChange(_) | EntryPayload::Snapshot(_) => {
@@ -2036,10 +2042,13 @@ mod tests {
         }
     }
 
-    impl StateMachineCallback for TestStateMachine {
-        fn apply(&mut self, index: LogIndex, entry: &[u8]) -> XResult<()> {
-            self.applied.lock().unwrap().push((index, entry.to_vec()));
-            Ok(())
+    impl StateMachine for TestStateMachine {
+        fn apply(&mut self, index: LogIndex, command: &[u8]) -> XResult<Vec<u8>> {
+            self.applied.lock().unwrap().push((index, command.to_vec()));
+            Ok(Vec::new())
+        }
+        fn query(&self, _query: &[u8]) -> XResult<Vec<u8>> {
+            Ok(Vec::new())
         }
         fn snapshot(&self) -> XResult<Vec<u8>> {
             Ok(Vec::new())
@@ -3466,8 +3475,7 @@ port = 6012
         // Tight deadline so the test exercises the timeout path quickly
         // under the paused runtime's auto-advance.
         let deadline = Duration::from_millis(50);
-        let mut router =
-            MessageRouter::new_with_fetch_snapshot_deadline(transport, tx, deadline);
+        let mut router = MessageRouter::new_with_fetch_snapshot_deadline(transport, tx, deadline);
 
         router.dispatch(
             NodeId(2),
@@ -3499,9 +3507,7 @@ port = 6012
                     "expected deadline-exceeded error message, got: {err}"
                 );
             }
-            other => panic!(
-                "expected OutboundResult::Error (drain timeout), got {other:?}"
-            ),
+            other => panic!("expected OutboundResult::Error (drain timeout), got {other:?}"),
         }
 
         // The router's in-flight count must drop back to zero once the
