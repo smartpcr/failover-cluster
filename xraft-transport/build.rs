@@ -52,6 +52,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".xraft.DivergingEpoch",
             "::xraft_core::message::proto::DivergingEpoch",
         ),
+        (
+            ".xraft.SnapshotRedirect",
+            "::xraft_core::message::proto::SnapshotRedirect",
+        ),
         (".xraft.Endpoint", "::xraft_core::message::proto::Endpoint"),
         (
             ".xraft.VoterRecord",

@@ -159,6 +159,14 @@ impl LogStore for MemoryLogStore {
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
+
+    fn purge_prefix(&mut self, through_index_inclusive: LogIndex) -> Result<()> {
+        // Volatile store: dropping in-memory entries is the entire
+        // purge. Idempotent — entries.retain on an already-purged
+        // store is a cheap no-op walk.
+        self.entries.retain(|e| e.index > through_index_inclusive);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -175,13 +183,23 @@ pub const DEFAULT_MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 
 const SEGMENT_EXT: &str = "wal";
 
+/// Sidecar marker file holding the durable low-watermark
+/// (`first_valid_index`) for a [`FileLogStore`]. Entries with
+/// `index <= first_valid_index` are treated as compacted and never
+/// surface from reads or recovery — restart-safe prefix purge.
+///
+/// Format: 8 little-endian bytes encoding `first_valid_index.0` as a
+/// `u64`. Written via `fsync` before any segment-level purge so that a
+/// crash mid-purge leaves the store in a state that suppresses
+/// resurrected entries on the next recovery.
+const PURGE_MARKER_FILE: &str = "purge.idx";
+
 /// Fixed byte overhead per entry: index(8) + term(8) + tag(1) + payload_len(4).
 const ENTRY_HEADER_LEN: usize = 21;
 
 /// Metadata for a single WAL segment file.
 #[derive(Debug)]
 struct SegmentInfo {
-    #[expect(dead_code)]
     base_index: LogIndex,
     path: PathBuf,
 }
@@ -206,6 +224,11 @@ pub struct FileLogStore {
     /// Maps each entry to its physical location: `(segment_vec_index, byte_offset)`.
     offsets: BTreeMap<LogIndex, (usize, u64)>,
     max_segment_size: u64,
+    /// Durable low-watermark: all entries with `index <= first_valid_index`
+    /// have been logically removed by a prior [`LogStore::purge_prefix`]
+    /// call. Persisted to [`PURGE_MARKER_FILE`] and consulted during
+    /// recovery so segment frames that span the cut never resurface.
+    first_valid_index: LogIndex,
 }
 
 // Manual impls not required — all fields are `Send + Sync`.
@@ -232,13 +255,62 @@ impl FileLogStore {
             entries: BTreeMap::new(),
             offsets: BTreeMap::new(),
             max_segment_size,
+            first_valid_index: LogIndex(0),
         };
 
+        store.load_purge_marker()?;
         store.recover()?;
         Ok(store)
     }
 
     // -- recovery ----------------------------------------------------------
+
+    /// Load the durable purge low-watermark from the sidecar marker file.
+    ///
+    /// Missing file is treated as `first_valid_index = LogIndex(0)`
+    /// (no purge ever issued). Corrupt or short content errors out so
+    /// the operator notices rather than silently resurrecting compacted
+    /// entries.
+    fn load_purge_marker(&mut self) -> Result<()> {
+        let path = self.dir.join(PURGE_MARKER_FILE);
+        if !path.exists() {
+            return Ok(());
+        }
+        let buf = fs::read(&path).map_err(io_to_storage)?;
+        if buf.len() != 8 {
+            return Err(storage_err(format!(
+                "purge marker {} has wrong length: {} (expected 8)",
+                path.display(),
+                buf.len(),
+            )));
+        }
+        let value = u64::from_le_bytes(buf.try_into().unwrap());
+        self.first_valid_index = LogIndex(value);
+        Ok(())
+    }
+
+    /// Atomically persist `first_valid_index` to the sidecar marker file.
+    ///
+    /// Writes through a `tmp` file + rename so a crash mid-write cannot
+    /// leave a torn marker. Synced before rename so the on-disk state
+    /// is durable before returning.
+    fn persist_purge_marker(&self) -> Result<()> {
+        let final_path = self.dir.join(PURGE_MARKER_FILE);
+        let tmp_path = self.dir.join(format!("{PURGE_MARKER_FILE}.tmp"));
+        {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp_path)
+                .map_err(io_to_storage)?;
+            f.write_all(&self.first_valid_index.0.to_le_bytes())
+                .map_err(io_to_storage)?;
+            f.sync_all().map_err(io_to_storage)?;
+        }
+        fs::rename(&tmp_path, &final_path).map_err(io_to_storage)?;
+        Ok(())
+    }
 
     /// Scan existing segment files, replay valid frames, and truncate any
     /// corrupt tail on the last segment.
@@ -288,9 +360,20 @@ impl FileLogStore {
             let frame_start = cursor;
             match Self::decode_frame(&buf, cursor) {
                 Ok((entry, next)) => {
-                    self.offsets
-                        .insert(entry.index, (seg_idx, frame_start as u64));
-                    self.entries.insert(entry.index, entry);
+                    // Stage 5.3 restart-safe prefix purge: a previously
+                    // issued `purge_prefix(through)` persisted
+                    // `first_valid_index = through`, so any segment frame
+                    // covering an index `<= first_valid_index` is a dead
+                    // remnant and must NOT be exposed to readers. Skip it
+                    // entirely — we do not record it in `entries` /
+                    // `offsets`, so `get`, `get_range`, `term_at`,
+                    // `last_index`, `last_term` all behave as if the
+                    // entry no longer exists.
+                    if entry.index > self.first_valid_index {
+                        self.offsets
+                            .insert(entry.index, (seg_idx, frame_start as u64));
+                        self.entries.insert(entry.index, entry);
+                    }
                     cursor = next;
                 }
                 Err(_) if is_last => {
@@ -612,6 +695,96 @@ impl LogStore for FileLogStore {
         if let Some(ref w) = self.active_writer {
             w.sync_all().map_err(io_to_storage)?;
         }
+        Ok(())
+    }
+
+    fn purge_prefix(&mut self, through_index_inclusive: LogIndex) -> Result<()> {
+        // Idempotent: a same-or-lower watermark means a previous purge
+        // (or the all-zero default) already covered this range; nothing
+        // to do.
+        if through_index_inclusive <= self.first_valid_index {
+            return Ok(());
+        }
+
+        // Step 1 (durability-first): persist the new low-watermark
+        // BEFORE we drop any in-memory state or touch segment files.
+        // A crash between this step and the in-memory purge leaves the
+        // store correct: on restart, `load_purge_marker` reads the new
+        // value and `recover_segment` skips any frame `<= through`. The
+        // dead frames remain on disk (reclaimed by Stage 6.2 segment GC)
+        // but never surface to readers.
+        let new_floor = through_index_inclusive;
+        let prior_floor = self.first_valid_index;
+        self.first_valid_index = new_floor;
+        if let Err(e) = self.persist_purge_marker() {
+            // Roll back the in-memory floor so a retry can attempt the
+            // marker write again without the in-memory state having
+            // already diverged.
+            self.first_valid_index = prior_floor;
+            return Err(e);
+        }
+
+        // Step 2: drop in-memory entries / offsets at or below the new
+        // floor. After this, the public read API (`get`, `get_range`,
+        // `term_at`, `last_index`, `last_term`) treats those entries
+        // as if they never existed.
+        let drop_keys: Vec<LogIndex> = self
+            .entries
+            .range(..=through_index_inclusive)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in &drop_keys {
+            self.entries.remove(k);
+            self.offsets.remove(k);
+        }
+
+        // Step 3 (best-effort durable reclaim): delete every NON-active
+        // segment whose entire index range is `<= through`. Two segments
+        // s_i and s_{i+1} bracket s_i's max index at `s_{i+1}.base_index - 1`,
+        // so `s_i` is fully covered iff `s_{i+1}.base_index <= through + 1`.
+        // The active (last) segment is never deleted here — it would
+        // invalidate `active_writer` and is owned by the append path; if
+        // its frames are fully covered they'll be dropped on the next
+        // rotation. Either way the purge marker plus the in-memory
+        // filtering guarantees correctness regardless of physical
+        // segment reclaim.
+        if self.segments.len() > 1 {
+            let active_seg_idx = self.segments.len() - 1;
+            let mut delete_until: Option<usize> = None;
+            for i in 0..active_seg_idx {
+                let next_base = self.segments[i + 1].base_index;
+                // s_i fully covered iff its max entry index <= through.
+                // max entry index in s_i = s_{i+1}.base_index - 1
+                if next_base.0 == 0 || next_base.0.saturating_sub(1) <= through_index_inclusive.0 {
+                    delete_until = Some(i);
+                } else {
+                    break;
+                }
+            }
+            if let Some(last_to_drop) = delete_until {
+                // Remove segments[0..=last_to_drop] from disk and from
+                // the in-memory segment vec, then rebuild the offsets
+                // map's segment-index references to reflect the shift.
+                let drop_count = last_to_drop + 1;
+                let dropped: Vec<SegmentInfo> = self.segments.drain(0..drop_count).collect();
+                for seg in dropped {
+                    let _ = fs::remove_file(&seg.path);
+                }
+                // Shift surviving offsets' seg_idx by `-drop_count`.
+                // (No offsets survive in `[0..drop_count]` because we
+                // also purged in-memory entries above; but defensively
+                // walk the map.)
+                let mut new_offsets: BTreeMap<LogIndex, (usize, u64)> = BTreeMap::new();
+                for (idx, (seg_idx, byte_off)) in self.offsets.iter() {
+                    let shifted = seg_idx
+                        .checked_sub(drop_count)
+                        .expect("offset for surviving entry must reference a kept segment");
+                    new_offsets.insert(*idx, (shifted, *byte_off));
+                }
+                self.offsets = new_offsets;
+            }
+        }
+
         Ok(())
     }
 }
@@ -1028,6 +1201,148 @@ mod tests {
 
         let mut log = MemoryLogStore::new();
         let result = log.append(&[entry]);
-        assert!(result.is_err(), "Snapshot entries must be rejected by MemoryLogStore");
+        assert!(
+            result.is_err(),
+            "Snapshot entries must be rejected by MemoryLogStore"
+        );
+    }
+
+    // ---- purge_prefix --------------------------------------------------
+
+    /// MemoryLogStore: after `purge_prefix(N)`, entries at indices
+    /// `<= N` must not be reachable via `get`, and entries `> N`
+    /// remain intact. Volatile store has no restart concern.
+    #[test]
+    fn memory_purge_prefix_drops_only_covered_entries() {
+        let mut log = MemoryLogStore::new();
+        let entries: Vec<Entry> = (1..=10).map(|i| make_entry(i, 1)).collect();
+        log.append(&entries).unwrap();
+
+        log.purge_prefix(LogIndex(5)).unwrap();
+
+        for i in 1..=5 {
+            assert!(
+                log.get(LogIndex(i)).unwrap().is_none(),
+                "entry {i} <= purge floor must be gone",
+            );
+        }
+        for i in 6..=10 {
+            assert!(
+                log.get(LogIndex(i)).unwrap().is_some(),
+                "entry {i} > purge floor must remain",
+            );
+        }
+        assert_eq!(log.last_index(), LogIndex(10));
+    }
+
+    /// MemoryLogStore: `purge_prefix` is idempotent and a lower
+    /// watermark does not re-resurrect previously purged entries.
+    #[test]
+    fn memory_purge_prefix_idempotent_and_monotonic() {
+        let mut log = MemoryLogStore::new();
+        log.append(&(1..=10).map(|i| make_entry(i, 1)).collect::<Vec<_>>())
+            .unwrap();
+
+        log.purge_prefix(LogIndex(5)).unwrap();
+        // Re-issuing a lower floor is a no-op — purged entries stay gone.
+        log.purge_prefix(LogIndex(3)).unwrap();
+        for i in 1..=5 {
+            assert!(log.get(LogIndex(i)).unwrap().is_none());
+        }
+        // Re-issuing the same floor is a no-op.
+        log.purge_prefix(LogIndex(5)).unwrap();
+        for i in 1..=5 {
+            assert!(log.get(LogIndex(i)).unwrap().is_none());
+        }
+        // Advancing the floor purges more.
+        log.purge_prefix(LogIndex(7)).unwrap();
+        for i in 1..=7 {
+            assert!(log.get(LogIndex(i)).unwrap().is_none());
+        }
+        for i in 8..=10 {
+            assert!(log.get(LogIndex(i)).unwrap().is_some());
+        }
+    }
+
+    /// FileLogStore: after `purge_prefix(N)` and a restart, entries
+    /// at indices `<= N` MUST NOT resurface from WAL replay. This is
+    /// the durability contract — without the `purge.idx` marker,
+    /// `recover_segment` would re-load every frame on disk and the
+    /// store would silently undo the prefix purge.
+    #[test]
+    fn file_purge_prefix_survives_restart() {
+        let dir = test_dir("file_purge_prefix_survives_restart");
+        {
+            let mut log = FileLogStore::open(&dir).unwrap();
+            let entries: Vec<Entry> = (1..=10).map(|i| make_entry(i, 1)).collect();
+            log.append(&entries).unwrap();
+            log.flush().unwrap();
+            log.purge_prefix(LogIndex(5)).unwrap();
+            assert!(log.get(LogIndex(5)).unwrap().is_none());
+            assert!(log.get(LogIndex(6)).unwrap().is_some());
+        }
+        // Reopen — purge marker must be replayed so entries 1..=5
+        // stay invisible even though the on-disk WAL frames may
+        // still encode them (Stage 6.2 segment GC reclaims later).
+        let log = FileLogStore::open(&dir).unwrap();
+        for i in 1..=5 {
+            assert!(
+                log.get(LogIndex(i)).unwrap().is_none(),
+                "entry {i} <= purge floor MUST stay purged across restart",
+            );
+            assert!(
+                log.term_at(LogIndex(i)).unwrap().is_none(),
+                "term_at({i}) MUST also stay None across restart",
+            );
+        }
+        for i in 6..=10 {
+            assert!(
+                log.get(LogIndex(i)).unwrap().is_some(),
+                "entry {i} > purge floor MUST be preserved across restart",
+            );
+        }
+        assert_eq!(log.last_index(), LogIndex(10));
+    }
+
+    /// FileLogStore: when an entire non-active segment is fully
+    /// covered by the new floor, `purge_prefix` reclaims it on disk
+    /// (best-effort) while preserving the surviving suffix. The
+    /// active segment is never deleted — its frames are dropped via
+    /// the marker filter, not by file removal.
+    #[test]
+    fn file_purge_prefix_reclaims_fully_covered_segments() {
+        let dir = test_dir("file_purge_prefix_reclaims_fully_covered_segments");
+        // Small segment size so multiple segments are created across
+        // the appends (each entry's serialised size > 32, so 100-byte
+        // segment forces frequent rotation).
+        let mut log = FileLogStore::open_with_max_segment_size(&dir, 100).unwrap();
+        let entries: Vec<Entry> = (1..=20).map(|i| make_entry(i, 1)).collect();
+        log.append(&entries).unwrap();
+        log.flush().unwrap();
+
+        // Purge entries 1..=15. After the call, the surviving
+        // entries 16..=20 must still be reachable.
+        log.purge_prefix(LogIndex(15)).unwrap();
+        for i in 1..=15 {
+            assert!(log.get(LogIndex(i)).unwrap().is_none());
+        }
+        for i in 16..=20 {
+            let e = log.get(LogIndex(i)).unwrap().unwrap();
+            assert_eq!(e.index, LogIndex(i));
+        }
+        assert_eq!(log.last_index(), LogIndex(20));
+
+        // Reopen and verify the surviving suffix still loads correctly
+        // even if the dropped segments are gone.
+        drop(log);
+        let log = FileLogStore::open_with_max_segment_size(&dir, 100).unwrap();
+        for i in 1..=15 {
+            assert!(log.get(LogIndex(i)).unwrap().is_none());
+        }
+        for i in 16..=20 {
+            let e = log.get(LogIndex(i)).unwrap().unwrap();
+            assert_eq!(e.index, LogIndex(i));
+        }
+        assert_eq!(log.last_index(), LogIndex(20));
     }
 }
