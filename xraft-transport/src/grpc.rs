@@ -394,9 +394,8 @@ impl<H: RaftMessageHandler> Transport for GrpcTransport<H> {
             // the bind happens before `serve_inner`, not before the
             // caller's `tokio::spawn(transport.start_server())`.
             let std_listener = bind_grpc_listener(&self.config.listen_addr)?;
-            let listener = tokio::net::TcpListener::from_std(std_listener).map_err(|e| {
-                XRaftError::Transport(format!("tokio TcpListener::from_std: {e}"))
-            })?;
+            let listener = tokio::net::TcpListener::from_std(std_listener)
+                .map_err(|e| XRaftError::Transport(format!("tokio TcpListener::from_std: {e}")))?;
             self.serve_inner(listener).await
         }
     }

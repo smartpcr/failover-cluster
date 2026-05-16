@@ -354,13 +354,72 @@ pub struct Server;
 impl Server {
     /// Start the server with the default [`NoOpStateMachine`].
     pub async fn start(cfg: ServerConfig) -> XResult<ServerHandle> {
-        Self::start_with_state_machine(cfg, NoOpStateMachine).await
+        Self::start_inner(cfg, NoOpStateMachine, None).await
+    }
+
+    /// Start the server with the default [`NoOpStateMachine`] over
+    /// a caller-supplied **already-bound** `std::net::TcpListener`
+    /// for the gRPC port.
+    ///
+    /// Mirrors [`xraft_transport::grpc::GrpcTransport::start_server_with_listener`]
+    /// one level up the stack so callers (test harnesses,
+    /// systemd-socket-activated operator binaries) can bind the
+    /// listener separately and hand it in. The supplied listener
+    /// MUST correspond to `cfg.cluster.listen_addr`: when
+    /// `cluster.listen_addr` carries a non-zero concrete port, the
+    /// listener's `local_addr().port()` must match it; otherwise
+    /// `Server::start` returns a typed `XRaftError::Config` rather
+    /// than silently serving on a port the rest of the cluster
+    /// cannot reach. A `:0` ephemeral port in the config string is
+    /// accepted unconditionally (the listener's bound port becomes
+    /// the effective one).
+    ///
+    /// Eliminates the TOCTOU race a "pick a port, drop the
+    /// listener, then ask `Server::start` to re-bind that port"
+    /// pattern is exposed to under parallel test load: the listener
+    /// is bound exactly once and never released between the
+    /// allocation and serve steps.
+    pub async fn start_with_listener(
+        cfg: ServerConfig,
+        grpc_listener: std::net::TcpListener,
+    ) -> XResult<ServerHandle> {
+        Self::start_inner(cfg, NoOpStateMachine, Some(grpc_listener)).await
     }
 
     /// Start the server with a caller-supplied state machine.
     pub async fn start_with_state_machine<SM>(
         cfg: ServerConfig,
+        state_machine: SM,
+    ) -> XResult<ServerHandle>
+    where
+        SM: StateMachine + Send + Sync + 'static,
+    {
+        Self::start_inner(cfg, state_machine, None).await
+    }
+
+    /// Start the server with a caller-supplied state machine AND a
+    /// pre-bound gRPC `TcpListener`. See [`Server::start_with_listener`]
+    /// for the listener-passthrough contract.
+    pub async fn start_with_state_machine_and_listener<SM>(
+        cfg: ServerConfig,
+        state_machine: SM,
+        grpc_listener: std::net::TcpListener,
+    ) -> XResult<ServerHandle>
+    where
+        SM: StateMachine + Send + Sync + 'static,
+    {
+        Self::start_inner(cfg, state_machine, Some(grpc_listener)).await
+    }
+
+    /// Shared body for all four public start entry points. The
+    /// `grpc_listener` parameter selects between the legacy
+    /// "bind synchronously from `cluster.listen_addr`" path
+    /// (`None`) and the new "consume a caller-supplied pre-bound
+    /// listener" path (`Some`).
+    async fn start_inner<SM>(
+        cfg: ServerConfig,
         mut state_machine: SM,
+        grpc_listener: Option<std::net::TcpListener>,
     ) -> XResult<ServerHandle>
     where
         SM: StateMachine + Send + Sync + 'static,
@@ -769,7 +828,47 @@ impl Server {
         // entry point accepted them. The previous
         // `cluster.listen_addr.parse::<SocketAddr>()` step rejected
         // hostnames before any DNS resolution was attempted.
-        let std_listener = bind_grpc_listener(&cluster.listen_addr)?;
+        //
+        // When the caller supplied a pre-bound listener (via
+        // [`Server::start_with_listener`] / the
+        // `_and_listener` variant), skip the bind entirely and adopt
+        // it. We still validate the listener's local port against any
+        // non-zero concrete port in `cluster.listen_addr` so a
+        // misconfigured caller surfaces a typed `Config` error rather
+        // than serving on a port the peers cannot reach. A `:0`
+        // ephemeral port in the config string is accepted
+        // unconditionally — the listener's actually-bound port is
+        // logged below and surfaces via `ServerHandle::grpc_listen_addr`.
+        let std_listener = if let Some(l) = grpc_listener {
+            let bound_port = l
+                .local_addr()
+                .map_err(|e| {
+                    XRaftError::Transport(format!("provided gRPC listener local_addr: {e}"))
+                })?
+                .port();
+            let cfg_port = cluster
+                .listen_addr
+                .rsplit(':')
+                .next()
+                .and_then(|s| s.parse::<u16>().ok());
+            if let Some(p) = cfg_port
+                && p != 0
+                && p != bound_port
+            {
+                return Err(XRaftError::Config(format!(
+                    "pre-bound gRPC listener port ({bound_port}) does not match the port \
+                     parsed from cluster.listen_addr ('{}', port {p}); the listener and \
+                     the cluster config must agree so peers reach the same port",
+                    cluster.listen_addr
+                )));
+            }
+            l.set_nonblocking(true).map_err(|e| {
+                XRaftError::Transport(format!("set_nonblocking on pre-bound gRPC listener: {e}"))
+            })?;
+            l
+        } else {
+            bind_grpc_listener(&cluster.listen_addr)?
+        };
         let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(|e| XRaftError::Transport(format!("tokio TcpListener::from_std: {e}")))?;
         let grpc_listen = tokio_listener

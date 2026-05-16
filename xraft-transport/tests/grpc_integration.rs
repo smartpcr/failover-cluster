@@ -82,6 +82,15 @@ struct StubHandler {
     /// `fetch_snapshot_mid_stream_transport_error_evicts_channel` to
     /// drive the client's eviction policy through a real wire path.
     fetch_snapshot_mid_stream_error: AtomicBool,
+    /// When true, `handle_fetch` returns an `XRaftError::Transport`
+    /// instead of a real response. The server adapter maps that to
+    /// `Status::unavailable`, which is the retriable code that drives
+    /// the client's *unary*-path channel-eviction policy. Paired with
+    /// `unary_retriable_status_evicts_cached_channel` to prove that
+    /// the documented unary eviction path (per `grpc_client.rs` retry
+    /// loop, `self.invalidate(peer).await`) actually fires through a
+    /// real wire round-trip — not just the mid-stream variant.
+    fetch_always_fails: AtomicBool,
 }
 
 impl StubHandler {
@@ -125,6 +134,18 @@ impl RaftMessageHandler for StubHandler {
     }
 
     async fn handle_fetch(&self, req: FetchRequest) -> XResult<FetchResponse> {
+        // Synthetic transport-class failure path. The server adapter
+        // maps `XRaftError::Transport` to `Status::unavailable`, which
+        // is exactly the retriable status the client's unary retry
+        // loop keys off of for channel eviction. We count the call
+        // BEFORE returning so the test can assert the server saw the
+        // attempt even though it deliberately failed.
+        if self.fetch_always_fails.load(Ordering::SeqCst) {
+            self.fetch_calls.fetch_add(1, Ordering::SeqCst);
+            return Err(xraft_core::error::XRaftError::Transport(
+                "synthetic fetch failure for eviction test".to_string(),
+            ));
+        }
         // bump after capturing the previous value so test responses can
         // verify per-call distinctness via `high_watermark`.
         let prev = self.fetch_calls.fetch_add(1, Ordering::SeqCst);
@@ -1073,4 +1094,243 @@ async fn fetch_snapshot_mid_stream_transport_error_evicts_channel() {
 
     shutdown.notify_one();
     srv_handle.await.unwrap().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: unary-retriable-status-evicts-cached-channel
+// ---------------------------------------------------------------------------
+//
+// The unary RPC retry loop documented in `grpc_client.rs` (≈line 410)
+// calls `self.invalidate(peer).await` on every retriable status, so the
+// next attempt dials a fresh channel rather than reusing a half-broken
+// one. This was only proven for the *mid-stream* path
+// (`fetch_snapshot_mid_stream_transport_error_evicts_channel`); the
+// unary path was relying on doc + code inspection. This test drives the
+// behaviour end-to-end through a real wire round-trip:
+//
+//  1. Send a successful Vote so the per-peer channel is cached
+//     (`pool_size == 1`).
+//  2. Flip the stub to return `XRaftError::Transport` from `handle_fetch`,
+//     which the server adapter maps to `Status::unavailable`.
+//  3. Send a Fetch with `max_retries == 0` — the client sees the
+//     retriable status once, evicts the cached channel, and surfaces
+//     the failure (no retry).
+//  4. Assert `pool_size == 0`, proving the eviction fired.
+
+#[tokio::test]
+async fn unary_retriable_status_evicts_cached_channel() {
+    let port = pick_free_port();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let endpoint = format!("http://127.0.0.1:{port}");
+
+    let handler = StubHandler::new();
+    let (shutdown, srv_handle) = spawn_plain_server(addr, handler.clone());
+    wait_for_listening(addr, Duration::from_secs(2)).await;
+
+    // No retries: we only want to observe the eviction triggered by the
+    // FIRST retriable status, not the subsequent reconnect.
+    let mut cfg = client_config(endpoint);
+    cfg.max_retries = 0;
+    let client = RaftGrpcClient::new(cfg);
+
+    // Warm the pool with one successful RPC so the assertion below
+    // proves *eviction* (not "channel never existed").
+    let _ = client
+        .send_vote(NodeId(SERVER_NODE_ID), sample_vote_request())
+        .await
+        .expect("warm-up vote succeeds");
+    assert_eq!(
+        client.pool_size().await,
+        1,
+        "successful Vote populates the per-peer channel cache"
+    );
+
+    // Flip the handler to fail every subsequent Fetch with a
+    // `XRaftError::Transport` — the server adapter maps that to
+    // `Status::unavailable`, the canonical retriable code.
+    handler.fetch_always_fails.store(true, Ordering::SeqCst);
+
+    let err = client
+        .send_fetch(NodeId(SERVER_NODE_ID), sample_fetch_request(101))
+        .await
+        .expect_err("Fetch must surface the retriable transport failure");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Fetch RPC"),
+        "error must name the failing RPC: {msg}"
+    );
+    assert!(
+        msg.contains("unavailable") || msg.contains("Unavailable"),
+        "error must surface the underlying tonic status: {msg}"
+    );
+
+    // The eviction MUST have run as part of the retry-loop branch
+    // documented in `grpc_client.rs`. With max_retries == 0 the loop
+    // immediately returns Err *after* invalidating, so the pool is
+    // empty by the time we observe it here.
+    assert_eq!(
+        client.pool_size().await,
+        0,
+        "retriable unary status must evict the cached channel"
+    );
+    // Server actually saw the bad call (proves the failure was on the
+    // server response path, not a client-side short-circuit).
+    assert_eq!(
+        handler.fetch_calls.load(Ordering::SeqCst),
+        1,
+        "server saw exactly one Fetch attempt"
+    );
+
+    shutdown.notify_one();
+    srv_handle.await.unwrap().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: start-server-with-listener (pre-bound socket API)
+// ---------------------------------------------------------------------------
+//
+// `GrpcTransport::start_server_with_listener` is the entry point
+// production bootstrap (`xraft_server::Server::start`) uses so that
+//   (a) bind failures surface BEFORE any task is spawned, and
+//   (b) ephemeral-port (`:0`) requests can be inspected via
+//       `listener.local_addr()` before the gRPC server begins
+//       serving.
+//
+// The brief's `start_server` step covers the in-trait entry point
+// (which this test still exercises indirectly via `wait_for_listening`),
+// but the pre-bound variant was relying on type-checking alone. This
+// test drives a full RPC against a listener bound by the test itself
+// to prove the path is wired correctly.
+
+#[tokio::test]
+async fn start_server_with_listener_serves_on_pre_bound_socket() {
+    // Bind synchronously here (mimicking the production bootstrap
+    // path). The actual port is captured AFTER bind, demonstrating
+    // the ephemeral-port use case.
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    std_listener.set_nonblocking(true).expect("set_nonblocking");
+    let actual_addr = std_listener.local_addr().expect("local_addr");
+    let port = actual_addr.port();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::from_std(std_listener).expect("tokio from_std");
+
+    let handler = StubHandler::new();
+    let cluster = ClusterConfig {
+        cluster_id: TEST_CLUSTER_ID.to_string(),
+        node_id: NodeId(SERVER_NODE_ID),
+        // Listen addr in the config is ignored on this path — the
+        // pre-bound listener wins. Set to ":0" to make that explicit.
+        listen_addr: "127.0.0.1:0".to_string(),
+        peers: Vec::new(),
+        voters: vec![
+            xraft_core::config::VoterConfig {
+                node_id: SERVER_NODE_ID,
+                directory_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+            },
+            xraft_core::config::VoterConfig {
+                node_id: CLIENT_NODE_ID,
+                directory_id: "00000000-0000-0000-0000-000000000002".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: pick_free_port(),
+            },
+        ],
+        election_timeout_min_ms: 150,
+        election_timeout_max_ms: 300,
+        fetch_interval_ms: 50,
+        tick_interval_ms: 10,
+        snapshot_interval: 10_000,
+        max_log_entries_before_compaction: 100_000,
+        data_dir: std::path::PathBuf::from("data"),
+        snapshot_retention_count: 3,
+        tls_enabled: false,
+        tls_cert_path: None,
+        tls_key_path: None,
+        tls_ca_path: None,
+        tls_domain_name: None,
+        connect_timeout_ms: 2_000,
+        rpc_timeout_ms: 5_000,
+        max_rpc_retries: 3,
+        retry_initial_backoff_ms: 50,
+        retry_max_backoff_ms: 400,
+        max_message_size: 64 * 1024 * 1024,
+        observers: vec![],
+        enable_check_quorum: true,
+        enable_leader_lease: false,
+        check_quorum_interval_ms: None,
+    };
+    let server_cfg = GrpcTransportConfig::from_cluster_config(&cluster)
+        .expect("from_cluster_config accepts ephemeral listen_addr");
+    let server_transport: Arc<GrpcTransport<StubHandler>> =
+        Arc::new(GrpcTransport::new(server_cfg, handler.clone()));
+
+    let serve_handle = tokio::spawn(
+        server_transport
+            .clone()
+            .start_server_with_listener(listener),
+    );
+    wait_for_listening(actual_addr, Duration::from_secs(2)).await;
+
+    let client = RaftGrpcClient::new(client_config(endpoint));
+    let resp = client
+        .send_vote(NodeId(SERVER_NODE_ID), sample_vote_request())
+        .await
+        .expect("vote rpc succeeds against pre-bound listener");
+    assert!(resp.vote_granted);
+    assert_eq!(handler.vote_calls.load(Ordering::SeqCst), 1);
+
+    server_transport.shutdown();
+    let join_result = tokio::time::timeout(Duration::from_secs(5), serve_handle)
+        .await
+        .expect("server task completes within shutdown timeout");
+    let server_result = join_result.expect("server task did not panic");
+    server_result.expect("server reported graceful shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: client-config-derivation (GrpcTransport::client_config helper)
+// ---------------------------------------------------------------------------
+//
+// `GrpcTransport::client_config(&GrpcTransportConfig)` is the shared
+// derivation step that keeps the in-transport client and any external
+// `ConnectionPool::from_cluster_config` consumer in lockstep on every
+// knob (timeouts, retry budget, message-size caps, TLS). A future edit
+// that forgets a field would silently drift the two surfaces apart.
+// This unit test pins every field to a unique sentinel value and
+// asserts it propagates one-for-one.
+
+#[test]
+fn client_config_derives_all_fields_from_transport_config() {
+    let mut peer_endpoints = HashMap::new();
+    peer_endpoints.insert(NodeId(7), "http://10.0.0.7:6000".to_string());
+
+    let transport_cfg = GrpcTransportConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        peer_endpoints: peer_endpoints.clone(),
+        connect_timeout: Duration::from_millis(123),
+        rpc_timeout: Duration::from_millis(4567),
+        max_retries: 9,
+        retry_initial_backoff: Duration::from_millis(11),
+        retry_max_backoff: Duration::from_millis(2222),
+        max_message_size: 3 * 1024 * 1024 + 1,
+        tls: None,
+    };
+
+    let client_cfg = GrpcTransport::<StubHandler>::client_config(&transport_cfg);
+
+    assert_eq!(
+        client_cfg.peer_endpoints, peer_endpoints,
+        "peer_endpoints must propagate verbatim"
+    );
+    assert_eq!(client_cfg.connect_timeout, Duration::from_millis(123));
+    assert_eq!(client_cfg.rpc_timeout, Duration::from_millis(4567));
+    assert_eq!(client_cfg.max_retries, 9);
+    assert_eq!(client_cfg.initial_backoff, Duration::from_millis(11));
+    assert_eq!(client_cfg.max_backoff, Duration::from_millis(2222));
+    assert_eq!(client_cfg.max_message_size, 3 * 1024 * 1024 + 1);
+    assert!(
+        client_cfg.tls.is_none(),
+        "tls=None on transport ⇒ tls=None on client"
+    );
 }

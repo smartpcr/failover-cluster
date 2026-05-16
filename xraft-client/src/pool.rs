@@ -453,14 +453,10 @@ mod tests {
         //      later by the first `send_*` call.
         let mut cluster = three_node_cluster();
         cluster.voters.clear();
-        cluster.peers = vec![
-            "10.0.0.2:6000".to_string(),
-            "10.0.0.3:6000".to_string(),
-        ];
+        cluster.peers = vec!["10.0.0.2:6000".to_string(), "10.0.0.3:6000".to_string()];
 
-        let err = ConnectionPool::from_cluster_config(&cluster).expect_err(
-            "ConnectionPool MUST reject legacy peers without structured voters",
-        );
+        let err = ConnectionPool::from_cluster_config(&cluster)
+            .expect_err("ConnectionPool MUST reject legacy peers without structured voters");
         let msg = err.to_string();
         assert!(
             msg.contains("ClusterConfig.peers"),

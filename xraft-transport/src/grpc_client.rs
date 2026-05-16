@@ -19,7 +19,12 @@
 //! lookups, because each peer owns its own mutex. Channels are evicted
 //! from the pool when an RPC observes a transport-level error so the
 //! next call re-establishes a fresh connection (re-entering the same
-//! per-peer serialised connect path).
+//! per-peer serialised connect path). **Eviction fires on every
+//! retriable status, regardless of whether the call retries.** A
+//! retriable failure with `max_retries == 0` (or with the retry budget
+//! exhausted) still evicts the channel — the contract is "transport-class
+//! error ⇒ evict", not "retried-error ⇒ evict". Unary and streaming RPC
+//! paths agree on this invariant.
 //!
 //! # Retry policy
 //!
@@ -337,10 +342,7 @@ impl RaftGrpcClient {
     /// [`futures::StreamExt::then`]) can reuse the SAME single
     /// invalidation primitive as the unary RPC retry paths — no
     /// duplicated `pool.write().await; remove(&peer)` shape.
-    async fn evict_pooled_channel(
-        pool: &Arc<RwLock<HashMap<NodeId, Channel>>>,
-        peer: NodeId,
-    ) {
+    async fn evict_pooled_channel(pool: &Arc<RwLock<HashMap<NodeId, Channel>>>, peer: NodeId) {
         pool.write().await.remove(&peer);
     }
 
@@ -415,6 +417,18 @@ impl RaftGrpcClient {
                     attempt += 1;
                 }
                 Err(status) => {
+                    // Retriable errors must ALSO evict the cached channel
+                    // when the retry budget is exhausted (or was zero from
+                    // the start) so the next caller dials fresh — the
+                    // module-level pool contract is "transport-class error
+                    // ⇒ evict", not "retried-error ⇒ evict". The
+                    // mid-stream FetchSnapshot path already honoured this
+                    // unconditionally via `Self::evict_pooled_channel`;
+                    // gating eviction on remaining budget here was an
+                    // unary-vs-streaming inconsistency.
+                    if Self::is_retriable(&status) {
+                        self.invalidate(peer).await;
+                    }
                     return Err(XRaftError::Transport(format!(
                         "Vote RPC to peer {} after {} attempts: {status}",
                         peer.0,
@@ -457,6 +471,11 @@ impl RaftGrpcClient {
                     attempt += 1;
                 }
                 Err(status) => {
+                    // See `send_vote` for the rationale on
+                    // budget-exhausted-but-still-evict.
+                    if Self::is_retriable(&status) {
+                        self.invalidate(peer).await;
+                    }
                     return Err(XRaftError::Transport(format!(
                         "PreVote RPC to peer {} after {} attempts: {status}",
                         peer.0,
@@ -500,6 +519,11 @@ impl RaftGrpcClient {
                     attempt += 1;
                 }
                 Err(status) => {
+                    // See `send_vote` for the rationale on
+                    // budget-exhausted-but-still-evict.
+                    if Self::is_retriable(&status) {
+                        self.invalidate(peer).await;
+                    }
                     return Err(XRaftError::Transport(format!(
                         "Fetch RPC to peer {} after {} attempts: {status}",
                         peer.0,
@@ -549,6 +573,15 @@ impl RaftGrpcClient {
                     attempt += 1;
                 }
                 Err(status) => {
+                    // See `send_vote` for the rationale on
+                    // budget-exhausted-but-still-evict. The mid-stream
+                    // path below (the `.then(...)` adapter) already
+                    // evicts unconditionally on retriable status; this
+                    // line gives the *initial-RPC* path the same
+                    // behaviour.
+                    if Self::is_retriable(&status) {
+                        self.invalidate(peer).await;
+                    }
                     return Err(XRaftError::Transport(format!(
                         "FetchSnapshot RPC init to peer {} after {} attempts: {status}",
                         peer.0,
