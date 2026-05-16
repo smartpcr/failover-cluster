@@ -2991,6 +2991,15 @@ where
                             last_included_index: snapshot_metadata.last_included_index,
                             last_included_term: snapshot_metadata.last_included_term,
                         }),
+                        // The redirect is served from the engine's
+                        // leader-role `handle_fetch_request` path — by
+                        // construction this response carries
+                        // authoritative leader state, so the
+                        // Stage 6.2 leader-hint integrity flag is
+                        // `true` (the follower may safely cache the
+                        // returned `(leader_id, leader_epoch)` tuple
+                        // as a routing hint).
+                        is_leader: true,
                     };
 
                     debug!(
@@ -4638,6 +4647,7 @@ port = 6000
         /// item 1) to verify operator-triggered snapshots surface a
         /// follow-up purge failure to the admin caller rather than
         /// silently returning `Ok`.
+        #[allow(dead_code)]
         fail_next_purge_prefix: Arc<std::sync::atomic::AtomicBool>,
     }
 
