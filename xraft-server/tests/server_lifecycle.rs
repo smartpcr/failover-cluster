@@ -56,12 +56,15 @@ fn single_voter_cluster_config(data_dir: PathBuf) -> ClusterConfig {
         tls_ca_path: None,
         tls_domain_name: None,
         connect_timeout_ms: 5_000,
-        rpc_timeout_ms: 10_000,
+        rpc_timeout_ms: 30_000,
         max_rpc_retries: 3,
         retry_initial_backoff_ms: 100,
         retry_max_backoff_ms: 5_000,
         max_message_size: 64 * 1024 * 1024,
         observers: vec![],
+        enable_check_quorum: true,
+        enable_leader_lease: false,
+        check_quorum_interval_ms: None,
     }
 }
 
@@ -1117,10 +1120,10 @@ async fn health_endpoint_returns_expected_json_fields() {
         .expect("teardown must complete within deadline");
 }
 
-/// Verify `/metrics` exposes the MVP Prometheus metric set
-/// required by Stage 6.1 (`xraft_current_term`,
-/// `xraft_commit_index`, `xraft_current_leader`, `xraft_role`,
-/// `xraft_election_latency_seconds`, `xraft_append_records_total`).
+/// Verify `/metrics` exposes the canonical Prometheus metric set:
+/// the Stage 6.1 MVP subset plus the Stage 7.1 leader / replication
+/// observability extensions (`xraft_replication_lag`,
+/// `xraft_commit_latency_seconds`, `xraft_fetch_requests_total`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metrics_endpoint_exposes_mvp_metric_set() {
     let tmp = TempDir::new().unwrap();
@@ -1131,16 +1134,45 @@ async fn metrics_endpoint_exposes_mvp_metric_set() {
     let body = http_get(&handle.admin_addr.to_string(), "/metrics").await;
 
     for metric in [
+        // Stage 6.1 MVP subset — every entry emits at least one
+        // sample row at startup (gauges initialise to 0, histograms
+        // emit bucket rows even with zero count).
         "xraft_current_term",
         "xraft_commit_index",
         "xraft_current_leader",
         "xraft_role",
         "xraft_election_latency_seconds",
         "xraft_append_records_total",
+        // Stage 7.1 — histograms emit bucket rows even with zero
+        // observations, so the rendered `_seconds` sample-row
+        // substring is reliable.
+        "xraft_commit_latency_seconds",
     ] {
         assert!(
             body.contains(metric),
             "metrics output must include '{metric}', body = {body}"
+        );
+    }
+
+    // Stage 7.1 — `xraft_replication_lag` and `xraft_fetch_requests`
+    // are `Family<Label, …>` metrics: prometheus-client only emits
+    // sample rows once a label set has been observed. In this
+    // single-node lifecycle test no follower has been registered
+    // (replication_lag) and no Fetch RPC has been issued
+    // (fetch_requests), so the rendered exposition for these two
+    // contains ONLY the HELP and TYPE descriptor lines. Assert on
+    // the descriptor lines so the test stays sensitive to
+    // accidental de-registration without requiring live traffic.
+    // The Counter family is registered without the `_total` suffix
+    // (the renderer auto-appends it on sample rows) — the HELP line
+    // therefore uses the bare name.
+    for descriptor in [
+        "# HELP xraft_replication_lag",
+        "# HELP xraft_fetch_requests",
+    ] {
+        assert!(
+            body.contains(descriptor),
+            "metrics output must include descriptor line '{descriptor}', body = {body}"
         );
     }
 

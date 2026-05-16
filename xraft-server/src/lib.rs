@@ -22,10 +22,10 @@ pub mod metrics;
 pub mod server;
 pub mod status;
 
-pub use admin::{AdminConfig, AdminServer, router as admin_router};
+pub use admin::{AdminConfig, AdminServer, ClusterInfo, router as admin_router};
 pub use driver::{
     Driver, DriverConfig, DriverHandle, DriverInboundHandler, DriverObserver, InboundRpc,
-    MessageRouter, OutboundResult,
+    MessageRouter, OutboundResult, TriggeredSnapshotInfo,
 };
 pub use metrics::XRaftMetrics;
 pub use server::{Server, ServerConfig, ServerHandle};
