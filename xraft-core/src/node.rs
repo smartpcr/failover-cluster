@@ -441,7 +441,7 @@ impl RaftNode {
         // canonical signal that surfaces the misconfiguration in logs.
         if let Some(vs) = voter_set.as_ref() {
             let n = vs.unique_node_count();
-            if n > 0 && n.is_multiple_of(2) {
+            if n > 0 && n % 2 == 0 {
                 tracing::warn!(
                     target: "xraft::node::bootstrap",
                     node_id = config.node_id.0,
