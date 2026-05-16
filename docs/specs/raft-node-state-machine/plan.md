@@ -503,6 +503,12 @@ These were open questions in earlier iterations and are now resolved:
    tree are untracked by design and any physical cleanup is a future
    operational workstream — Stage 3.1 must not model it as a
    deliverable. The planning-track contract is therefore decoupled
-   from the implementation-track cleanup question: this plan owns
-   only the engine's source contract under `xraft-core/src/`, not
-   the disposition of any backup file under the repo root.
+   from the implementation-track cleanup question. Stage 3.1 owns
+   three artefact classes — the engine's source contract under
+   `xraft-core/src/`, this design narrative under
+   `docs/specs/raft-node-state-machine/plan.md`, and the WIT tree
+   in `docs/specs/raft-node-state-machine/wit-tree.yaml` — and it
+   explicitly does NOT own the physical disposition of any
+   `*.review-backup` or `*.iter-snapshot.bak` file under the repo
+   root; that disposition is delegated to a future operational
+   workstream (see operator answer `delete-via-future-workstream`).
