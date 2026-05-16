@@ -122,6 +122,16 @@ pub struct ClusterConfig {
     /// tonic's default 4 MiB limit. Applied to both client and server.
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
+
+    /// Node IDs that participate in the cluster as **observers** —
+    /// they replicate the log and answer reads but DO NOT vote in
+    /// elections. When this node's `node_id` appears in this list the
+    /// engine starts in [`NodeRole::Observer`](crate::types::NodeRole::Observer)
+    /// instead of [`NodeRole::Follower`](crate::types::NodeRole::Follower).
+    /// Empty by default (a node not in this list participates as a
+    /// regular voter / follower per the voters set).
+    #[serde(default)]
+    pub observers: Vec<u64>,
 }
 
 fn default_election_timeout_min() -> u64 {
@@ -611,6 +621,190 @@ impl ClusterConfig {
             )));
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NodeConfig — top-level TOML schema (Stage 1.2 / Stage 6.1)
+// ---------------------------------------------------------------------------
+
+/// Top-level TOML configuration consumed by the `xraft-server`
+/// binary. `NodeConfig` wraps the engine-facing [`ClusterConfig`]
+/// (via `#[serde(flatten)]` so existing TOML files load unchanged)
+/// and adds the small set of node-/server-level knobs that don't
+/// belong in the cluster-wide engine config.
+///
+/// Lifecycle (Stage 6.1 server bootstrap):
+///
+/// 1. [`NodeConfig::load`] reads + parses the TOML, applies
+///    `XRAFT_*` env overrides, then runs [`NodeConfig::validate`].
+/// 2. Caller optionally applies CLI overrides (e.g. `--node-id`,
+///    `--admin-listen`) and **must** re-run [`NodeConfig::validate`]
+///    afterwards.
+/// 3. [`NodeConfig::into_cluster_config`] yields the engine-facing
+///    [`ClusterConfig`] consumed by `RaftNode::new` and friends.
+///    The server-level fields (e.g. [`NodeConfig::admin_listen_addr`])
+///    are read directly off `NodeConfig` and projected into the
+///    `xraft-server`-only `ServerConfig`.
+///
+/// The observer list is part of [`ClusterConfig::observers`] (kept
+/// alongside the cluster-wide config so it survives
+/// [`NodeConfig::into_cluster_config`] and reaches the engine —
+/// `RaftNode::new` consults it to seed the local node's initial role
+/// as [`NodeRole::Observer`](crate::types::NodeRole::Observer) when
+/// applicable, instead of the default
+/// [`NodeRole::Follower`](crate::types::NodeRole::Follower)).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfig {
+    /// Inline cluster-wide configuration. `#[serde(flatten)]`
+    /// keeps the on-disk TOML shape identical to a plain
+    /// [`ClusterConfig`] so existing config files load without
+    /// modification. The observer list lives on
+    /// [`ClusterConfig::observers`] (deserialised from the same
+    /// top-level `observers = [...]` TOML key thanks to flatten).
+    #[serde(flatten)]
+    pub cluster: ClusterConfig,
+    /// Optional `host:port` for the admin HTTP listener that serves
+    /// `/health` and `/metrics`. Server-only — the consensus engine
+    /// does not consult it. CLI `--admin-listen` overrides this
+    /// value at startup; the default
+    /// (`xraft_server::server::DEFAULT_ADMIN_LISTEN_ADDR`) applies
+    /// when neither is set.
+    ///
+    /// Not hot-reloadable: changes here on a SIGHUP reload are
+    /// logged-and-ignored — restart the process to move the admin
+    /// listener (see `xraft-server/src/main.rs::reload_config`).
+    #[serde(default)]
+    pub admin_listen_addr: Option<String>,
+}
+
+impl NodeConfig {
+    /// Load + parse + env-override + validate from a TOML file.
+    ///
+    /// Convenience wrapper for the production server bootstrap
+    /// path. Equivalent to reading the file and calling
+    /// [`NodeConfig::from_toml_str_with_env`].
+    pub fn load(path: &Path) -> Result<Self, XRaftError> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| XRaftError::Config(format!("failed to read {}: {e}", path.display())))?;
+        Self::from_toml_str_with_env(&content)
+    }
+
+    /// Parse + validate without applying env overrides.
+    pub fn from_toml_str(s: &str) -> Result<Self, XRaftError> {
+        let cfg: NodeConfig =
+            toml::from_str(s).map_err(|e| XRaftError::Config(format!("TOML parse error: {e}")))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Parse, apply `XRAFT_*` env overrides, then validate.
+    pub fn from_toml_str_with_env(s: &str) -> Result<Self, XRaftError> {
+        let mut cfg: NodeConfig =
+            toml::from_str(s).map_err(|e| XRaftError::Config(format!("TOML parse error: {e}")))?;
+        cfg.apply_env_overrides()?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Apply `XRAFT_*` env-var overrides. Delegates cluster-level
+    /// fields to [`ClusterConfig::apply_env_overrides`] and reads
+    /// `XRAFT_OBSERVERS` (comma-separated `u64` list) for the
+    /// observer roster.
+    pub fn apply_env_overrides(&mut self) -> Result<(), XRaftError> {
+        self.cluster.apply_env_overrides()?;
+        if let Ok(val) = std::env::var("XRAFT_OBSERVERS")
+            && !val.is_empty()
+        {
+            let mut parsed = Vec::with_capacity(4);
+            for part in val.split(',') {
+                let trimmed = part.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let id: u64 = trimmed.parse().map_err(|_| {
+                    XRaftError::Config(format!("XRAFT_OBSERVERS: invalid u64 value '{trimmed}'"))
+                })?;
+                parsed.push(id);
+            }
+            self.cluster.observers = parsed;
+        }
+        Ok(())
+    }
+
+    /// Cluster-level validation **plus** node-membership rules.
+    /// Idempotent: callers that mutate `self` after [`load`] (e.g.
+    /// a CLI `--node-id` override in `main.rs`) **must** re-call
+    /// `validate()` to verify the override is still consistent.
+    pub fn validate(&self) -> Result<(), XRaftError> {
+        self.cluster.validate()?;
+        self.validate_membership()?;
+        Ok(())
+    }
+
+    /// Verify the local `node_id` is a recognised cluster member.
+    ///
+    /// Acceptance rules:
+    ///
+    /// - `voters` **must be non-empty** — every cluster MUST define
+    ///   at least one structured `[[voters]]` entry, even a single-
+    ///   node cluster. The legacy flat `peers` list cannot stand in
+    ///   because it lacks `NodeId` keys, and an empty voter set
+    ///   leaves [`ClusterConfig::build_voter_set`] returning `None`
+    ///   so `RaftNode::has_election_quorum` would always return
+    ///   `false` — i.e. the accepted config could never elect a
+    ///   leader.
+    /// - `node_id` MUST appear in exactly one of `voters[].node_id`
+    ///   or `observers[]`. Appearing in both is rejected as a
+    ///   configuration error.
+    pub fn validate_membership(&self) -> Result<(), XRaftError> {
+        let self_id = self.cluster.node_id.0;
+        if self.cluster.voters.is_empty() {
+            return Err(XRaftError::Config(format!(
+                "configuration MUST specify at least one structured `[[voters]]` entry \
+                 (even for a single-node cluster) — empty voters leaves the engine with \
+                 no quorum metadata and it can never elect a leader. Add a [[voters]] \
+                 block for node_id = {self_id} pointing at this node's listen_addr."
+            )));
+        }
+        let in_voters = self.cluster.voters.iter().any(|v| v.node_id == self_id);
+        let in_observers = self.cluster.observers.contains(&self_id);
+        if !in_voters && !in_observers {
+            let voter_ids: Vec<u64> = self.cluster.voters.iter().map(|v| v.node_id).collect();
+            return Err(XRaftError::Config(format!(
+                "node_id {self_id} is not present in the voters list or observers list \
+                 (voters = {voter_ids:?}, observers = {observers:?}); each node MUST be \
+                 a member of exactly one set",
+                observers = self.cluster.observers,
+            )));
+        }
+        if in_voters && in_observers {
+            return Err(XRaftError::Config(format!(
+                "node_id {self_id} appears in BOTH the voters and observers lists; \
+                 each node MUST be a member of exactly one set"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Borrow the inner [`ClusterConfig`] without consuming.
+    pub fn cluster_config(&self) -> &ClusterConfig {
+        &self.cluster
+    }
+
+    /// Borrow the observer list (lives on [`ClusterConfig::observers`]).
+    pub fn observers(&self) -> &[u64] {
+        &self.cluster.observers
+    }
+
+    /// Consume `self` and return the engine-facing
+    /// [`ClusterConfig`]. The observer set is preserved on the
+    /// returned [`ClusterConfig`] so the engine can seed
+    /// [`NodeRole::Observer`](crate::types::NodeRole::Observer)
+    /// when the local `node_id` is in the observer list (see
+    /// `RaftNode::new`).
+    pub fn into_cluster_config(self) -> ClusterConfig {
+        self.cluster
     }
 }
 
@@ -1762,5 +1956,272 @@ port = 6002
         assert!(!map.contains_key(&NodeId(1)), "self not present");
         assert_eq!(map.get(&NodeId(2)).unwrap(), "https://10.0.0.2:6001");
         assert_eq!(map.get(&NodeId(3)).unwrap(), "https://10.0.0.3:6002");
+    }
+
+    // -----------------------------------------------------------------------
+    // NodeConfig tests (Stage 6.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn node_config_round_trips_existing_cluster_toml_unchanged() {
+        // A `full_toml()`-shaped config (engine-only fields) plus a
+        // single `[[voters]]` block for the local node still loads
+        // as `NodeConfig` and yields the same engine-facing
+        // `ClusterConfig` via `into_cluster_config()`. `[[voters]]`
+        // is now required (see `validate_membership`).
+        let toml = format!(
+            r#"{full}
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440002"
+host = "10.0.0.2"
+port = 7000
+"#,
+            full = full_toml()
+        );
+        let cfg = NodeConfig::from_toml_str(&toml).expect("must parse");
+        assert!(
+            cfg.cluster.observers.is_empty(),
+            "default observers is empty"
+        );
+        assert!(
+            cfg.admin_listen_addr.is_none(),
+            "admin_listen_addr is optional, defaults to None"
+        );
+        let cluster = cfg.into_cluster_config();
+        assert_eq!(cluster.node_id, NodeId(2));
+        assert_eq!(cluster.cluster_id, "prod-cluster");
+        assert_eq!(cluster.listen_addr, "10.0.0.2:7000");
+    }
+
+    #[test]
+    fn node_config_admin_listen_addr_round_trip_from_toml() {
+        // Operator-supplied `admin_listen_addr` in the TOML lands
+        // on `NodeConfig` (server-only field; engine `ClusterConfig`
+        // never sees it). The default is `None` (the binary then
+        // falls back to `DEFAULT_ADMIN_LISTEN_ADDR`).
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "10.0.0.1:6000"
+admin_listen_addr = "0.0.0.0:9001"
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+"#;
+        let cfg = NodeConfig::from_toml_str(toml).expect("must parse");
+        assert_eq!(
+            cfg.admin_listen_addr.as_deref(),
+            Some("0.0.0.0:9001"),
+            "admin_listen_addr deserialises off the top-level TOML key"
+        );
+    }
+
+    #[test]
+    fn node_config_flatten_works_with_voters_array() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "10.0.0.1:6000"
+observers = [4, 5]
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440001"
+host = "10.0.0.2"
+port = 6000
+"#;
+        let cfg = NodeConfig::from_toml_str(toml).expect("must parse");
+        assert_eq!(cfg.cluster.observers, vec![4, 5]);
+        assert_eq!(cfg.cluster.voters.len(), 2);
+        assert_eq!(cfg.cluster.voters[0].host, "10.0.0.1");
+    }
+
+    #[test]
+    fn node_config_rejects_empty_voters() {
+        // Stage 6.1 hardening: empty `voters` was previously accepted
+        // as an "implicit single-node bootstrap", but that left the
+        // engine with no `voter_set`, so `has_election_quorum` always
+        // returned false and the cluster could never elect a leader.
+        // The contract is now: every cluster MUST declare at least one
+        // structured `[[voters]]` entry (even single-node clusters).
+        let toml = r#"
+node_id = 99
+cluster_id = "c"
+listen_addr = "127.0.0.1:6000"
+"#;
+        let err = NodeConfig::from_toml_str(toml).expect_err("empty voters must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("[[voters]]"),
+            "error must guide operator to add [[voters]]: {msg}"
+        );
+        assert!(
+            msg.contains("at least one"),
+            "error must explain the at-least-one rule: {msg}"
+        );
+    }
+
+    #[test]
+    fn node_config_rejects_observer_only_without_voters() {
+        // Observers cannot stand in for voters because an observer-
+        // only cluster has nobody who can win an election. Configuring
+        // `observers = [...]` without `[[voters]]` is rejected for the
+        // same reason as empty voters/observers.
+        let toml = r#"
+node_id = 5
+cluster_id = "c"
+listen_addr = "127.0.0.1:6000"
+observers = [5]
+"#;
+        let err = NodeConfig::from_toml_str(toml)
+            .expect_err("observer-only (no voters) must be rejected");
+        assert!(format!("{err}").contains("[[voters]]"));
+    }
+
+    #[test]
+    fn node_config_membership_rejects_node_outside_voter_set() {
+        let toml = r#"
+node_id = 99
+cluster_id = "c"
+listen_addr = "10.0.0.9:6000"
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440001"
+host = "10.0.0.2"
+port = 6000
+"#;
+        let err = NodeConfig::from_toml_str(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("node_id 99"),
+            "error must name the missing node_id: {msg}"
+        );
+        assert!(
+            msg.contains("not present"),
+            "error must say not present: {msg}"
+        );
+    }
+
+    #[test]
+    fn node_config_membership_accepts_node_in_voter_set() {
+        let toml = r#"
+node_id = 2
+cluster_id = "c"
+listen_addr = "10.0.0.2:6000"
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440001"
+host = "10.0.0.2"
+port = 6000
+"#;
+        NodeConfig::from_toml_str(toml).expect("voter membership valid");
+    }
+
+    #[test]
+    fn node_config_membership_accepts_node_in_observer_set() {
+        let toml = r#"
+node_id = 5
+cluster_id = "c"
+listen_addr = "10.0.0.5:6000"
+observers = [5, 6]
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+"#;
+        let cfg = NodeConfig::from_toml_str(toml).expect("observer membership valid");
+        assert_eq!(cfg.cluster.observers, vec![5, 6]);
+    }
+
+    #[test]
+    fn node_config_membership_rejects_both_voter_and_observer() {
+        // A node MUST NOT be a voter AND an observer simultaneously.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "10.0.0.1:6000"
+observers = [1]
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+"#;
+        let err = NodeConfig::from_toml_str(toml).unwrap_err();
+        assert!(format!("{err}").contains("BOTH"));
+    }
+
+    #[test]
+    fn node_config_into_cluster_config_preserves_observers() {
+        // Observers now live on ClusterConfig directly, so the
+        // conversion is lossless. The engine consults
+        // `cluster.observers` to seed `NodeRole::Observer` when
+        // applicable (see `RaftNode::new_inner`).
+        let mut cluster = ClusterConfig::from_toml_str(valid_toml()).unwrap();
+        cluster.observers = vec![10, 11];
+        // Add a [[voters]] entry programmatically — the tightened
+        // `validate_membership` requires at least one voter and we
+        // need the local node_id to be a member somewhere.
+        cluster.voters = vec![VoterConfig {
+            node_id: cluster.node_id.0,
+            directory_id: "550e8400-e29b-41d4-a716-446655440003".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 6001,
+        }];
+        let cfg = NodeConfig {
+            cluster,
+            admin_listen_addr: None,
+        };
+        cfg.validate().expect("populated cfg must validate");
+        let cluster = cfg.into_cluster_config();
+        assert_eq!(cluster.node_id, NodeId(1));
+        assert_eq!(cluster.observers, vec![10, 11]);
+    }
+
+    #[test]
+    fn node_config_validate_re_runs_membership_after_mutation() {
+        // Models the main.rs CLI `--node-id` override path:
+        // load, mutate node_id, re-validate.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "10.0.0.1:6000"
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440001"
+host = "10.0.0.2"
+port = 6000
+"#;
+        let mut cfg = NodeConfig::from_toml_str(toml).expect("initial valid");
+        // Override node_id to a non-member ⇒ re-validate must error.
+        cfg.cluster.node_id = NodeId(7);
+        let err = cfg.validate().unwrap_err();
+        assert!(format!("{err}").contains("node_id 7"));
+        // Override to a valid voter ⇒ re-validate must succeed.
+        cfg.cluster.node_id = NodeId(2);
+        cfg.validate().expect("override to valid voter must pass");
     }
 }
