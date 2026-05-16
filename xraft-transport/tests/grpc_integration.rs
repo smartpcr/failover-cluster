@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -30,7 +30,9 @@ use xraft_core::message::{
 use xraft_core::transport::{RaftMessageHandler, SnapshotChunkStream, Transport};
 use xraft_core::types::{LogIndex, NodeId, Term};
 
-use xraft_transport::grpc::{GrpcTransport, GrpcTransportConfig, TlsTransportConfig};
+use xraft_transport::grpc::{
+    GrpcTransport, GrpcTransportConfig, TlsTransportConfig, peer_endpoints_from_cluster_config,
+};
 use xraft_transport::grpc_client::{RaftGrpcClient, RaftGrpcClientConfig};
 use xraft_transport::grpc_server::RaftGrpcServer;
 
@@ -62,11 +64,27 @@ struct StubHandler {
     pre_vote_calls: AtomicU64,
     fetch_calls: AtomicU64,
     fetch_snapshot_calls: AtomicU64,
+    /// When true, `handle_fetch_snapshot` emits chunk0 then a synthetic
+    /// mid-stream `XRaftError::Transport` error. Used by
+    /// `fetch_snapshot_mid_stream_transport_error_evicts_channel` to
+    /// drive the client's eviction policy through a real wire path.
+    fetch_snapshot_mid_stream_error: AtomicBool,
 }
 
 impl StubHandler {
     fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Build a stub whose FetchSnapshot stream emits one chunk then a
+    /// `XRaftError::Transport` error. Server-side this maps to
+    /// `Status::unavailable`, which the client sees as a retriable
+    /// mid-stream transport failure.
+    fn with_mid_stream_error() -> Arc<Self> {
+        let h = Self::default();
+        h.fetch_snapshot_mid_stream_error
+            .store(true, Ordering::SeqCst);
+        Arc::new(h)
     }
 }
 
@@ -143,7 +161,20 @@ impl RaftMessageHandler for StubHandler {
             metadata: None,
         };
         let stream: SnapshotChunkStream =
-            Box::pin(futures::stream::iter(vec![Ok(chunk0), Ok(chunk1)]));
+            if self.fetch_snapshot_mid_stream_error.load(Ordering::SeqCst) {
+                // Emit one good chunk then a transport-class error. The
+                // server adapter maps `XRaftError::Transport` to
+                // `Status::unavailable`, which is the retriable code the
+                // client's eviction policy keys off of.
+                Box::pin(futures::stream::iter(vec![
+                    Ok(chunk0),
+                    Err(xraft_core::error::XRaftError::Transport(
+                        "synthetic mid-stream transport failure".to_string(),
+                    )),
+                ]))
+            } else {
+                Box::pin(futures::stream::iter(vec![Ok(chunk0), Ok(chunk1)]))
+            };
         Ok(stream)
     }
 }
@@ -724,6 +755,287 @@ async fn fetch_snapshot_streaming() {
         handler.fetch_snapshot_calls.load(Ordering::SeqCst),
         1,
         "exactly one server fetch_snapshot call"
+    );
+
+    shutdown.notify_one();
+    srv_handle.await.unwrap().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: hostname-listen-addr (iter-2 fix for prior evaluator finding)
+// ---------------------------------------------------------------------------
+//
+// `ClusterConfig::validate_address` accepts hostnames such as
+// `localhost:6000`, but the previous `GrpcTransport::start_server`
+// parsed `listen_addr` as `std::net::SocketAddr` *before* binding and
+// rejected any value that wasn't a literal IP. That made a perfectly
+// valid `listen_addr = "localhost:<port>"` fail at startup. The fix
+// delegates binding to `tokio::net::TcpListener::bind(&str)`, which
+// walks DNS-resolved addresses. This test reserves a port via
+// `pick_free_port`, configures `listen_addr = "localhost:<port>"`,
+// starts the server, and proves a real RPC succeeds against the
+// hostname-configured listener.
+
+#[tokio::test]
+async fn start_server_accepts_hostname_listen_addr() {
+    let port = pick_free_port();
+    // Pick an alternative free port for the second voter so the
+    // ClusterConfig validation accepts the literal.
+    let other_port = pick_free_port();
+    // The probe target — uses 127.0.0.1 because the OS DNS resolver
+    // consistently maps `localhost` to that loopback address on test
+    // hosts.
+    let probe_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let endpoint = format!("http://127.0.0.1:{port}");
+
+    let cluster = ClusterConfig {
+        cluster_id: TEST_CLUSTER_ID.to_string(),
+        node_id: NodeId(SERVER_NODE_ID),
+        // Hostname-form listen_addr — the gap the iter-1 evaluator flagged.
+        listen_addr: format!("localhost:{port}"),
+        peers: Vec::new(),
+        voters: vec![
+            xraft_core::config::VoterConfig {
+                node_id: SERVER_NODE_ID,
+                directory_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                host: "localhost".to_string(),
+                port,
+            },
+            xraft_core::config::VoterConfig {
+                node_id: CLIENT_NODE_ID,
+                directory_id: "00000000-0000-0000-0000-000000000002".to_string(),
+                host: "localhost".to_string(),
+                port: other_port,
+            },
+        ],
+        election_timeout_min_ms: 150,
+        election_timeout_max_ms: 300,
+        fetch_interval_ms: 50,
+        tick_interval_ms: 10,
+        snapshot_interval: 10_000,
+        max_log_entries_before_compaction: 100_000,
+        data_dir: std::path::PathBuf::from("data"),
+        snapshot_retention_count: 3,
+        tls_enabled: false,
+        tls_cert_path: None,
+        tls_key_path: None,
+        tls_ca_path: None,
+        tls_domain_name: None,
+        connect_timeout_ms: 2_000,
+        rpc_timeout_ms: 5_000,
+        max_rpc_retries: 3,
+        retry_initial_backoff_ms: 50,
+        retry_max_backoff_ms: 400,
+        max_message_size: 64 * 1024 * 1024,
+        observers: vec![],
+        enable_check_quorum: true,
+        enable_leader_lease: false,
+        check_quorum_interval_ms: None,
+    };
+
+    let handler = StubHandler::new();
+    let server_cfg = GrpcTransportConfig::from_cluster_config(&cluster)
+        .expect("from_cluster_config accepts hostname listen_addr");
+    let server_transport: Arc<GrpcTransport<StubHandler>> =
+        Arc::new(GrpcTransport::new(server_cfg, handler.clone()));
+    let serve_handle = tokio::spawn(server_transport.clone().start_server());
+
+    // Verify the listener actually bound — i.e., the hostname resolved
+    // and `tokio::net::TcpListener::bind` accepted it. If the prior bug
+    // were still present, the spawned future would have returned a
+    // `Config` error rather than holding open the port.
+    wait_for_listening(probe_addr, Duration::from_secs(3)).await;
+
+    let client = RaftGrpcClient::new(client_config(endpoint));
+    let resp = client
+        .send_vote(NodeId(SERVER_NODE_ID), sample_vote_request())
+        .await
+        .expect("vote rpc against hostname-bound server succeeds");
+    assert!(resp.vote_granted);
+    assert_eq!(handler.vote_calls.load(Ordering::SeqCst), 1);
+
+    server_transport.shutdown();
+    let join_result = tokio::time::timeout(Duration::from_secs(5), serve_handle)
+        .await
+        .expect("hostname-bound server task completes within shutdown timeout");
+    let server_result = join_result.expect("hostname-bound server task did not panic");
+    server_result.expect("hostname-bound server reported graceful shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: legacy-peers-rejected (iter-2 fix for prior evaluator finding)
+// ---------------------------------------------------------------------------
+//
+// `ClusterConfig::peer_endpoints` derives its `NodeId -> URL` map from
+// `cluster.voters`, so a config that populates only the legacy
+// `peers: Vec<String>` field silently produces an empty routing map.
+// The previous `GrpcTransportConfig::from_cluster_config` swallowed
+// that silently, so the transport would *appear* to construct and only
+// fail later when a real `send_*` call had no endpoint for any peer.
+// This test asserts construction now errors at the misconfig with an
+// actionable message naming both `ClusterConfig.peers` and `voters`.
+
+fn make_legacy_peers_only_cluster() -> ClusterConfig {
+    ClusterConfig {
+        cluster_id: TEST_CLUSTER_ID.to_string(),
+        node_id: NodeId(SERVER_NODE_ID),
+        listen_addr: "127.0.0.1:0".to_string(),
+        // Legacy field populated; voters left empty — the exact misconfig
+        // shape the evaluator flagged.
+        peers: vec!["10.0.0.2:6000".to_string(), "10.0.0.3:6000".to_string()],
+        voters: Vec::new(),
+        election_timeout_min_ms: 150,
+        election_timeout_max_ms: 300,
+        fetch_interval_ms: 50,
+        tick_interval_ms: 10,
+        snapshot_interval: 10_000,
+        max_log_entries_before_compaction: 100_000,
+        data_dir: std::path::PathBuf::from("data"),
+        snapshot_retention_count: 3,
+        tls_enabled: false,
+        tls_cert_path: None,
+        tls_key_path: None,
+        tls_ca_path: None,
+        tls_domain_name: None,
+        connect_timeout_ms: 2_000,
+        rpc_timeout_ms: 5_000,
+        max_rpc_retries: 3,
+        retry_initial_backoff_ms: 50,
+        retry_max_backoff_ms: 400,
+        max_message_size: 64 * 1024 * 1024,
+        observers: vec![],
+        enable_check_quorum: true,
+        enable_leader_lease: false,
+        check_quorum_interval_ms: None,
+    }
+}
+
+#[test]
+fn from_cluster_config_rejects_legacy_peers_without_voters() {
+    let cluster = make_legacy_peers_only_cluster();
+
+    let err = GrpcTransportConfig::from_cluster_config(&cluster)
+        .expect_err("legacy peers without voters MUST be rejected by transport config");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ClusterConfig.peers"),
+        "error must name the offending field: {msg}"
+    );
+    assert!(
+        msg.contains("voters"),
+        "error must point to the fix (populate voters): {msg}"
+    );
+
+    // The shared helper used by both transport + client pool must
+    // surface the same error so misconfig is caught uniformly across
+    // entry points.
+    let err = peer_endpoints_from_cluster_config(&cluster)
+        .expect_err("helper must reject the same misconfig");
+    let msg = err.to_string();
+    assert!(msg.contains("ClusterConfig.peers"));
+    assert!(msg.contains("voters"));
+}
+
+#[test]
+fn peer_endpoints_helper_accepts_single_node_bootstrap() {
+    // Inverse check: a legitimate single-node bootstrap — BOTH peers and
+    // voters empty — must NOT be rejected; the result is just an empty
+    // map (no outbound peers), which is correct for bootstrap.
+    let mut cluster = make_legacy_peers_only_cluster();
+    cluster.peers = Vec::new();
+    let endpoints = peer_endpoints_from_cluster_config(&cluster)
+        .expect("single-node bootstrap (peers & voters both empty) must be accepted");
+    assert!(
+        endpoints.is_empty(),
+        "single-node bootstrap has no outbound peers"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: fetch-snapshot-mid-stream-eviction (iter-2 fix for prior finding)
+// ---------------------------------------------------------------------------
+//
+// The module-level pool contract on `RaftGrpcClient` says: observed
+// transport errors evict the cached channel so the next RPC dials a
+// fresh connection. The previous `send_fetch_snapshot` implementation
+// honoured this on *initial-RPC* failures but not on *mid-stream*
+// failures (its `stream.map(...)` was a pure sync mapping that had no
+// way to touch the pool). This test drives a real wire-path
+// mid-stream `Status::unavailable` and asserts:
+//   1. the failure surfaces as an `Err` item in the client stream, and
+//   2. the cached channel for the peer is evicted (pool_size drops to 0).
+
+#[tokio::test]
+async fn fetch_snapshot_mid_stream_transport_error_evicts_channel() {
+    use futures::StreamExt as _;
+
+    let port = pick_free_port();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let endpoint = format!("http://127.0.0.1:{port}");
+
+    // Stub configured to emit a synthetic mid-stream transport error
+    // after the first chunk. The server's adapter maps that to
+    // Status::unavailable, which is the retriable code the client uses
+    // to trigger channel eviction.
+    let handler = StubHandler::with_mid_stream_error();
+    let (shutdown, srv_handle) = spawn_plain_server(addr, handler.clone());
+    wait_for_listening(addr, Duration::from_secs(2)).await;
+
+    let mut cfg = client_config(endpoint);
+    // We are NOT trying to drive retry here — initial-RPC succeeds and the
+    // failure is mid-stream. The retry budget only affects connect-time.
+    cfg.max_retries = 0;
+    let client = RaftGrpcClient::new(cfg);
+
+    let req = FetchSnapshotRequest {
+        cluster_id: TEST_CLUSTER_ID.to_string(),
+        leader_epoch: TEST_LEADER_EPOCH,
+        replica_id: NodeId(CLIENT_NODE_ID),
+        snapshot_id: "snap-test".to_string(),
+        offset: 0,
+        max_bytes: 0,
+    };
+    let mut stream = client
+        .send_fetch_snapshot(NodeId(SERVER_NODE_ID), req)
+        .await
+        .expect("initial send_fetch_snapshot succeeds (failure is mid-stream)");
+
+    // First chunk: Ok.
+    let first = stream
+        .next()
+        .await
+        .expect("stream yields a first item")
+        .expect("first chunk decodes ok");
+    assert_eq!(first.chunk_index, 0, "first chunk arrives intact");
+
+    // Pool MUST have cached the channel by now since at least one
+    // RPC has completed.
+    assert_eq!(
+        client.pool_size().await,
+        1,
+        "channel cached after successful initial RPC + first chunk"
+    );
+
+    // Second item: the synthetic Err. This is the moment the new
+    // code MUST evict the cached channel (per pool contract).
+    let second = stream.next().await.expect("stream yields a second item");
+    assert!(
+        second.is_err(),
+        "second item must be the mid-stream transport error"
+    );
+    // No more items.
+    assert!(
+        stream.next().await.is_none(),
+        "stream terminates after the error item"
+    );
+
+    // The eviction is awaited inside `.then(...)`, which has already run
+    // by the time the `Err` is delivered to the consumer. The pool
+    // SHOULD now be empty.
+    assert_eq!(
+        client.pool_size().await,
+        0,
+        "retriable mid-stream transport error must evict the cached channel"
     );
 
     shutdown.notify_one();

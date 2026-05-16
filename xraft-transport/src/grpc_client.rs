@@ -542,13 +542,34 @@ impl RaftGrpcClient {
             }
         };
 
-        let mapped: SnapshotChunkStream = Box::pin(stream.map(|item| {
-            match item {
-                Ok(proto_chunk) => FetchSnapshotChunk::try_from(proto_chunk)
-                    .map_err(|e| XRaftError::Transport(format!("FetchSnapshot chunk decode: {e}"))),
-                Err(status) => Err(XRaftError::Transport(format!(
-                    "FetchSnapshot stream error: {status}"
-                ))),
+        let pool = self.pool.clone();
+        let mapped: SnapshotChunkStream = Box::pin(stream.then(move |item| {
+            let pool = pool.clone();
+            async move {
+                match item {
+                    Ok(proto_chunk) => FetchSnapshotChunk::try_from(proto_chunk).map_err(|e| {
+                        XRaftError::Transport(format!("FetchSnapshot chunk decode: {e}"))
+                    }),
+                    Err(status) => {
+                        // Mid-stream transport-class failure must
+                        // EVICT the cached channel so the next RPC
+                        // dials a fresh connection rather than reusing
+                        // a half-broken one. The module-level pool
+                        // contract documents this and the unary RPC
+                        // paths already do so via `invalidate(peer)`
+                        // on `is_retriable(&status)`; the streaming
+                        // path must follow the same policy. Non-
+                        // retriable codes leave the cache alone — the
+                        // channel is still healthy at the HTTP/2 layer.
+                        if Self::is_retriable(&status) {
+                            let mut guard = pool.write().await;
+                            guard.remove(&peer);
+                        }
+                        Err(XRaftError::Transport(format!(
+                            "FetchSnapshot stream error: {status}"
+                        )))
+                    }
+                }
             }
         }));
 

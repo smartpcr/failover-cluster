@@ -41,7 +41,7 @@ use std::time::Duration;
 use xraft_core::config::ClusterConfig;
 use xraft_core::error::{Result as XResult, XRaftError};
 use xraft_core::types::NodeId;
-use xraft_transport::grpc::TlsTransportConfig;
+use xraft_transport::grpc::{TlsTransportConfig, peer_endpoints_from_cluster_config};
 use xraft_transport::grpc_client::{RaftGrpcClient, RaftGrpcClientConfig};
 
 use crate::peer::PeerClient;
@@ -120,12 +120,16 @@ impl ConnectionPool {
     /// so the inbound transport and the operator-visible pool
     /// observe the SAME peer channel cache.
     pub fn from_cluster_config(cluster: &ClusterConfig) -> XResult<Self> {
+        // `peer_endpoints_from_cluster_config` rejects the
+        // legacy-`peers`-only misconfiguration eagerly so the pool
+        // never silently builds an unroutable client. See the
+        // helper's docs for the full rationale.
+        let peer_endpoints = peer_endpoints_from_cluster_config(cluster)?;
         let tls = if cluster.tls_enabled {
             Some(Arc::new(TlsTransportConfig::from_cluster_config(cluster)?))
         } else {
             None
         };
-        let peer_endpoints = cluster.peer_endpoints();
         let client_cfg = RaftGrpcClientConfig {
             peer_endpoints: peer_endpoints.clone(),
             connect_timeout: Duration::from_millis(cluster.connect_timeout_ms),

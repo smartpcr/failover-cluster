@@ -18,11 +18,24 @@ use futures::StreamExt;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error};
 
+use xraft_core::error::XRaftError;
 use xraft_core::message::{FetchRequest, FetchSnapshotRequest, PreVoteRequest, VoteRequest};
 use xraft_core::transport::RaftMessageHandler;
 
 use crate::pb;
 use crate::pb::raft_service_server::{RaftService, RaftServiceServer};
+
+/// Map an [`XRaftError`] from a handler into the appropriate gRPC
+/// [`Status`]. Transport-class failures are *retriable* on the wire and
+/// must map to `Unavailable` so the client-side
+/// `RaftGrpcClient::is_retriable` policy can trigger an evict + retry.
+/// Everything else is `Internal`.
+fn status_from_error(err: &XRaftError, op: &str) -> Status {
+    match err {
+        XRaftError::Transport(msg) => Status::unavailable(format!("{op} transport error: {msg}")),
+        other => Status::internal(format!("{op} handler error: {other}")),
+    }
+}
 
 /// Adapter that implements the tonic-generated `RaftService` trait by
 /// dispatching every incoming RPC to a [`RaftMessageHandler`].
@@ -62,7 +75,7 @@ impl<H: RaftMessageHandler> RaftService for RaftGrpcServer<H> {
         debug!(target: "xraft_transport::server", candidate = req.candidate_id.0, term = req.term.0, "Vote RPC");
         let resp = self.handler.handle_vote(req).await.map_err(|e| {
             error!(target: "xraft_transport::server", "Vote handler error: {e}");
-            Status::internal(format!("vote handler error: {e}"))
+            status_from_error(&e, "vote")
         })?;
         Ok(Response::new(pb::VoteResponse::from(&resp)))
     }
@@ -75,7 +88,7 @@ impl<H: RaftMessageHandler> RaftService for RaftGrpcServer<H> {
         debug!(target: "xraft_transport::server", candidate = req.candidate_id.0, next_term = req.next_term.0, "PreVote RPC");
         let resp = self.handler.handle_pre_vote(req).await.map_err(|e| {
             error!(target: "xraft_transport::server", "PreVote handler error: {e}");
-            Status::internal(format!("pre_vote handler error: {e}"))
+            status_from_error(&e, "pre_vote")
         })?;
         Ok(Response::new(pb::PreVoteResponse::from(&resp)))
     }
@@ -88,7 +101,7 @@ impl<H: RaftMessageHandler> RaftService for RaftGrpcServer<H> {
         debug!(target: "xraft_transport::server", replica = req.replica_id.0, fetch_offset = req.fetch_offset.0, "Fetch RPC");
         let resp = self.handler.handle_fetch(req).await.map_err(|e| {
             error!(target: "xraft_transport::server", "Fetch handler error: {e}");
-            Status::internal(format!("fetch handler error: {e}"))
+            status_from_error(&e, "fetch")
         })?;
         let proto_resp = pb::FetchResponse::try_from(&resp).map_err(|e| {
             error!(target: "xraft_transport::server", "Fetch response encode error: {e}");
@@ -107,13 +120,15 @@ impl<H: RaftMessageHandler> RaftService for RaftGrpcServer<H> {
         debug!(target: "xraft_transport::server", replica = req.replica_id.0, snapshot_id = %req.snapshot_id, "FetchSnapshot RPC");
         let stream = self.handler.handle_fetch_snapshot(req).await.map_err(|e| {
             error!(target: "xraft_transport::server", "FetchSnapshot handler error: {e}");
-            Status::internal(format!("fetch_snapshot handler error: {e}"))
+            status_from_error(&e, "fetch_snapshot")
         })?;
         let mapped: Self::FetchSnapshotStream = Box::pin(stream.map(|item| match item {
             Ok(chunk) => Ok(pb::FetchSnapshotChunk::from(&chunk)),
-            Err(e) => Err(Status::internal(format!(
-                "fetch_snapshot stream error: {e}"
-            ))),
+            // Stream-mid errors get the same Transport->Unavailable
+            // mapping so the client's retriable-eviction policy can
+            // fire even when the failure surfaces inside the stream
+            // (not just on initial connect).
+            Err(e) => Err(status_from_error(&e, "fetch_snapshot stream")),
         }));
         Ok(Response::new(mapped))
     }
