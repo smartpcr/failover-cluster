@@ -1,62 +1,74 @@
-//! Raft log entry definitions used by the xraft core.
-//!
-//! Each committed entry in the replicated log carries a term, an index, a
-//! payload, and an [`EntryType`] tag that tells the state machine and the
-//! cluster-management layer how the payload should be interpreted.
-
 use serde::{Deserialize, Serialize};
 
-/// Classifies a single entry in the Raft log.
+/// Classification of a Raft log entry.
 ///
-/// The variant determines how the entry is applied:
-///
-/// * [`EntryType::NoOp`] — committed by a newly elected leader to advance the
-///   commit index of its term without altering state machine state.
-/// * [`EntryType::Command`] — an opaque client command that is forwarded to
-///   the state machine when committed.
-/// * [`EntryType::Configuration`] — a cluster membership change that updates
-///   the active voter set as part of joint-consensus reconfiguration.
+/// Used by the log compaction pipeline to decide which entries can be
+/// discarded after a snapshot is installed and which must be preserved
+/// (e.g. configuration changes that affect cluster membership).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EntryType {
-    /// No-op entry written at the start of a new leader's term.
+    /// A no-op entry committed by a newly elected leader to advance the
+    /// commit index for entries from previous terms.
     NoOp,
-    /// Client command to be applied to the state machine on commit.
-    Command,
-    /// Cluster membership / configuration change.
-    Configuration,
+
+    /// A normal state-machine command replicated to followers and applied
+    /// once committed.
+    Normal,
+
+    /// A cluster membership change (joint consensus or single-server
+    /// reconfiguration). Must be retained across compaction so the
+    /// configuration history can be replayed.
+    ConfigChange,
+
+    /// A marker entry indicating that a snapshot was installed at this
+    /// index. Entries at or below the snapshot's last-included index can
+    /// be removed by the compaction pipeline.
+    Snapshot,
 }
 
-/// A single entry in the Raft replicated log.
+/// A single Raft log entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// Leader term in which this entry was created.
-    pub term: u64,
-    /// Monotonically increasing position of this entry in the log.
+    /// Monotonically increasing log index assigned by the leader.
     pub index: u64,
-    /// Classification tag for this entry.
-    pub entry_type: EntryType,
-    /// Opaque payload bytes; interpretation depends on `entry_type`.
-    pub data: Vec<u8>,
+
+    /// Term in which this entry was created by the leader.
+    pub term: u64,
+
+    /// Classification of this entry.
+    pub kind: EntryType,
+
+    /// Opaque payload — a serialized state-machine command, configuration
+    /// change descriptor, or snapshot metadata, depending on `kind`.
+    pub payload: Vec<u8>,
 }
 
 impl LogEntry {
     /// Construct a new log entry.
-    pub fn new(term: u64, index: u64, entry_type: EntryType, data: Vec<u8>) -> Self {
-        Self {
-            term,
-            index,
-            entry_type,
-            data,
-        }
+    pub fn new(index: u64, term: u64, kind: EntryType, payload: Vec<u8>) -> Self {
+        Self { index, term, kind, payload }
     }
 
-    /// Returns `true` if this entry represents a configuration change.
-    pub fn is_configuration(&self) -> bool {
-        matches!(self.entry_type, EntryType::Configuration)
+    /// Returns `true` if this entry may be discarded once a snapshot covers
+    /// its index. Configuration changes and snapshot markers are retained.
+    pub fn is_compactable(&self) -> bool {
+        matches!(self.kind, EntryType::Normal | EntryType::NoOp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_and_noop_are_compactable() {
+        assert!(LogEntry::new(1, 1, EntryType::Normal, vec![]).is_compactable());
+        assert!(LogEntry::new(2, 1, EntryType::NoOp, vec![]).is_compactable());
     }
 
-    /// Returns `true` if this entry is a leader-elected no-op marker.
-    pub fn is_noop(&self) -> bool {
-        matches!(self.entry_type, EntryType::NoOp)
+    #[test]
+    fn config_change_and_snapshot_are_retained() {
+        assert!(!LogEntry::new(3, 1, EntryType::ConfigChange, vec![]).is_compactable());
+        assert!(!LogEntry::new(4, 1, EntryType::Snapshot, vec![]).is_compactable());
     }
 }
