@@ -3070,7 +3070,7 @@ port = 6000
             tls_ca_path: None,
             tls_domain_name: None,
             connect_timeout_ms: 5_000,
-            rpc_timeout_ms: 10_000,
+            rpc_timeout_ms: 30_000,
             max_rpc_retries: 3,
             retry_initial_backoff_ms: 100,
             retry_max_backoff_ms: 5_000,
@@ -3994,6 +3994,7 @@ port = 6004
             entries,
             diverging_epoch,
             snapshot_redirect: None,
+            is_leader: true,
         }
     }
 
@@ -5721,6 +5722,7 @@ port = 6000
                 last_included_index: LogIndex(last_included_index),
                 last_included_term: Term(last_included_term),
             }),
+            is_leader: true,
         }
     }
 
@@ -5813,6 +5815,7 @@ port = 6000
                 last_included_index: LogIndex(50),
                 last_included_term: Term(4),
             }),
+            is_leader: true,
         };
 
         let actions = node.handle_fetch_response(resp);

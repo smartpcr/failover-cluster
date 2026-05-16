@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_core::Stream;
+use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::{Interval, MissedTickBehavior, interval};
@@ -215,10 +216,63 @@ struct ClientCommand {
     reply: oneshot::Sender<XResult<LogIndex>>,
 }
 
+/// Client read query submitted via [`DriverHandle::query`].
+///
+/// Stage 6.2 embedded read API: the driver is the only owner of the
+/// state machine (and the only owner of `last_applied`), so routing
+/// the read through the same single-threaded event loop guarantees
+/// the SM is consistent at apply-cursor `last_applied >= commit_index`
+/// at the moment the query is served — i.e. the read observes every
+/// committed entry up to (at least) the engine's current commit
+/// boundary.
+///
+/// Read serves are leader-only: a follower has no quorum-bounded
+/// apply lease and would risk returning stale state. The handler
+/// returns `XRaftError::NotLeader { leader_hint }` so the caller can
+/// route to the actual leader without an extra round-trip.
+struct ClientQuery {
+    query: Bytes,
+    reply: oneshot::Sender<XResult<Bytes>>,
+}
+
+/// Public summary of a successfully-triggered snapshot.
+///
+/// Returned by [`DriverHandle::trigger_snapshot`] and
+/// [`crate::ServerHandle::trigger_snapshot`]; serialised onto the wire
+/// by the admin HTTP handler so
+/// `xraft_client::admin::AdminClient::trigger_snapshot` can surface
+/// the same data to its caller.
+///
+/// Field meanings track `SnapshotMeta`: `last_included_index` /
+/// `last_included_term` describe the log-anchor the snapshot covers
+/// up to (inclusive), and `size_bytes` reports the serialised payload
+/// length the state machine produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct TriggeredSnapshotInfo {
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub size_bytes: u64,
+}
+
 /// Unified event consumed by the driver loop.
 enum DriverEvent {
     Inbound(InboundRpc),
     Client(ClientCommand),
+    /// Embedded read API (Stage 6.2) — see [`ClientQuery`].
+    Query(ClientQuery),
+    /// Operator-triggered snapshot (Stage 6.2, evaluator feedback
+    /// iter 1 item 2). Drives `handle_take_snapshot` against the
+    /// driver's current `commit_index` and replies via the oneshot
+    /// with the resulting [`TriggeredSnapshotInfo`]. Rejected with
+    /// `XRaftError::NotLeader` when the driver is not the leader:
+    /// operator tooling routes the request to the leader via the
+    /// admin-status endpoint and re-issues. Rejected with
+    /// `XRaftError::Config` when a snapshot is already in flight
+    /// (gating off the engine's `snapshot_in_flight` flag). Rejected
+    /// with `XRaftError::Shutdown` during graceful drain / fail-stop.
+    TriggerSnapshot {
+        reply: oneshot::Sender<XResult<TriggeredSnapshotInfo>>,
+    },
     /// Hot-reload the driver's tick interval.
     ///
     /// Sent by [`DriverHandle::reload_tick_interval`] when SIGHUP-driven
@@ -326,6 +380,37 @@ impl DriverHandle {
         }
     }
 
+    /// Submit a read query against the leader's committed state.
+    ///
+    /// Stage 6.2 embedded read API (per `architecture.md` §2.4 and
+    /// `e2e-scenarios.md` Feature 11). Returns:
+    ///
+    /// - `Ok(bytes)` — the [`StateMachine::query`] result against the
+    ///   leader's currently-applied state.
+    /// - `Err(XRaftError::NotLeader { leader_hint })` — caller MUST
+    ///   route the query to `leader_hint` (or discover the leader via
+    ///   the admin status endpoint).
+    /// - `Err(XRaftError::Shutdown)` — the driver shut down before
+    ///   the query was served.
+    ///
+    /// The query is serialised through the driver's single event loop,
+    /// so it observes every entry the engine has committed up to and
+    /// including `last_applied` at serve time. A more aggressive
+    /// linearisable-read protocol (read-index / lease-fenced reads) is
+    /// out of scope for v1 — see `tech-spec.md` §2.6.
+    pub async fn query(&self, query: Bytes) -> XResult<Bytes> {
+        let (tx, rx) = oneshot::channel();
+        let q = ClientQuery { query, reply: tx };
+        self.events
+            .send(DriverEvent::Query(q))
+            .await
+            .map_err(|_| XRaftError::Transport(PROPOSE_CHANNEL_CLOSED.to_string()))?;
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => Err(XRaftError::Shutdown),
+        }
+    }
+
     /// Trigger a graceful shutdown of the driver loop. Returns
     /// immediately; the loop drains in-flight work and returns from
     /// [`Driver::run`].
@@ -335,6 +420,37 @@ impl DriverHandle {
         // the loop awaits `notified()` still wakes the loop on its
         // first poll.
         self.shutdown.notify_one();
+    }
+
+    /// Operator-triggered snapshot (Stage 6.2 evaluator feedback iter
+    /// 1 item 2). Sends a `DriverEvent::TriggerSnapshot` to the
+    /// driver, which:
+    /// 1. Returns `Err(XRaftError::NotLeader { leader_hint })` when
+    ///    the local node is not the leader. Operator tooling routes
+    ///    the request to the actual leader via the admin status
+    ///    endpoint (`/admin/status`).
+    /// 2. Otherwise calls `handle_take_snapshot(commit_index)` —
+    ///    asking the state machine for a serialised snapshot,
+    ///    persisting it via the `SnapshotStore`, and feeding the
+    ///    `Input::SnapshotComplete` follow-up through the engine.
+    ///    Replies with `Ok(LogIndex)` carrying the `through_index`
+    ///    the snapshot was taken at.
+    /// 3. Returns `Err(XRaftError::Shutdown)` if the driver has
+    ///    already stepped down (graceful drain / fail-stop).
+    ///
+    /// Mirrors the rejection semantics of [`Self::propose`] /
+    /// [`Self::query`] so a caller can use the same retry / routing
+    /// logic.
+    pub async fn trigger_snapshot(&self) -> XResult<TriggeredSnapshotInfo> {
+        let (tx, rx) = oneshot::channel();
+        self.events
+            .send(DriverEvent::TriggerSnapshot { reply: tx })
+            .await
+            .map_err(|_| XRaftError::Transport(PROPOSE_CHANNEL_CLOSED.to_string()))?;
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => Err(XRaftError::Shutdown),
+        }
     }
 
     /// Apply a new tick interval to the running driver.
@@ -1374,6 +1490,10 @@ where
                     match event {
                         DriverEvent::Inbound(rpc) => self.handle_inbound(rpc).await,
                         DriverEvent::Client(cmd) => self.handle_client_command(cmd).await,
+                        DriverEvent::Query(q) => self.handle_client_query(q),
+                        DriverEvent::TriggerSnapshot { reply } => {
+                            self.handle_trigger_snapshot(reply).await;
+                        }
                         DriverEvent::ReloadTickInterval(new) => {
                             // Live-apply SIGHUP-triggered tick-interval change.
                             // Rebuild `self.tick` so the next select! arm
@@ -1614,6 +1734,125 @@ where
         }
 
         self.process_actions(actions, None).await;
+    }
+
+    /// Serve a read [`ClientQuery`] against the leader's currently-
+    /// applied state.
+    ///
+    /// Stage 6.2 embedded read API. Leader-only: a follower returns
+    /// `NotLeader { leader_hint }` so the caller can route. The query
+    /// is dispatched synchronously inside the event loop (no `.await`)
+    /// because `StateMachine::query` is sync — this also guarantees no
+    /// other event slips in between the apply that bumped
+    /// `last_applied` and the query that observes it.
+    fn handle_client_query(&self, q: ClientQuery) {
+        if self.node.role != NodeRole::Leader {
+            let _ = q.reply.send(Err(XRaftError::NotLeader {
+                leader_hint: self.node.leader_id,
+            }));
+            return;
+        }
+        let result = self.state_machine.query(&q.query).map(Bytes::from);
+        let _ = q.reply.send(result);
+    }
+
+    /// Handle [`DriverEvent::TriggerSnapshot`] — operator-triggered
+    /// snapshot (Stage 6.2 evaluator feedback iter 1 item 2). Mirrors
+    /// the engine-emitted `Action::TakeSnapshot` cycle through
+    /// [`Self::handle_take_snapshot`] at the current `commit_index`.
+    ///
+    /// Replies with:
+    /// - `Err(XRaftError::NotLeader { leader_hint })` when the local
+    ///   node is not the leader. (Snapshotting on a follower would
+    ///   capture potentially-stale `last_applied` state and confuse
+    ///   the snapshot anchor's `voter_set` claim — only the leader
+    ///   has authoritative knowledge of which entries are committed.)
+    /// - `Err(XRaftError::Storage(_))` when the SnapshotStore or
+    ///   StateMachine returns an error during snapshot persistence;
+    ///   in this case the driver halts (fail-stop) per the
+    ///   action-list contract.
+    /// - `Ok(LogIndex)` carrying the `through_index` (= local
+    ///   `commit_index`) the snapshot was taken at.
+    ///
+    /// The follow-up actions emitted by the engine (e.g.
+    /// `Action::TruncateLog` for prefix compaction) are pushed back
+    /// through `process_actions` so the post-snapshot truncation
+    /// happens transparently to the caller.
+    async fn handle_trigger_snapshot(
+        &mut self,
+        reply: oneshot::Sender<XResult<TriggeredSnapshotInfo>>,
+    ) {
+        if self.node.role != NodeRole::Leader {
+            let _ = reply.send(Err(XRaftError::NotLeader {
+                leader_hint: self.node.leader_id,
+            }));
+            return;
+        }
+        // Reject concurrent triggers — the engine already has a
+        // snapshot in flight (a prior `Action::TakeSnapshot` whose
+        // `Input::SnapshotComplete` follow-up has not yet flowed back
+        // through `process_actions`). Driving two concurrent
+        // state-machine snapshots would either double-load the SM or
+        // write a stale anchor when both completions race; cleaner to
+        // surface a `Config` error so the operator backs off and
+        // retries.
+        if self.node.snapshot_in_flight {
+            let _ = reply.send(Err(XRaftError::Config(
+                "snapshot already in flight; retry after current snapshot completes".to_string(),
+            )));
+            return;
+        }
+        let through_index = self.node.commit_index;
+        info!(
+            target: "xraft_server::driver",
+            node_id = %self.node.id,
+            through_index = %through_index,
+            "operator-triggered snapshot starting"
+        );
+        match self.take_snapshot_with_meta(through_index) {
+            Ok((meta, follow_ups)) => {
+                // Push follow-on actions (e.g. TruncateLog from the
+                // engine's SnapshotComplete) through the same
+                // worklist plumbing the engine-driven path uses. We
+                // forward them via process_actions so prefix
+                // compaction lands transparently.
+                //
+                // Evaluator iter-2 item 1: a follow-up
+                // TruncateLog/flush failure inside `process_actions`
+                // sets `captured.error` AND `self.halt_reason` so the
+                // driver fail-stops on the next loop iteration. We
+                // MUST surface that error to the admin caller too —
+                // returning Ok(TriggeredSnapshotInfo) while the
+                // driver is about to halt would lie to the operator
+                // and hide the storage failure behind a successful
+                // HTTP response.
+                let captured = self.process_actions(follow_ups, None).await;
+                if let Some(err) = captured.error {
+                    error!(
+                        target: "xraft_server::driver",
+                        node_id = %self.node.id,
+                        last_included_index = %meta.last_included_index,
+                        error = %err,
+                        "operator-triggered snapshot persisted but a follow-up action failed; reporting failure to the admin caller"
+                    );
+                    let _ = reply.send(Err(err));
+                    return;
+                }
+                let info = TriggeredSnapshotInfo {
+                    last_included_index: meta.last_included_index.0,
+                    last_included_term: meta.last_included_term.0,
+                    size_bytes: meta.size_bytes.unwrap_or(0),
+                };
+                let _ = reply.send(Ok(info));
+            }
+            Err(e) => {
+                let msg = format!("operator-triggered snapshot failed: {e}");
+                error!(target: "xraft_server::driver", %msg, "halting driver");
+                let halt = XRaftError::Storage(msg.clone());
+                self.halt_reason.get_or_insert(msg);
+                let _ = reply.send(Err(halt));
+            }
+        }
     }
 
     async fn handle_inbound(&mut self, rpc: InboundRpc) {
@@ -2187,6 +2426,10 @@ where
                             last_included_index: snapshot_metadata.last_included_index,
                             last_included_term: snapshot_metadata.last_included_term,
                         }),
+                        // RedirectToSnapshot is leader-emitted from
+                        // the leader role: the engine only schedules
+                        // this when serving fetch as the leader.
+                        is_leader: true,
                     };
 
                     debug!(
@@ -2280,6 +2523,10 @@ where
                     last_included_index: snap_meta.last_included_index,
                     last_included_term: snap_meta.last_included_term,
                 }),
+                // materialize_fetch_response is only invoked from
+                // the leader's serve-fetch path; the snapshot
+                // redirect is leader-authoritative.
+                is_leader: true,
             });
         }
 
@@ -2351,6 +2598,12 @@ where
             entries,
             diverging_epoch: diverging,
             snapshot_redirect: None,
+            // materialize_fetch_response is the leader's authoritative
+            // serve-fetch path (entries / divergence). Mark as such so
+            // followers cache this hint, in contrast to the
+            // best-effort `default_deny_fetch` reply emitted by a
+            // non-leader.
+            is_leader: true,
         })
     }
 
@@ -2515,6 +2768,21 @@ where
     ///
     /// On error the caller fails the driver fail-stop contract.
     fn handle_take_snapshot(&mut self, through_index: LogIndex) -> XResult<Vec<Action>> {
+        let (_meta, follow_ups) = self.take_snapshot_with_meta(through_index)?;
+        Ok(follow_ups)
+    }
+
+    /// Internal helper shared by the engine-emitted
+    /// `Action::TakeSnapshot` path and the operator-triggered
+    /// [`DriverEvent::TriggerSnapshot`] path. Returns both the
+    /// canonical [`SnapshotMeta`] (so operator tooling can echo
+    /// `(last_included_index, last_included_term, size_bytes)` back
+    /// over the admin wire) and the engine's follow-on actions
+    /// (e.g. `Action::TruncateLog`).
+    fn take_snapshot_with_meta(
+        &mut self,
+        through_index: LogIndex,
+    ) -> XResult<(SnapshotMeta, Vec<Action>)> {
         // Resolve the term at `through_index` — required for the
         // SnapshotMeta. The engine cannot supply this itself because it
         // does not hold log entries (only the index/term mirror tail).
@@ -2578,8 +2846,10 @@ where
             "snapshot saved; feeding SnapshotComplete to engine"
         );
 
-        let follow_ups = self.node.step(Input::SnapshotComplete { metadata });
-        Ok(follow_ups)
+        let follow_ups = self.node.step(Input::SnapshotComplete {
+            metadata: metadata.clone(),
+        });
+        Ok((metadata, follow_ups))
     }
 
     /// Handle [`Action::InstallSnapshot`]: restore the state machine
@@ -2827,6 +3097,16 @@ where
             entries: Vec::new(),
             diverging_epoch: None,
             snapshot_redirect: None,
+            // Stage 6.2 (evaluator feedback iter 1 item 5): a
+            // non-leader response — `leader_id` is the best-effort
+            // hint from our local view (which falls back to `self.id`
+            // when no leader is known). Mark this reply as
+            // `is_leader=false` so a `PeerClient` does NOT cache
+            // `leader_id` as the routing hint from this response. A
+            // subsequent reply from the real leader (carrying
+            // `is_leader=true`) is the only signal that updates the
+            // routing hint.
+            is_leader: false,
         }
     }
 
@@ -2876,6 +3156,23 @@ where
                         // create new log/durability/network obligations
                         // a node about to exit cannot satisfy.
                         let _ = cmd.reply.send(Err(XRaftError::Shutdown));
+                    }
+                    Some(DriverEvent::Query(q)) => {
+                        // Reject reads during drain — the SM may not
+                        // observe further committed entries before the
+                        // loop exits, so a returned snapshot could be
+                        // stale relative to any post-drain leader's
+                        // view. Operators should retry against the new
+                        // leader once drain completes.
+                        let _ = q.reply.send(Err(XRaftError::Shutdown));
+                    }
+                    Some(DriverEvent::TriggerSnapshot { reply }) => {
+                        // Reject operator-triggered snapshots during
+                        // drain — taking a new snapshot would race the
+                        // shutdown flush and risk a half-written
+                        // snapshot file. Operators retry against the
+                        // new leader once drain completes.
+                        let _ = reply.send(Err(XRaftError::Shutdown));
                     }
                     Some(DriverEvent::ReloadTickInterval(_)) => {
                         // Hot-reload during graceful drain is a no-op:
@@ -2939,6 +3236,21 @@ where
                 DriverEvent::Inbound(rpc) => self.reply_halt_to_inbound(rpc, &reason),
                 DriverEvent::Client(cmd) => {
                     let _ = cmd.reply.send(Err(XRaftError::Storage(reason.clone())));
+                }
+                DriverEvent::Query(q) => {
+                    // Fail-stop: state machine consistency cannot be
+                    // guaranteed after a persistence failure (a missed
+                    // apply could mean stale reads), so reply with the
+                    // halt reason instead of serving a possibly-stale
+                    // query.
+                    let _ = q.reply.send(Err(XRaftError::Storage(reason.clone())));
+                }
+                DriverEvent::TriggerSnapshot { reply } => {
+                    // Fail-stop: storage is the thing that just failed;
+                    // a snapshot would either re-trip the failure or
+                    // write a corrupted file. Reply with the halt
+                    // reason.
+                    let _ = reply.send(Err(XRaftError::Storage(reason.clone())));
                 }
                 DriverEvent::ReloadTickInterval(_) => {
                     // Halt path drops reload events — the driver is
@@ -3224,6 +3536,13 @@ mod tests {
         /// When set, the next `truncate_from` call returns a storage
         /// error. Used to verify install-snapshot wipe halts on error.
         fail_next_truncate: Arc<std::sync::atomic::AtomicBool>,
+        /// When set, the next `purge_prefix` call returns a storage
+        /// error. Used by Stage 6.2 (evaluator iter-2 item 1) to verify
+        /// that an operator-triggered snapshot whose follow-up
+        /// `Action::TruncateLog(PrefixThroughInclusive)` fails surfaces
+        /// the failure to the admin caller (and halts the driver)
+        /// rather than silently returning `Ok(TriggeredSnapshotInfo)`.
+        fail_next_purge_prefix: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl LogStore for TestLogStore {
@@ -3277,6 +3596,14 @@ mod tests {
             Ok(())
         }
         fn purge_prefix(&mut self, through_index_inclusive: LogIndex) -> XResult<()> {
+            if self
+                .fail_next_purge_prefix
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(XRaftError::Storage(format!(
+                    "injected purge_prefix failure at {through_index_inclusive}"
+                )));
+            }
             // Stage 5.3 prefix compaction: drop entries `<= through`.
             // Idempotent — retain is a single-pass walk that no-ops when
             // the prefix is already gone.
@@ -3697,6 +4024,12 @@ port = 6000
         /// call return an error. Used by Stage 5.2 fail-stop tests for
         /// the install-snapshot wipe path.
         fail_next_truncate: Arc<std::sync::atomic::AtomicBool>,
+        /// Flip to `true` to make the NEXT `log_store.purge_prefix()`
+        /// call return an error. Used by Stage 6.2 (evaluator iter-2
+        /// item 1) to verify operator-triggered snapshots surface a
+        /// follow-up purge failure to the admin caller rather than
+        /// silently returning `Ok`.
+        fail_next_purge_prefix: Arc<std::sync::atomic::AtomicBool>,
     }
 
     /// Build a driver pre-wired with capture-aware test doubles for the
@@ -3710,6 +4043,7 @@ port = 6000
         let log = TestLogStore::default();
         let fail_next_get_range = log.fail_next_get_range.clone();
         let fail_next_truncate = log.fail_next_truncate.clone();
+        let fail_next_purge_prefix = log.fail_next_purge_prefix.clone();
         let hs = TestHardStateStore::default();
         let ss = TestSnapshotStore::default();
         let saved_snapshots = ss.saved.clone();
@@ -3747,6 +4081,7 @@ port = 6000
                 fail_next_apply,
                 fail_next_get_range,
                 fail_next_truncate,
+                fail_next_purge_prefix,
             },
         )
     }
@@ -7130,6 +7465,101 @@ port = 6012
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].0.last_included_index, LogIndex(150));
         assert_eq!(saved[0].1, snapshot_payload);
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 6.2 evaluator iter-2 item 1 — operator-triggered snapshot
+    // surfaces a follow-up purge_prefix failure to the admin caller
+    // instead of returning Ok and silently halting the driver.
+    //
+    // Scenario: a leader receives a `DriverEvent::TriggerSnapshot`
+    // (the admin HTTP `POST /admin/trigger-snapshot` path). The
+    // state-machine snapshot + SnapshotStore.save_snapshot succeed,
+    // so `take_snapshot_with_meta` returns Ok with follow-up
+    // `Action::TruncateLog(PrefixThroughInclusive(...))`. The
+    // follow-up's `purge_prefix` call then fails (e.g. disk error
+    // on segment-file deletion). The fix: the admin caller MUST
+    // receive `Err(Storage(...))` so the operator's dashboard does
+    // not show "snapshot ok" while the driver halts on its next
+    // tick. Previously the captured response was discarded and the
+    // caller was told `Ok(TriggeredSnapshotInfo)`.
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn trigger_snapshot_followup_purge_failure_surfaces_error_to_caller() {
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
+
+        // Promote to Leader explicitly so `handle_trigger_snapshot`
+        // does not short-circuit with `NotLeader`. The default
+        // post-construction role is Follower.
+        driver.node.role = NodeRole::Leader;
+        driver.node.leader_id = Some(driver.node.id);
+        driver.node.hard_state.current_term = Term(4);
+
+        // Seed a small log so the engine has prefix work to do when
+        // it processes `Input::SnapshotComplete`.
+        let entries: Vec<Entry> = (1..=10)
+            .map(|i| Entry {
+                index: LogIndex(i),
+                term: Term(4),
+                payload: EntryPayload::Command(Bytes::from(format!("cmd-{i}").into_bytes())),
+            })
+            .collect();
+        driver
+            .log_store
+            .append(&entries)
+            .expect("seed entries into the log store");
+        driver.node.set_last_log(LogIndex(10), Term(4));
+        driver.node.commit_index = LogIndex(10);
+        driver.node.last_applied = LogIndex(10);
+
+        // Pre-seed snapshot bytes so save_snapshot is deterministic.
+        *h.snapshot_payload.lock().unwrap() = b"trigger-snapshot-payload".to_vec();
+
+        // Arm the failure injection: the FOLLOW-UP TruncateLog(
+        // PrefixThroughInclusive(10)) that the engine emits after
+        // `Input::SnapshotComplete` will hit `purge_prefix` and
+        // return Storage(...). This is the path the fix exercises.
+        h.fail_next_purge_prefix
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        driver.handle_trigger_snapshot(reply_tx).await;
+
+        let result = reply_rx.await.expect("reply channel closed unexpectedly");
+        match result {
+            Err(XRaftError::Storage(msg)) => {
+                assert!(
+                    msg.contains("purge_prefix"),
+                    "error must propagate the underlying purge_prefix failure, got: {msg}",
+                );
+            }
+            other => panic!(
+                "expected Storage error from follow-up purge failure, got {other:?}; the admin caller must NOT receive Ok when the post-snapshot truncation fails",
+            ),
+        }
+
+        // The fail-stop contract: process_actions also sets
+        // `halt_reason`, so the driver's main loop would shut down
+        // on the next iteration. We don't run the loop here, but the
+        // halt_reason MUST be set so a follow-up tick triggers
+        // fail_stop_shutdown.
+        assert!(
+            driver.halt_reason.is_some(),
+            "follow-up purge failure must arm the driver's halt_reason for fail-stop on the next tick",
+        );
+
+        // The snapshot itself DID land in the store before the
+        // follow-up failed — we report failure to the caller but the
+        // partial state is preserved so the operator can inspect it.
+        let saved = h.saved_snapshots.lock().unwrap().clone();
+        assert_eq!(
+            saved.len(),
+            1,
+            "snapshot bytes should have been saved BEFORE the follow-up purge failed",
+        );
+        assert_eq!(saved[0].0.last_included_index, LogIndex(10));
     }
 
     // -----------------------------------------------------------------

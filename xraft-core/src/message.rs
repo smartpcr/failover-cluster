@@ -428,6 +428,19 @@ pub struct FetchResponse {
     /// leader's compacted prefix; instructs the follower to switch to
     /// `FetchSnapshot` to catch up.
     pub snapshot_redirect: Option<SnapshotRedirect>,
+    /// Stage 6.2 leader-hint integrity flag (evaluator feedback iter
+    /// 1 item 5). `true` iff the responder is acting as the leader
+    /// at response time — i.e. the response carries authoritative
+    /// leader state (entries / divergence / snapshot redirect served
+    /// from leader role). `false` on the `default_deny_fetch` path
+    /// where the responder echoes `leader_id` as a best-effort hint
+    /// (possibly its own id when no leader is known). Clients
+    /// (`xraft-client::PeerClient`) cache the `(leader_id,
+    /// leader_epoch)` tuple as a routing hint ONLY when this is
+    /// `true`, otherwise a hint sourced from a non-authoritative
+    /// response could pin the cache to a deposed leader or to the
+    /// responder's own id.
+    pub is_leader: bool,
 }
 
 /// Request to fetch a snapshot from the leader (chunked transfer).
@@ -687,6 +700,7 @@ impl TryFrom<&FetchResponse> for proto::FetchResponse {
                 .snapshot_redirect
                 .as_ref()
                 .map(proto::SnapshotRedirect::from),
+            is_leader: r.is_leader,
         })
     }
 }
@@ -705,6 +719,7 @@ impl TryFrom<proto::FetchResponse> for FetchResponse {
             entries: entries?,
             diverging_epoch: p.diverging_epoch.map(DivergingEpoch::from),
             snapshot_redirect: p.snapshot_redirect.map(SnapshotRedirect::from),
+            is_leader: p.is_leader,
         })
     }
 }
@@ -1145,6 +1160,7 @@ mod tests {
                 end_offset: LogIndex(8),
             }),
             snapshot_redirect: None,
+            is_leader: true,
         };
         let proto_resp = proto::FetchResponse::try_from(&resp).unwrap();
         let mut buf = Vec::new();
@@ -1173,6 +1189,7 @@ mod tests {
             entries: vec![],
             diverging_epoch: None,
             snapshot_redirect: None,
+            is_leader: true,
         };
         let proto_resp = proto::FetchResponse::try_from(&resp).unwrap();
         let mut buf = Vec::new();
@@ -1202,6 +1219,7 @@ mod tests {
                 last_included_index: LogIndex(123),
                 last_included_term: Term(8),
             }),
+            is_leader: true,
         };
         let proto_resp = proto::FetchResponse::try_from(&resp).unwrap();
         let mut buf = Vec::new();
@@ -1223,6 +1241,36 @@ mod tests {
         assert_eq!(redirect.snapshot_id, "snap-roundtrip");
         assert_eq!(redirect.last_included_index, LogIndex(123));
         assert_eq!(redirect.last_included_term, Term(8));
+        assert!(
+            rt.is_leader,
+            "is_leader=true must survive the proto roundtrip"
+        );
+    }
+
+    /// Stage 6.2 (evaluator feedback iter 1 item 5): a non-leader
+    /// responder MUST be able to signal `is_leader=false` on the wire
+    /// so a follower's hint cache does not pin to a deposed leader.
+    #[test]
+    fn proto_roundtrip_fetch_response_default_deny_carries_is_leader_false() {
+        let resp = FetchResponse {
+            cluster_id: "c".into(),
+            leader_epoch: 0,
+            leader_id: NodeId(3),
+            high_watermark: LogIndex(0),
+            entries: vec![],
+            diverging_epoch: None,
+            snapshot_redirect: None,
+            is_leader: false,
+        };
+        let proto_resp = proto::FetchResponse::try_from(&resp).unwrap();
+        let mut buf = Vec::new();
+        proto_resp.encode(&mut buf).unwrap();
+        let decoded = proto::FetchResponse::decode(buf.as_slice()).unwrap();
+        let rt = FetchResponse::try_from(decoded).unwrap();
+        assert!(
+            !rt.is_leader,
+            "non-leader default_deny response must roundtrip is_leader=false"
+        );
     }
 
     #[test]

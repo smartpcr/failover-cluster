@@ -56,7 +56,7 @@ fn single_voter_cluster_config(data_dir: PathBuf) -> ClusterConfig {
         tls_ca_path: None,
         tls_domain_name: None,
         connect_timeout_ms: 5_000,
-        rpc_timeout_ms: 10_000,
+        rpc_timeout_ms: 30_000,
         max_rpc_retries: 3,
         retry_initial_backoff_ms: 100,
         retry_max_backoff_ms: 5_000,

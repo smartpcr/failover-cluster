@@ -162,7 +162,13 @@ fn default_connect_timeout_ms() -> u64 {
     5_000
 }
 fn default_rpc_timeout_ms() -> u64 {
-    10_000
+    // 30s end-to-end per-attempt budget. Picked to match the Stage 6.2
+    // workstream brief ("request: 30s") and to cover the slowest known
+    // operation (`FetchSnapshot` streaming a multi-MB snapshot over a
+    // congested WAN link). Each retry attempt gets the full budget;
+    // total time-on-the-wire for an RPC that exhausts `max_rpc_retries`
+    // is bounded by `rpc_timeout_ms * (max_rpc_retries + 1) + Σ backoff`.
+    30_000
 }
 fn default_max_rpc_retries() -> usize {
     3
@@ -1683,7 +1689,7 @@ port = 6000
         assert!(cfg.tls_ca_path.is_none());
         assert!(cfg.tls_domain_name.is_none());
         assert_eq!(cfg.connect_timeout_ms, 5_000);
-        assert_eq!(cfg.rpc_timeout_ms, 10_000);
+        assert_eq!(cfg.rpc_timeout_ms, 30_000);
         assert_eq!(cfg.max_rpc_retries, 3);
         assert_eq!(cfg.retry_initial_backoff_ms, 100);
         assert_eq!(cfg.retry_max_backoff_ms, 5_000);
