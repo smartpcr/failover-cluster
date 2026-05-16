@@ -78,20 +78,27 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// Channel capacity for the outbound-result mpsc.
 const OUTBOUND_CHANNEL_CAPACITY: usize = 1024;
 
-/// Stage 7.1 (iter-6 evaluator finding #1) ΓÇö maximum number of
+/// Stage 7.1 (iter-2 evaluator finding #1) ΓÇö maximum number of
 /// pending lease-slow-path reads the driver will buffer before
 /// rejecting new queries with `NotLeader { leader_hint: None }`.
 ///
-/// The slow path enqueues an inbound `ClientQuery` when
-/// `enable_leader_lease` is on but the lease is currently inactive,
-/// waiting for a quorum of voters to confirm leadership via fresh
-/// inbound `FetchRequest`s. Under healthy operation the queue drains
-/// within one or two ticks; under sustained partition it can grow
-/// without bound, eventually trying to retain an `oneshot::Sender`
-/// per buffered read. Capping the queue prevents memory exhaustion
-/// when followers are offline and routes excess load back to the
-/// caller (which can retry once the cluster recovers). Set to 1024
-/// so a moderate read burst fits without spilling, while a partition
+/// The slow path enqueues an inbound `ClientQuery` whenever the
+/// leader cannot answer immediately without the commit-index
+/// confirmation round-trip ΓÇö i.e. either:
+///   * `enable_leader_lease` is OFF (Stage 7.1 brief: every read
+///     MUST go through quorum confirmation in this mode), OR
+///   * `enable_leader_lease` is ON but
+///     `RaftNode::has_active_lease()` returns false (the lease has
+///     not yet been re-validated by a quorum of voters within the
+///     current `check_quorum_interval_ticks` window).
+///
+/// Under healthy operation the queue drains within one or two
+/// ticks; under sustained partition it can grow without bound,
+/// eventually trying to retain an `oneshot::Sender` per buffered
+/// read. Capping the queue prevents memory exhaustion when
+/// followers are offline and routes excess load back to the caller
+/// (which can retry once the cluster recovers). Set to 1024 so a
+/// moderate read burst fits without spilling, while a partition
 /// scenario cannot accumulate gigabytes of pending Bytes payloads.
 const MAX_PENDING_READS: usize = 1024;
 
@@ -252,14 +259,25 @@ struct ClientQuery {
     reply: oneshot::Sender<XResult<Bytes>>,
 }
 
-/// Stage 7.1 (iter-6 evaluator finding #1) ΓÇö a `ClientQuery` deferred
-/// onto the lease *slow-path*: enqueued when `enable_leader_lease` is
-/// on but `RaftNode::has_active_lease()` is currently false. The
-/// driver answers the read only once a quorum of voters has confirmed
-/// leadership by sending a fresh `FetchRequest` strictly after the
-/// read was captured (the "extra commit-index confirmation round-trip"
-/// the spec describes), and only once the state machine has applied
-/// at least up to the read's captured `read_index`.
+/// Stage 7.1 (iter-3 evaluator finding #3) ΓÇö a `ClientQuery` deferred
+/// onto the lease *slow-path*. Enqueued whenever the leader cannot
+/// immediately skip the commit-index confirmation round-trip, i.e.
+/// **either** of:
+///
+///   1. `enable_leader_lease` is OFF (Stage 7.1 brief: the lease is
+///      the *only* mechanism that lets the leader skip the
+///      round-trip; without it every read MUST confirm), OR
+///   2. `enable_leader_lease` is ON but
+///      `RaftNode::has_active_lease()` returned false at receipt
+///      (the lease has not been re-validated by a quorum of voters
+///      within the current check-quorum window).
+///
+/// In both cases the driver answers the read only once a quorum of
+/// voters has confirmed leadership by sending a fresh `FetchRequest`
+/// strictly after the read was captured (the "extra commit-index
+/// confirmation round-trip" the spec describes), and only once the
+/// state machine has applied at least up to the read's captured
+/// `read_index`.
 ///
 /// Field semantics:
 /// - `read_index`: the engine's `commit_index` at receipt. Serving
@@ -1337,20 +1355,29 @@ where
     /// single re-entrant Candidate→Leader transition emits exactly
     /// one histogram sample.
     prev_role: NodeRole,
-    /// Stage 7.1 (iter-6 evaluator finding #1) ΓÇö FIFO of reads
-    /// deferred onto the lease *slow-path*. A `ClientQuery` lands here
-    /// only when `enable_leader_lease` is on AND
-    /// `RaftNode::has_active_lease()` is false at receipt: i.e. the
-    /// leader cannot skip the commit-index confirmation round-trip and
-    /// must wait for a quorum of voter peers to send a fresh
-    /// `FetchRequest` (strict-`>` `fetch_seq`) before answering. The
-    /// queue is bounded by [`MAX_PENDING_READS`]; overflow replies
-    /// `NotLeader { leader_hint: None }` so callers can retry once the
-    /// cluster recovers. Drained by [`Self::drain_pending_reads`] after
-    /// every event-loop iteration, and explicitly on
+    /// Stage 7.1 (iter-2 evaluator finding #1) ΓÇö FIFO of reads
+    /// deferred onto the lease *slow-path*. A `ClientQuery` lands
+    /// here whenever the leader cannot immediately skip the
+    /// commit-index confirmation round-trip, i.e. **either** of:
+    ///
+    ///   1. `enable_leader_lease` is OFF (Stage 7.1 brief: lease
+    ///      is the *only* mechanism that lets the leader skip the
+    ///      round-trip; without it every read MUST confirm).
+    ///   2. `enable_leader_lease` is ON but
+    ///      `RaftNode::has_active_lease()` returned false at receipt
+    ///      (the lease has not been re-validated by a quorum of
+    ///      voters within the current check-quorum window).
+    ///
+    /// In both cases the driver must wait for a fresh quorum of
+    /// voter peers to send a `FetchRequest` (strict-`>` `fetch_seq`)
+    /// before answering. The queue is bounded by
+    /// [`MAX_PENDING_READS`]; overflow replies
+    /// `NotLeader { leader_hint: None }` so callers can retry once
+    /// the cluster recovers. Drained by [`Self::drain_pending_reads`]
+    /// after every event-loop iteration, and explicitly on
     /// [`Action::StepDown`](xraft_core::message::Action::StepDown),
-    /// graceful shutdown, and fail-stop shutdown so no caller hangs on
-    /// a never-resolved `oneshot`.
+    /// graceful shutdown, and fail-stop shutdown so no caller hangs
+    /// on a never-resolved `oneshot`.
     pending_reads: VecDeque<PendingRead>,
 }
 
@@ -2052,26 +2079,25 @@ where
             }));
             return;
         }
-        // FAST path: lease disabled, OR lease enabled and currently
-        // active (quorum-acked within the check-quorum window). Serve
-        // immediately ΓÇö this is the "skip the extra commit-index
-        // confirmation round-trip" the spec calls out.
-        let lease_on = self.node.config.enable_leader_lease;
-        if !lease_on || self.node.has_active_lease() {
-            if lease_on {
-                tracing::debug!(
-                    node_id = %self.node.id,
-                    term = %self.node.hard_state.current_term,
-                    "Stage 7.1 lease-gated read: fast path (active lease)"
-                );
-            }
+        // FAST path: ONLY when `enable_leader_lease` is on AND the
+        // lease is currently active. `has_active_lease()` internally
+        // short-circuits on `enable_leader_lease == false`, so this
+        // one check correctly gates BOTH cases (flag off, or flag on
+        // but lease inactive) onto the slow path below.
+        if self.node.has_active_lease() {
+            tracing::debug!(
+                node_id = %self.node.id,
+                term = %self.node.hard_state.current_term,
+                "Stage 7.1 lease-gated read: fast path (active lease)"
+            );
             let result = self.state_machine.query(&q.query).map(Bytes::from);
             let _ = q.reply.send(result);
             return;
         }
-        // SLOW path: lease enabled but currently inactive. Defer the
-        // read until [`drain_pending_reads`] can prove a fresh quorum
-        // and the state machine has caught up to `read_index`.
+        // SLOW path: either lease is disabled (every read must
+        // confirm), or lease is enabled but currently inactive. Defer
+        // the read until [`drain_pending_reads`] can prove a fresh
+        // quorum and the state machine has caught up to `read_index`.
         if self.pending_reads.len() >= MAX_PENDING_READS {
             tracing::warn!(
                 node_id = %self.node.id,
@@ -2095,6 +2121,7 @@ where
             read_index = %self.node.commit_index,
             baseline_seq = self.node.fetch_seq,
             deadline_tick,
+            lease_enabled = self.node.config.enable_leader_lease,
             "Stage 7.1 lease-gated read: slow path (deferring for quorum confirmation)"
         );
         self.pending_reads.push_back(PendingRead {
@@ -2735,6 +2762,16 @@ where
                     );
                 }
                 Action::ApplyToStateMachine { from, to } => {
+                    // Stage 7.1 (iter-2 evaluator finding #2):
+                    // record commit-latency BEFORE applying to the
+                    // state machine. The histogram measures
+                    // "proposal -> commit-index advancement" per
+                    // the architecture.md §7 contract, NOT
+                    // "proposal -> apply completion". The engine
+                    // emits ApplyToStateMachine the moment
+                    // commit_index has crossed `to`, so this is the
+                    // canonical observation point.
+                    self.observe_commit_latencies_in_range(from, to);
                     if let Err(e) = self.apply_committed(from, to) {
                         let msg = format!("apply to state machine failed: {e}");
                         error!(target: "xraft_server::driver", %msg, "halting driver");
@@ -3622,6 +3659,17 @@ where
         Ok(follow_ups)
     }
 
+    /// Resolve all `propose()` waiters registered at `index`. Stage
+    /// 7.1 iter-2 evaluator finding #2 moved the
+    /// [`DriverObserver::on_commit_latency`] emission OUT of this
+    /// function and into [`Self::observe_commit_latencies_in_range`],
+    /// which the `ApplyToStateMachine` arm of [`Self::process_actions`]
+    /// calls **before** [`Self::apply_committed`] runs. The histogram
+    /// must measure "proposal to commit-index advancement", not
+    /// "proposal to state-machine apply completion", so the sample
+    /// has to be recorded at the moment commit_index crosses each
+    /// index. This function therefore only resolves the waiter
+    /// channels; it never touches `propose_times` or the observer.
     fn resolve_waiters_at(&mut self, index: LogIndex, result: XResult<LogIndex>) {
         if let Some(list) = self.pending.remove(&index) {
             for w in list {
@@ -3631,18 +3679,43 @@ where
                 });
             }
         }
-        // Stage 7.1: observe commit latency exactly once per index. We
-        // remove the stamp on every resolve path (success OR fail) so
-        // the BTreeMap drains alongside `pending` and never leaks. We
-        // only call `on_commit_latency` on the success path because the
-        // metric is "proposal → commit"; failed-commit paths are
-        // covered by `xraft_propose_failures_total` (Stage 6.1) and
-        // would distort the histogram if mixed in.
-        if let Some(t0) = self.propose_times.remove(&index)
-            && result.is_ok()
-            && let Some(obs) = self.observer.as_ref()
-        {
-            obs.on_commit_latency(t0.elapsed());
+    }
+
+    /// Stage 7.1 (iter-2 evaluator finding #2): emit one
+    /// [`DriverObserver::on_commit_latency`] sample per pending
+    /// `propose_times` entry whose index lies in the inclusive
+    /// `[from, to]` range, then drain those entries from the
+    /// BTreeMap. This is called from the
+    /// [`Action::ApplyToStateMachine { from, to }`] arm of
+    /// [`Self::process_actions`] **before** [`Self::apply_committed`]
+    /// runs, so the histogram measures exactly the
+    /// proposal-to-commit-index-advancement window the spec mandates
+    /// and excludes state-machine apply latency.
+    ///
+    /// Indices outside the supplied range are untouched. Entries
+    /// that have already been drained (e.g. by a prior call, or
+    /// removed on append failure / step-down) are silently skipped.
+    fn observe_commit_latencies_in_range(&mut self, from: LogIndex, to: LogIndex) {
+        if from > to {
+            return;
+        }
+        // Snapshot the indices first so we can mutate the map below
+        // without an outstanding range-borrow.
+        let indices: Vec<LogIndex> = self
+            .propose_times
+            .range(from..=to)
+            .map(|(k, _)| *k)
+            .collect();
+        if indices.is_empty() {
+            return;
+        }
+        let obs = self.observer.clone();
+        for idx in indices {
+            if let Some(t0) = self.propose_times.remove(&idx)
+                && let Some(ref o) = obs
+            {
+                o.on_commit_latency(t0.elapsed());
+            }
         }
     }
 
@@ -6287,14 +6360,23 @@ port = 6003
         }
     }
 
-    /// Stage 7.1 — `enable_leader_lease = false` (the default) must
-    /// preserve the legacy Stage 6.2 ClientQuery semantics: serve
-    /// every leader query without any lease check. This is the
-    /// "backward compatible" cell of the truth table — without this
-    /// gate the flag would silently change every existing user's
-    /// read behaviour.
+    /// Stage 7.1 (iter-2 evaluator finding #1) ΓÇö `enable_leader_lease
+    /// = false` MUST still take the commit-index confirmation
+    /// round-trip on every read. The iter-1 evaluator flagged the
+    /// prior `!lease_on || has_active_lease()` short-circuit as a
+    /// contract violation: without the round-trip the lease
+    /// optimisation has nothing to skip. This test proves:
+    ///   1. With the flag OFF the read is enqueued on
+    ///      `pending_reads` rather than served immediately.
+    ///   2. Without a quorum proof the read stays pending.
+    ///   3. After a real inbound `FetchRequest` from a voter peer
+    ///      bumps the leader's `fetch_seq` and stamps the peer's
+    ///      `last_fetch_seq`, `drain_pending_reads` resolves the
+    ///      read with `Ok(_)`.
+    ///   4. The lease remains inactive because the flag is the
+    ///      gate ΓÇö evidence alone never turns it on.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn client_query_with_lease_disabled_skips_lease_check() {
+    async fn client_query_with_lease_disabled_still_requires_quorum_confirmation() {
         // 3-voter config, lease DISABLED. We still force-set role to
         // Leader so the test isolates the lease branch (not the
         // role check).
@@ -6357,23 +6439,207 @@ port = 6003
         driver.node.role = xraft_core::NodeRole::Leader;
         driver.node.leader_started_tick = Some(0);
         driver.node.logical_tick = 1;
-        // Lease is inactive (no peer fetch evidence) but disabled.
+        // Bump term to 1 so the inbound FetchRequest below carries a
+        // matching leader_epoch (engine's default current_term is 0,
+        // and `handle_fetch_request` rejects epoch mismatches).
+        driver.node.hard_state.current_term = xraft_core::types::Term(1);
+        // Lease is inactive AND disabled ΓÇö precondition for slow path.
         assert!(
             !driver.node.has_active_lease(),
             "test precondition: lease must be inactive (and disabled)"
         );
 
-        let (tx, rx) = oneshot::channel();
+        // (1) Submit the query. With lease off the iter-2 fix routes
+        //     this onto the slow-path queue rather than serving it
+        //     immediately.
+        let (tx, mut rx) = oneshot::channel();
         driver.handle_client_query(ClientQuery {
             query: Bytes::from_static(b"any"),
             reply: tx,
         });
-        match rx.await.expect("reply channel must deliver") {
-            Ok(_) => { /* expected — legacy behaviour preserved */ }
-            Err(other) => {
-                panic!("expected legacy serve (Ok) when lease disabled, got Err({other:?})")
+        assert_eq!(
+            driver.pending_reads.len(),
+            1,
+            "lease=off MUST enqueue the read on pending_reads (iter-2 fix), not fast-path"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "lease=off read MUST NOT be served before quorum confirms"
+        );
+
+        // (2) Drain with no inbound Fetch ΓÇö nothing should resolve.
+        driver.drain_pending_reads();
+        assert_eq!(
+            driver.pending_reads.len(),
+            1,
+            "no quorum proof yet; read must remain pending"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "pending read must still be unresolved without quorum proof"
+        );
+
+        // (3) Simulate a real inbound FetchRequest from voter peer 2
+        //     after the read was enqueued. This bumps the leader's
+        //     `fetch_seq` and stamps peer 2's `last_fetch_seq`,
+        //     supplying the strict-`>` quorum proof
+        //     `drain_pending_reads` requires.
+        let req = FetchRequest {
+            cluster_id: driver.node.config.cluster_id.clone(),
+            leader_epoch: driver.node.hard_state.current_term.0,
+            replica_id: NodeId(2),
+            fetch_offset: LogIndex(1),
+            last_fetched_epoch: Term(0),
+        };
+        let _ = driver.node.handle_fetch_request(req);
+        driver.drain_pending_reads();
+        assert_eq!(
+            driver.pending_reads.len(),
+            0,
+            "after quorum proof the read MUST be drained"
+        );
+
+        // (4) The read resolves successfully via the slow path.
+        match rx.try_recv() {
+            Ok(Ok(_)) => { /* expected slow-path serve after quorum proof */ }
+            Ok(Err(e)) => {
+                panic!("slow-path serve after quorum proof MUST resolve Ok(_); got Err({e:?})")
             }
+            Err(e) => panic!("reply channel must deliver after drain, got {e:?}"),
         }
+
+        // (5) Post-condition: lease is STILL inactive because the
+        //     flag is off ΓÇö `has_active_lease()` short-circuits on
+        //     `enable_leader_lease == false`. So a subsequent read
+        //     would also take the slow path. This proves the iter-2
+        //     contract: lease=off means EVERY read confirms, not
+        //     just the first.
+        assert!(
+            !driver.node.has_active_lease(),
+            "lease MUST remain inactive while enable_leader_lease=false even \
+             after a fetch ΓÇö the flag is the gate, not the fetch evidence"
+        );
+    }
+
+    // ─── Stage 7.1 (iter-2 evaluator finding #2): commit-latency
+    // observation MUST happen at commit-index advancement (when the
+    // engine emits `Action::ApplyToStateMachine`), NOT inside
+    // `resolve_waiters_at` AFTER `state_machine.apply` returns.
+    // These two tests pin the new contract:
+    //
+    //   * `commit_latency_observed_before_apply_via_range_helper`:
+    //     `observe_commit_latencies_in_range` emits the observer
+    //     hook for every propose_times entry in the supplied range
+    //     and drains those entries (proposal → commit-index
+    //     advancement, no apply involvement).
+    //
+    //   * `resolve_waiters_at_no_longer_observes_commit_latency`:
+    //     After the range observer fires, `resolve_waiters_at` MUST
+    //     NOT emit a second sample. Without this gate the histogram
+    //     would double-count on every commit.
+    // ────────────────────────────────────────────────────────────
+
+    #[derive(Default, Debug)]
+    struct CommitLatencyObserver {
+        samples: std::sync::Mutex<Vec<Duration>>,
+    }
+
+    impl DriverObserver for CommitLatencyObserver {
+        fn on_status<'a>(
+            &'a self,
+            _status: NodeStatus,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+        fn on_append(&self, _n: u64) {}
+        fn on_election_won(&self, _elapsed: Duration) {}
+        fn on_commit_latency(&self, elapsed: Duration) {
+            self.samples.lock().unwrap().push(elapsed);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn commit_latency_observed_before_apply_via_range_helper() {
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, _applied) = build_driver(cfg);
+        let obs = Arc::new(CommitLatencyObserver::default());
+        driver.observer = Some(obs.clone() as Arc<dyn DriverObserver>);
+
+        // Stamp propose_times for indices 1, 2, 3 ΓÇö pretending those
+        // are pending proposals. Use an explicit Instant in the past
+        // so `elapsed()` is non-zero and we can sanity-check that
+        // each sample is actually populated.
+        let t_past = Instant::now() - Duration::from_millis(10);
+        for i in 1..=3u64 {
+            driver.propose_times.insert(LogIndex(i), t_past);
+        }
+        assert_eq!(driver.propose_times.len(), 3);
+
+        // Observe the [1, 2] range ΓÇö emulating the engine emitting
+        // `Action::ApplyToStateMachine { from: 1, to: 2 }`.
+        driver.observe_commit_latencies_in_range(LogIndex(1), LogIndex(2));
+
+        let samples = obs.samples.lock().unwrap().clone();
+        assert_eq!(
+            samples.len(),
+            2,
+            "observe_commit_latencies_in_range MUST emit ONE sample \
+             per propose_times entry in the inclusive range"
+        );
+        assert!(
+            samples.iter().all(|d| *d >= Duration::from_millis(5)),
+            "sampled latencies MUST reflect the stamped Instant (>=5ms past), got {samples:?}"
+        );
+        assert!(
+            !driver.propose_times.contains_key(&LogIndex(1)),
+            "index 1 stamp MUST be drained after observation"
+        );
+        assert!(
+            !driver.propose_times.contains_key(&LogIndex(2)),
+            "index 2 stamp MUST be drained after observation"
+        );
+        assert!(
+            driver.propose_times.contains_key(&LogIndex(3)),
+            "index 3 (outside range) MUST be left in the map"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn resolve_waiters_at_no_longer_observes_commit_latency() {
+        // After the iter-2 fix `resolve_waiters_at` must NOT emit a
+        // commit-latency sample. The range observer is the sole
+        // emission point so the histogram measures only proposal ->
+        // commit, not proposal -> apply.
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, _applied) = build_driver(cfg);
+        let obs = Arc::new(CommitLatencyObserver::default());
+        driver.observer = Some(obs.clone() as Arc<dyn DriverObserver>);
+
+        // Stamp propose_times for indices 5, 6.
+        let t_past = Instant::now() - Duration::from_millis(10);
+        driver.propose_times.insert(LogIndex(5), t_past);
+        driver.propose_times.insert(LogIndex(6), t_past);
+
+        // Step A: range-observe [5, 6] (the new emission point).
+        driver.observe_commit_latencies_in_range(LogIndex(5), LogIndex(6));
+        assert_eq!(
+            obs.samples.lock().unwrap().len(),
+            2,
+            "range observer must emit two samples for indices 5 and 6"
+        );
+
+        // Step B: call resolve_waiters_at for both indices on the
+        // success path (what apply_committed would do per index).
+        // No additional samples must appear ΓÇö the prior emission
+        // point was removed in iter-2.
+        driver.resolve_waiters_at(LogIndex(5), Ok(LogIndex(5)));
+        driver.resolve_waiters_at(LogIndex(6), Ok(LogIndex(6)));
+        assert_eq!(
+            obs.samples.lock().unwrap().len(),
+            2,
+            "resolve_waiters_at MUST NOT emit commit-latency samples \
+             (iter-2 evaluator fix); observed an extra emission"
+        );
     }
 
     /// Wrong cluster id → `XRaftError::Transport` (cluster mismatch).

@@ -7650,4 +7650,328 @@ port = 6000
             "term did not advance on a higher-term FetchRequest"
         );
     }
+
+    /// Five-voter Check-Quorum config (this node = 1; peers = 2, 3, 4, 5).
+    /// Builds on `five_voter_config` and toggles the Stage 7.1 flags on.
+    fn five_voter_check_quorum_config() -> ClusterConfig {
+        let mut cfg = five_voter_config();
+        cfg.enable_check_quorum = true;
+        cfg.enable_leader_lease = true;
+        cfg
+    }
+
+    /// Drive a 5-voter node directly to Leader by synthesising votes
+    /// from two peers (self + 2 = 3 = quorum of 5). Mirrors
+    /// `force_leader` but for the 5-voter cluster shape.
+    fn force_leader_5voter(node: &mut RaftNode) {
+        let _ = node.become_pre_candidate();
+        let _ = node.become_candidate();
+        node.votes_received.insert(NodeId(2));
+        node.votes_received.insert(NodeId(3));
+        let _ = node.become_leader();
+        assert_eq!(
+            node.role,
+            NodeRole::Leader,
+            "force_leader_5voter did not promote"
+        );
+    }
+
+    /// Work-item scenario validation — 5-voter Check-Quorum step-down.
+    /// Per the work item: "in a 5-node cluster, the leader needs at
+    /// least 2 of the 4 other voters to have responded within the
+    /// check quorum interval (since leader + 2 = 3 = majority of 5)".
+    /// With only ONE peer fetching, the leader counts itself + 1 = 2
+    /// reachable voters, which is < 3 (quorum of 5), so it must step
+    /// down at the next Check-Quorum tick.
+    ///
+    /// **Timing note.** `become_leader` resets `elapsed_ticks` to 0
+    /// and stamps every peer's `last_fetch_time = logical_tick = 0`.
+    /// After `run_ticks(interval - 1)` the elapsed counter is exactly
+    /// `interval - 1` (one short of the boundary). The single peer-2
+    /// fetch refreshes peer 2's stamp to the current `logical_tick`
+    /// (`= interval - 1`). The check therefore fires on the **first
+    /// tick** of the second `run_ticks(interval)` call — at that
+    /// moment peer 2's age is `1 < window` (counts) while peers 3, 4,
+    /// 5 have age `interval` (== window boundary, strictly NOT < so
+    /// they do NOT count). Self (1) + peer 2 (1) = 2 < 3 = quorum → step-down.
+    #[test]
+    fn check_quorum_steps_down_5voter_when_only_one_peer_reachable() {
+        let mut node = RaftNode::new_with_seed(five_voter_check_quorum_config(), 41).unwrap();
+        force_leader_5voter(&mut node);
+        let interval = node.check_quorum_interval_ticks;
+        // Tick `interval - 1` times. elapsed becomes `interval - 1`
+        // and Check-Quorum has NOT fired yet (the boundary is `>=`,
+        // not `>`).
+        let pre_actions = run_ticks(&mut node, interval - 1);
+        assert!(
+            !pre_actions.iter().any(|a| matches!(a, Action::StepDown)),
+            "Check-Quorum must not fire before reaching the interval boundary; got {pre_actions:?}"
+        );
+        assert_eq!(
+            node.check_quorum_elapsed_ticks,
+            interval - 1,
+            "elapsed counter must be `interval - 1` after `interval - 1` leader ticks"
+        );
+        // Refresh only peer 2's last_fetch_time to current logical_tick
+        // (= interval - 1). Peers 3, 4, 5 remain at the
+        // `become_leader` baseline (last_fetch_time = 0).
+        let fetch_req = fetch_at(&node, NodeId(2), None);
+        let _ = node.handle_fetch_request(fetch_req);
+        // The very NEXT tick crosses the boundary (elapsed becomes
+        // `interval`) and fires the check. Peer 2's age is 1 (fresh);
+        // peers 3/4/5 are at age `interval` (boundary == window, not
+        // counted under strict `<`). Self (1) + peer 2 (1) = 2 < 3
+        // quorum → step-down on the first tick of this run.
+        let actions = run_ticks(&mut node, interval);
+        // After step-down the post-Check-Quorum follower may have
+        // ticked past its (fresh) election timer and transitioned to
+        // PreCandidate by the end of the loop. The Stage 7.1
+        // invariant is "leader yields its role on quorum loss", so we
+        // assert the role is no longer Leader and that a `StepDown`
+        // action was emitted at some point during the run.
+        assert_ne!(
+            node.role,
+            NodeRole::Leader,
+            "5-voter leader with only one reachable peer did not step down \
+             (expected: 1+1=2 < 3 quorum); role is still {:?}",
+            node.role
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::StepDown)),
+            "actions did not contain a StepDown: {actions:?}"
+        );
+    }
+
+    /// Work-item scenario validation — 5-voter Check-Quorum healthy
+    /// for one cycle. With TWO peers fetching the leader counts
+    /// itself + 2 = 3 = quorum of 5, satisfying the work item's
+    /// reachability threshold; the leader must NOT step down at the
+    /// next Check-Quorum check.
+    ///
+    /// **Scope.** This test exercises a single Check-Quorum cycle.
+    /// Multi-cycle "indefinite" survival (i.e. the leader stays a
+    /// leader across many cycles as long as peers keep fetching) is
+    /// covered separately by
+    /// `check_quorum_keeps_leader_5voter_across_repeated_freshness_cycles`.
+    ///
+    /// **Timing note.** Same as the step-down test: after
+    /// `run_ticks(interval - 1)` elapsed is `interval - 1`; the two
+    /// peer fetches stamp peers 2 and 3 at the current
+    /// `logical_tick` (= `interval - 1`); the check fires on the
+    /// **first tick** of the second `run_ticks(interval)` call,
+    /// with peer 2 and peer 3 at age 1 (in-window) so the leader
+    /// survives.
+    #[test]
+    fn check_quorum_keeps_leader_5voter_when_two_peers_reachable() {
+        let mut node = RaftNode::new_with_seed(five_voter_check_quorum_config(), 43).unwrap();
+        force_leader_5voter(&mut node);
+        let interval = node.check_quorum_interval_ticks;
+        run_ticks(&mut node, interval - 1);
+        let _ = node.handle_fetch_request(fetch_at(&node, NodeId(2), None));
+        let _ = node.handle_fetch_request(fetch_at(&node, NodeId(3), None));
+        // First tick of this run crosses the boundary and fires the
+        // check; remaining `interval - 1` ticks just accumulate
+        // elapsed back to `interval - 1` without firing again.
+        let actions = run_ticks(&mut node, interval);
+        assert_eq!(
+            node.role,
+            NodeRole::Leader,
+            "5-voter leader with two reachable peers stepped down (expected: 1+2=3 = quorum, stays leader)"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::StepDown)),
+            "no StepDown should be emitted while peers 2 and 3 are fresh; got {actions:?}"
+        );
+    }
+
+    /// Work-item scenario validation — 5-voter Leader-Lease activates
+    /// once a majority of voters (self + 2 peers in a 5-node cluster)
+    /// have sent a post-election Fetch within the Check-Quorum window.
+    /// Mirrors the existing 3-voter lease test but exercises the
+    /// 5-voter quorum arithmetic the work item calls out explicitly.
+    #[test]
+    fn leader_lease_active_5voter_after_two_peer_post_election_fetches() {
+        let mut node = RaftNode::new_with_seed(five_voter_check_quorum_config(), 47).unwrap();
+        force_leader_5voter(&mut node);
+        // Advance the logical clock so post-election fetch stamps are
+        // strictly greater than `leader_started_tick` (the lease
+        // baseline).
+        let _ = node.step(Input::Tick);
+        // A single peer fetch is NOT enough on a 5-voter cluster:
+        // self (1) + peer2 (1) = 2 < 3 = quorum of 5.
+        let _ = node.handle_fetch_request(fetch_at(&node, NodeId(2), None));
+        assert!(
+            !node.has_active_lease(),
+            "lease must not be active with only one post-election peer fetch on a 5-voter cluster \
+             (expected: 1+1=2 < 3 quorum)"
+        );
+        // Second peer fetch crosses the threshold: self (1) + peer2 (1)
+        // + peer3 (1) = 3 = quorum. Lease is now active.
+        let _ = node.handle_fetch_request(fetch_at(&node, NodeId(3), None));
+        assert!(
+            node.has_active_lease(),
+            "lease must be active after two post-election peer fetches on a 5-voter cluster \
+             (expected: 1+2=3 = quorum, lease active)"
+        );
+    }
+
+    /// Iter-2 evaluator follow-up — boundary precision for Check-Quorum.
+    ///
+    /// Verifies the exact tick on which Check-Quorum fires. After
+    /// `become_leader` the elapsed counter is 0; after `interval - 1`
+    /// leader ticks it is `interval - 1` and the check has NOT fired
+    /// (the gate is `>=`, so the boundary is exactly `interval`). ONE
+    /// more tick brings elapsed to `interval` and the check fires.
+    /// With no peer fetches at all, every peer's age equals
+    /// `interval` (== window, NOT < window) so the leader counts only
+    /// itself (1) which is below the 5-voter quorum (3) and must step
+    /// down on that one tick.
+    ///
+    /// Complements `check_quorum_steps_down_5voter_when_only_one_peer_reachable`
+    /// by making the "fires on tick #interval, not tick #interval-1"
+    /// invariant explicit — a regression that triggered the check one
+    /// tick early would still pass the prior test but would fail this one.
+    #[test]
+    fn check_quorum_5voter_fires_exactly_at_interval_boundary() {
+        let mut node = RaftNode::new_with_seed(five_voter_check_quorum_config(), 51).unwrap();
+        force_leader_5voter(&mut node);
+        let interval = node.check_quorum_interval_ticks;
+        // Just under the boundary: elapsed = interval - 1, no fire.
+        let pre = run_ticks(&mut node, interval - 1);
+        assert_eq!(
+            node.role,
+            NodeRole::Leader,
+            "leader must NOT step down before the interval-th tick"
+        );
+        assert_eq!(
+            node.check_quorum_elapsed_ticks,
+            interval - 1,
+            "elapsed counter must be `interval - 1` (strict `<` boundary)"
+        );
+        assert!(
+            !pre.iter().any(|a| matches!(a, Action::StepDown)),
+            "no StepDown should be emitted before the interval-th tick; got {pre:?}"
+        );
+        // One more tick → elapsed = interval, check fires. All peers
+        // have age = interval (boundary, NOT < interval) so none count.
+        // Self alone (1) < 3 quorum → step-down.
+        let actions = run_ticks(&mut node, 1);
+        assert_ne!(
+            node.role,
+            NodeRole::Leader,
+            "Check-Quorum must fire on the interval-th tick when no peers have fetched"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::StepDown)),
+            "StepDown must be emitted on the interval-th tick with no peer freshness; got {actions:?}"
+        );
+    }
+
+    /// Iter-2 evaluator follow-up — true "remains leader across many
+    /// cycles" coverage. The prior
+    /// `check_quorum_keeps_leader_5voter_when_two_peers_reachable`
+    /// only verified one Check-Quorum cycle, so a regression that
+    /// stepped the leader down on the SECOND or later cycle (e.g.
+    /// failing to reset `elapsed_ticks` after a successful check)
+    /// would still pass that test. This case runs 5 back-to-back
+    /// cycles, refreshing peers 2 and 3 right before each cycle's
+    /// boundary tick, and asserts the leader survives every cycle and
+    /// that `elapsed_ticks` is reset to 0 after each successful check.
+    #[test]
+    fn check_quorum_keeps_leader_5voter_across_repeated_freshness_cycles() {
+        let mut node = RaftNode::new_with_seed(five_voter_check_quorum_config(), 53).unwrap();
+        force_leader_5voter(&mut node);
+        let interval = node.check_quorum_interval_ticks;
+        const CYCLES: u64 = 5;
+        for cycle in 0..CYCLES {
+            // Tick to `interval - 1` accumulated elapsed (the first
+            // cycle starts at elapsed = 0; subsequent cycles start at
+            // elapsed = 0 because the prior cycle's successful check
+            // reset it). No StepDown expected during this phase.
+            let phase_a = run_ticks(&mut node, interval - 1);
+            assert!(
+                !phase_a.iter().any(|a| matches!(a, Action::StepDown)),
+                "no StepDown should be emitted during cycle {cycle} pre-boundary phase; got {phase_a:?}"
+            );
+            assert_eq!(
+                node.role,
+                NodeRole::Leader,
+                "leader must still be in role at cycle {cycle} pre-boundary"
+            );
+            assert_eq!(
+                node.check_quorum_elapsed_ticks,
+                interval - 1,
+                "elapsed counter mismatch at cycle {cycle} pre-boundary"
+            );
+            // Refresh peer 2 and peer 3 stamps to the current
+            // logical_tick. At the next tick their age will be 1
+            // (well inside the window), satisfying quorum (1+2=3).
+            let _ = node.handle_fetch_request(fetch_at(&node, NodeId(2), None));
+            let _ = node.handle_fetch_request(fetch_at(&node, NodeId(3), None));
+            // One more tick → elapsed = interval, check fires AND
+            // passes; elapsed resets to 0.
+            let phase_b = run_ticks(&mut node, 1);
+            assert!(
+                !phase_b.iter().any(|a| matches!(a, Action::StepDown)),
+                "no StepDown should be emitted on cycle {cycle} boundary tick (peers fresh); got {phase_b:?}"
+            );
+            assert_eq!(
+                node.role,
+                NodeRole::Leader,
+                "leader must remain in role after cycle {cycle} boundary tick (1+2=3 quorum)"
+            );
+            assert_eq!(
+                node.check_quorum_elapsed_ticks, 0,
+                "elapsed counter must reset to 0 after a successful Check-Quorum on cycle {cycle}"
+            );
+        }
+    }
+
+    /// Iter-2 evaluator follow-up — lease window expiration in
+    /// isolation. With `enable_check_quorum = false` the leader does
+    /// NOT step down when peers age out, so we can observe the lease
+    /// transitioning from active to inactive purely due to the
+    /// `check_quorum_interval_ticks` window expiring on the peer
+    /// fetches (i.e. `age >= window`, NOT `age < window`). This
+    /// proves the lease has its own freshness gate independent of
+    /// role transitions; without it, a long-lived leader could
+    /// erroneously serve stale reads after losing peer contact.
+    #[test]
+    fn leader_lease_5voter_expires_when_peer_fetches_age_out() {
+        // Isolate the lease window: keep lease on, turn Check-Quorum
+        // off so the leader does NOT step down when peers age out.
+        let mut cfg = five_voter_check_quorum_config();
+        cfg.enable_check_quorum = false;
+        let mut node = RaftNode::new_with_seed(cfg, 59).unwrap();
+        force_leader_5voter(&mut node);
+        let interval = node.check_quorum_interval_ticks;
+        // Advance the logical clock so post-election fetch stamps are
+        // strictly greater than `leader_started_tick` (the lease baseline).
+        let _ = node.step(Input::Tick);
+        let _ = node.handle_fetch_request(fetch_at(&node, NodeId(2), None));
+        let _ = node.handle_fetch_request(fetch_at(&node, NodeId(3), None));
+        assert!(
+            node.has_active_lease(),
+            "lease must be active after two post-election peer fetches (1+2=3 quorum)"
+        );
+        // Age the peer-2 and peer-3 stamps out: tick `interval` more
+        // ticks. After this the stamps are at age = `interval` ==
+        // window boundary, NOT < window, so neither counts toward the
+        // lease.
+        let actions = run_ticks(&mut node, interval);
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::StepDown)),
+            "no StepDown should fire with Check-Quorum disabled; got {actions:?}"
+        );
+        assert_eq!(
+            node.role,
+            NodeRole::Leader,
+            "leader must remain in role with Check-Quorum disabled even as peer stamps age out"
+        );
+        assert!(
+            !node.has_active_lease(),
+            "lease must become inactive once peer fetches reach the window boundary \
+             (age == interval, strict `<` boundary fails)"
+        );
+    }
 }
