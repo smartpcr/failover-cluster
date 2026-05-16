@@ -15,9 +15,14 @@
 //!
 //! The atomic protocol matches KRaft's `quorum-state` file:
 //! a `.tmp` sibling is written, fsynced, and `rename`-d into
-//! place. A `.tmp` left behind by a crash is detected on
-//! [`FileHardStateStore::open`] and removed before the new
-//! handle starts serving.
+//! place, then the parent directory itself is fsynced so the
+//! rename's directory-entry update is durable across power
+//! loss (Linux ext4 with default mount options does not
+//! guarantee this without an explicit dir fsync; losing the
+//! rename would let the node re-vote in the same term after
+//! restart and violate Raft safety). A `.tmp` left behind by
+//! a crash is detected on [`FileHardStateStore::open`] and
+//! removed before the new handle starts serving.
 
 use std::fs;
 use std::io::Write;
@@ -224,6 +229,35 @@ impl FileHardStateStore {
                 final_path.display()
             ))
         })?;
+
+        // Make the rename's directory-entry update durable. On
+        // Linux ext4 with default mount options the rename's
+        // metadata change is *not* guaranteed to survive a power
+        // failure without an explicit fsync of the parent dir,
+        // even though the data blocks of the renamed file were
+        // already fsynced above. For Raft hard state, losing the
+        // rename means the node could re-vote in the same term
+        // after restart and break Raft's safety invariant. On
+        // Windows NTFS the rename is metadata-journaled by the
+        // filesystem, and `File::open` on a directory through
+        // std requires `FILE_FLAG_BACKUP_SEMANTICS` which std
+        // does not expose — so we gate the dir-fsync on `unix`.
+        #[cfg(unix)]
+        {
+            let dir = fs::File::open(&self.dir).map_err(|e| {
+                XRaftError::Storage(format!(
+                    "open dir for fsync '{}': {e}",
+                    self.dir.display()
+                ))
+            })?;
+            dir.sync_all().map_err(|e| {
+                XRaftError::Storage(format!(
+                    "fsync dir '{}': {e}",
+                    self.dir.display()
+                ))
+            })?;
+        }
+
         Ok(())
     }
 }
