@@ -1231,6 +1231,16 @@ where
                 }
                 Action::ApplyToStateMachine { from, to } => {
                     if let Err(reason) = self.apply_committed(from, to) {
+                        // Mirror the persistence-failure branches above:
+                        // a fail-stopping driver must surface the error
+                        // to any in-flight inbound RPC (Vote/PreVote/
+                        // Fetch/FetchSnapshot) whose handler reads
+                        // `captured.error` before any captured success
+                        // payload. Without this, the RPC reply can
+                        // return Ok with a captured response while the
+                        // driver is about to halt — clients then act on
+                        // a "successful" reply from a dying node.
+                        captured.error = Some(XRaftError::Storage(reason.clone()));
                         self.halt_reason.get_or_insert(reason);
                         break;
                     }
@@ -1242,6 +1252,7 @@ where
                             reason = %reason,
                             "TakeSnapshot failed; halting driver"
                         );
+                        captured.error = Some(XRaftError::Storage(reason.clone()));
                         self.halt_reason.get_or_insert(reason);
                         break;
                     }
@@ -1253,6 +1264,7 @@ where
                             reason = %reason,
                             "InstallSnapshot failed; halting driver"
                         );
+                        captured.error = Some(XRaftError::Storage(reason.clone()));
                         self.halt_reason.get_or_insert(reason);
                         break;
                     }
@@ -1480,12 +1492,26 @@ where
     /// via its oneshot so `propose()` returns rather than hanging;
     /// remaining waiters are failed by `fail_stop_shutdown()` on the
     /// halt path.
-    fn apply_committed(
-        &mut self,
-        from: LogIndex,
-        to: LogIndex,
-    ) -> std::result::Result<(), String> {
-        let entries = match self.log_store.get_range(from, LogIndex(to.0 + 1)) {
+    fn apply_committed(&mut self, from: LogIndex, to: LogIndex) -> std::result::Result<(), String> {
+        // Defensive guards: the engine's `Action::ApplyToStateMachine`
+        // contract states `from <= to`, but `apply_committed` is also
+        // reachable from direct dispatch in tests and a future engine
+        // change could regress this. Halt instead of panicking on
+        // either an inverted range or a `to + 1` overflow.
+        if from > to {
+            let msg = format!("apply: invalid range {from}..={to} (from > to)");
+            error!(target: "xraft_server::driver", %msg, "halting driver");
+            return Err(msg);
+        }
+        let end = match to.0.checked_add(1) {
+            Some(v) => LogIndex(v),
+            None => {
+                let msg = format!("apply: range end overflow for to={to}");
+                error!(target: "xraft_server::driver", %msg, "halting driver");
+                return Err(msg);
+            }
+        };
+        let entries = match self.log_store.get_range(from, end) {
             Ok(e) => e,
             Err(e) => {
                 let msg = format!("apply: read range {from}..={to} failed: {e}");
@@ -1506,6 +1532,56 @@ where
                 return Err(msg);
             }
         };
+        // Validate the range is complete and contiguous. The
+        // `Action::ApplyToStateMachine` contract is that the engine has
+        // ALREADY advanced `last_applied = to` before emitting the
+        // action, so any gap or short read here means the SM will not
+        // see entries that the engine believes are applied — a silent
+        // divergence that would corrupt every subsequent linearizable
+        // read. Halt the driver rather than skipping silently.
+        let expected_len = (to.0 - from.0 + 1) as usize;
+        if entries.len() != expected_len {
+            let msg = format!(
+                "apply: log_store.get_range({from}..={to}) returned {} entries, expected {}",
+                entries.len(),
+                expected_len
+            );
+            error!(
+                target: "xraft_server::driver",
+                returned = entries.len(),
+                expected = expected_len,
+                from = %from,
+                to = %to,
+                "apply: log range short read; halting driver"
+            );
+            let indices: Vec<LogIndex> =
+                self.pending.range(from..=to).map(|(k, _)| *k).collect();
+            for idx in indices {
+                self.resolve_waiters_at(idx, Err(XRaftError::Storage(msg.clone())));
+            }
+            return Err(msg);
+        }
+        for (offset, entry) in entries.iter().enumerate() {
+            let expected_idx = LogIndex(from.0 + offset as u64);
+            if entry.index != expected_idx {
+                let msg = format!(
+                    "apply: log_store.get_range({from}..={to}) returned entry at {} at position {}, expected {}",
+                    entry.index, offset, expected_idx
+                );
+                error!(
+                    target: "xraft_server::driver",
+                    got = %entry.index,
+                    expected = %expected_idx,
+                    "apply: log range index gap; halting driver"
+                );
+                let indices: Vec<LogIndex> =
+                    self.pending.range(from..=to).map(|(k, _)| *k).collect();
+                for idx in indices {
+                    self.resolve_waiters_at(idx, Err(XRaftError::Storage(msg.clone())));
+                }
+                return Err(msg);
+            }
+        }
         for entry in entries {
             match &entry.payload {
                 EntryPayload::Command(bytes) => {
@@ -1516,10 +1592,7 @@ where
                     // result work in a later stage — so we discard the
                     // bytes here while still honouring the error path.
                     if let Err(e) = self.state_machine.apply(entry.index, bytes) {
-                        let msg = format!(
-                            "state machine apply at {} failed: {e}",
-                            entry.index
-                        );
+                        let msg = format!("state machine apply at {} failed: {e}", entry.index);
                         error!(
                             target: "xraft_server::driver",
                             error = %e,
@@ -1530,10 +1603,7 @@ where
                         // an error rather than hanging. Halt immediately:
                         // continuing would compound the divergence between
                         // engine `last_applied` and actual SM state.
-                        self.resolve_waiters_at(
-                            entry.index,
-                            Err(XRaftError::Storage(msg.clone())),
-                        );
+                        self.resolve_waiters_at(entry.index, Err(XRaftError::Storage(msg.clone())));
                         return Err(msg);
                     }
                 }
@@ -1637,13 +1707,35 @@ where
         let snap_idx = metadata.last_included_index;
         let snap_term = metadata.last_included_term;
 
+        // Reject stale snapshots BEFORE touching persistent state or
+        // the state machine. If `snap_idx <= self.node.last_applied`,
+        // the local state machine has already applied every entry the
+        // snapshot covers. Calling `state_machine.restore(&data)` here
+        // would roll the SM back to the older (snapshot) state while
+        // `last_applied` still reflects the newer applied tip — a
+        // silent rollback that corrupts every subsequent read. The
+        // `<=` is intentional: at equality the SM is already at that
+        // state, so the restore is at best wasteful and at worst (if
+        // the snapshot bytes differ from the deterministic apply
+        // result) corrupting. Treat as a no-op success — the driver
+        // does NOT halt because a stale snapshot is a benign race
+        // (e.g. a delayed install for a snapshot the leader already
+        // superseded), not a correctness fault.
+        if snap_idx <= self.node.last_applied {
+            debug!(
+                target: "xraft_server::driver",
+                snap_index = %snap_idx,
+                last_applied = %self.node.last_applied,
+                "InstallSnapshot: snapshot at or behind last_applied; no-op (no persist, no restore)"
+            );
+            return Ok(());
+        }
+
         // Persist first so a crash between save and restore is recoverable
         // from the durable snapshot on restart.
         self.snapshot_store
             .save_snapshot(metadata, &data)
-            .map_err(|e| {
-                format!("InstallSnapshot: snapshot_store.save_snapshot failed: {e}")
-            })?;
+            .map_err(|e| format!("InstallSnapshot: snapshot_store.save_snapshot failed: {e}"))?;
 
         // Restore the state machine. A deterministic SM that rejects a
         // leader's snapshot is unrecoverable mid-flight — halt and let
@@ -1652,12 +1744,13 @@ where
             .restore(&data)
             .map_err(|e| format!("InstallSnapshot: state_machine.restore failed: {e}"))?;
 
-        // Advance engine bookkeeping. Only move indices forward — an
-        // installed snapshot whose tip is behind our current state is a
-        // bug elsewhere but must not regress `last_applied`/`commit_index`.
-        if snap_idx > self.node.last_applied {
-            self.node.last_applied = snap_idx;
-        }
+        // Advance engine bookkeeping. The `snap_idx > last_applied`
+        // guard above proved we're moving last_applied forward, but
+        // commit_index / last_log_index can still be ahead of
+        // last_applied (e.g. committed-but-not-yet-applied entries
+        // already on disk), so each of those needs its own no-regress
+        // guard rather than an unconditional assignment.
+        self.node.last_applied = snap_idx;
         if snap_idx > self.node.commit_index {
             self.node.commit_index = snap_idx;
         }
@@ -2122,6 +2215,11 @@ mod tests {
         /// path on `Action::TakeSnapshot` without needing a real
         /// truncation race.
         missing_next_term_at: Arc<std::sync::atomic::AtomicBool>,
+        /// Indices to silently drop from any `get_range` response.
+        /// Simulates a buggy or partially-truncated store returning a
+        /// short / gapped range — used to exercise the
+        /// `apply_committed` range-validation halt path.
+        drop_indices_in_get_range: Arc<Mutex<std::collections::HashSet<LogIndex>>>,
     }
 
     impl LogStore for TestLogStore {
@@ -2143,10 +2241,11 @@ mod tests {
                     "injected get_range failure for {start}..{end}"
                 )));
             }
+            let drop = self.drop_indices_in_get_range.lock().unwrap().clone();
             Ok(self
                 .entries
                 .iter()
-                .filter(|e| e.index >= start && e.index < end)
+                .filter(|e| e.index >= start && e.index < end && !drop.contains(&e.index))
                 .cloned()
                 .collect())
         }
@@ -3910,10 +4009,7 @@ port = 6012
                 payload: EntryPayload::Command(Bytes::from(format!("cmd-{i}").into_bytes())),
             });
         }
-        driver
-            .log_store
-            .append(&entries)
-            .expect("seed log append");
+        driver.log_store.append(&entries).expect("seed log append");
         driver.node.commit_index = LogIndex(n);
         driver.node.last_applied = LogIndex(n);
         driver.node.set_last_log(LogIndex(n), Term(1));
@@ -4014,7 +4110,9 @@ port = 6012
         let payload = b"sm-snapshot-payload-v1".to_vec();
         sm.set_snapshot_bytes(payload.clone());
 
-        let _ = driver.process_actions(vec![Action::TakeSnapshot], None).await;
+        let _ = driver
+            .process_actions(vec![Action::TakeSnapshot], None)
+            .await;
 
         assert!(
             driver.halt_reason.is_none(),
@@ -4039,7 +4137,9 @@ port = 6012
         let (mut driver, _sm, ss) = build_dispatch_driver();
         assert_eq!(driver.node.last_applied, LogIndex(0));
 
-        let _ = driver.process_actions(vec![Action::TakeSnapshot], None).await;
+        let _ = driver
+            .process_actions(vec![Action::TakeSnapshot], None)
+            .await;
 
         assert!(
             driver.halt_reason.is_none(),
@@ -4057,7 +4157,9 @@ port = 6012
         seed_committed_entries(&mut driver, 1);
         sm.arm_fail_next_snapshot();
 
-        let _ = driver.process_actions(vec![Action::TakeSnapshot], None).await;
+        let _ = driver
+            .process_actions(vec![Action::TakeSnapshot], None)
+            .await;
 
         let halt = driver
             .halt_reason
@@ -4080,7 +4182,9 @@ port = 6012
         ss.fail_next_save
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        let _ = driver.process_actions(vec![Action::TakeSnapshot], None).await;
+        let _ = driver
+            .process_actions(vec![Action::TakeSnapshot], None)
+            .await;
 
         let halt = driver
             .halt_reason
@@ -4101,7 +4205,9 @@ port = 6012
             .missing_next_term_at
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        let _ = driver.process_actions(vec![Action::TakeSnapshot], None).await;
+        let _ = driver
+            .process_actions(vec![Action::TakeSnapshot], None)
+            .await;
 
         let halt = driver
             .halt_reason
@@ -4120,7 +4226,9 @@ port = 6012
         seed_committed_entries(&mut driver, 1);
         driver.node.voter_set = None;
 
-        let _ = driver.process_actions(vec![Action::TakeSnapshot], None).await;
+        let _ = driver
+            .process_actions(vec![Action::TakeSnapshot], None)
+            .await;
 
         let halt = driver
             .halt_reason
@@ -4284,13 +4392,24 @@ port = 6012
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn install_snapshot_does_not_regress_bookkeeping_when_behind() {
-        let (mut driver, _sm, _ss) = build_dispatch_driver();
+        // Stale-snapshot guard: a snapshot at or behind `last_applied`
+        // must be a NO-OP — no SnapshotStore.save_snapshot, no
+        // state_machine.restore, no bookkeeping mutation, and the
+        // driver must NOT halt (stale installs are a benign race, not
+        // a correctness fault). The earlier iteration only checked
+        // index no-regress, which silently allowed the SM to be rolled
+        // back to the older snapshot bytes while indices stayed
+        // forward — that is exactly the corruption this test now
+        // pins down.
+        let (mut driver, sm, ss) = build_dispatch_driver();
         seed_committed_entries(&mut driver, 100);
         let pre_last_applied = driver.node.last_applied;
         let pre_commit = driver.node.commit_index;
         let pre_last_log_index = driver.node.last_log_index;
+        let pre_voter_set = driver.node.voter_set.clone();
+        let pre_peers: Vec<NodeId> = driver.node.peers.keys().copied().collect();
 
-        let meta = snapshot_meta_for(50, 3, &[1]);
+        let meta = snapshot_meta_for(50, 3, &[1, 2, 3]);
         let _ = driver
             .process_actions(
                 vec![Action::InstallSnapshot {
@@ -4303,10 +4422,282 @@ port = 6012
 
         assert!(
             driver.halt_reason.is_none(),
-            "install behind local tip should not halt"
+            "install behind local tip should not halt: {:?}",
+            driver.halt_reason
         );
+        // Indices unchanged.
         assert_eq!(driver.node.last_applied, pre_last_applied);
         assert_eq!(driver.node.commit_index, pre_commit);
         assert_eq!(driver.node.last_log_index, pre_last_log_index);
+        // Critical: no persist and no restore. The previous
+        // implementation called both BEFORE the no-regress guards,
+        // rolling the SM back to old data with stale indices intact.
+        assert!(
+            ss.saved_snapshots().is_empty(),
+            "stale snapshot must NOT be persisted"
+        );
+        assert!(
+            sm.restored_snapshots().is_empty(),
+            "stale snapshot must NOT trigger state_machine.restore"
+        );
+        // Membership unchanged: a stale install's voter_set must not
+        // overwrite the current (newer) configuration.
+        assert_eq!(driver.node.voter_set, pre_voter_set);
+        let post_peers: Vec<NodeId> = driver.node.peers.keys().copied().collect();
+        assert_eq!(post_peers, pre_peers);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn install_snapshot_at_equal_last_applied_is_noop() {
+        // Boundary case of the stale-snapshot guard: `snap_idx ==
+        // last_applied`. The SM is already at that state, so the
+        // restore is at best wasteful (same bytes) and at worst
+        // corrupting (different bytes from a divergent leader). The
+        // `<=` in the guard intentionally covers equality — pin it
+        // here so a future change to `<` is caught by tests.
+        let (mut driver, sm, ss) = build_dispatch_driver();
+        seed_committed_entries(&mut driver, 7);
+        assert_eq!(driver.node.last_applied, LogIndex(7));
+
+        let meta = snapshot_meta_for(7, 1, &[1]);
+        let _ = driver
+            .process_actions(
+                vec![Action::InstallSnapshot {
+                    metadata: meta,
+                    data: b"equal".to_vec(),
+                }],
+                None,
+            )
+            .await;
+
+        assert!(driver.halt_reason.is_none());
+        assert!(ss.saved_snapshots().is_empty());
+        assert!(sm.restored_snapshots().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Iteration 4 — additional fix coverage:
+    //   * `apply_committed` halt-on-incomplete-range (gap or short
+    //     read) — engine has already advanced last_applied, so
+    //     skipping silently would corrupt the SM/engine alignment.
+    //   * `process_actions` populates `captured.error` (not just
+    //     `halt_reason`) for ApplyToStateMachine / TakeSnapshot /
+    //     InstallSnapshot failures, mirroring the persistence
+    //     failure branches. Without this, an inbound RPC handler
+    //     can return a captured success response while the driver
+    //     is fail-stopping.
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn apply_committed_halts_when_log_range_is_short() {
+        // Seed 4 entries, ask `apply_committed` for [1..=4], but make
+        // the log store drop entry 3 from the response. The driver
+        // must halt — the engine has already advanced last_applied to
+        // 4, so silently applying only 1,2,4 would leave the SM
+        // missing entry 3 forever.
+        let (mut driver, sm, _ss) = build_dispatch_driver();
+        seed_committed_entries(&mut driver, 4);
+        driver
+            .log_store
+            .drop_indices_in_get_range
+            .lock()
+            .unwrap()
+            .insert(LogIndex(3));
+
+        let captured = driver
+            .process_actions(
+                vec![Action::ApplyToStateMachine {
+                    from: LogIndex(1),
+                    to: LogIndex(4),
+                }],
+                None,
+            )
+            .await;
+
+        let halt = driver
+            .halt_reason
+            .as_ref()
+            .expect("must halt when log_store returns short/gapped range");
+        assert!(
+            halt.contains("returned 3 entries, expected 4")
+                || halt.contains("returned entry at LogIndex(4) at position 2"),
+            "halt reason should name the short-range/gap, got: {halt}"
+        );
+        // captured.error must mirror the halt_reason for symmetry
+        // with the persistence-failure branches (Fix 3).
+        assert!(
+            captured.error.is_some(),
+            "captured.error must be set so inbound RPC handlers return Err"
+        );
+        // Critical: validation happens BEFORE the apply loop, so the
+        // state machine sees zero applies — the alternative (applying
+        // 1,2 then halting at 3) would let the engine and SM diverge
+        // by exactly the entries before the gap.
+        assert!(
+            sm.snapshot_handle().lock().unwrap().is_empty(),
+            "no apply must happen when range validation fails"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn apply_committed_halts_when_log_range_has_index_gap() {
+        // Seed 1,2,4 (no entry 3) and request [1..=4]. The store
+        // returns 3 entries — the length check still triggers, but
+        // we also want to confirm the index-continuity check would
+        // catch a same-length-but-misaligned response (e.g. a future
+        // store that returns 1,2,4,4 by mistake). Easiest way to
+        // exercise the index-continuity branch with the existing
+        // injectors is to drop entry 2 instead of 3, then assert the
+        // failure message names the index mismatch.
+        let (mut driver, _sm, _ss) = build_dispatch_driver();
+        seed_committed_entries(&mut driver, 4);
+        driver
+            .log_store
+            .drop_indices_in_get_range
+            .lock()
+            .unwrap()
+            .insert(LogIndex(2));
+
+        let captured = driver
+            .process_actions(
+                vec![Action::ApplyToStateMachine {
+                    from: LogIndex(1),
+                    to: LogIndex(4),
+                }],
+                None,
+            )
+            .await;
+
+        let halt = driver
+            .halt_reason
+            .as_ref()
+            .expect("must halt on log range gap");
+        assert!(
+            halt.contains("returned 3 entries, expected 4")
+                || halt.contains("at position"),
+            "halt reason should describe the range mismatch, got: {halt}"
+        );
+        assert!(captured.error.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn apply_to_state_machine_populates_captured_error_on_failure() {
+        // Fix 3: when state_machine.apply() fails, `process_actions`
+        // must populate `captured.error` AND `halt_reason`. The
+        // returned CapturedResponse is what inbound RPC handlers
+        // (Vote/PreVote/Fetch/FetchSnapshot) inspect before sending
+        // any captured success payload — without captured.error,
+        // those handlers will reply Ok while the driver is dying.
+        let (mut driver, sm, _ss) = build_dispatch_driver();
+        seed_committed_entries(&mut driver, 2);
+        sm.arm_fail_apply_at(LogIndex(1));
+
+        let captured = driver
+            .process_actions(
+                vec![Action::ApplyToStateMachine {
+                    from: LogIndex(1),
+                    to: LogIndex(2),
+                }],
+                None,
+            )
+            .await;
+
+        assert!(driver.halt_reason.is_some());
+        let err = captured
+            .error
+            .expect("captured.error must be set so inbound RPCs return Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("state machine apply at LogIndex(1)"),
+            "captured.error should describe the apply failure, got: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn take_snapshot_populates_captured_error_on_failure() {
+        // Fix 3 for the TakeSnapshot dispatch branch.
+        let (mut driver, sm, _ss) = build_dispatch_driver();
+        seed_committed_entries(&mut driver, 1);
+        sm.arm_fail_next_snapshot();
+
+        let captured = driver.process_actions(vec![Action::TakeSnapshot], None).await;
+
+        assert!(driver.halt_reason.is_some());
+        let err = captured
+            .error
+            .expect("captured.error must be set for TakeSnapshot failure");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("state machine snapshot failed"),
+            "captured.error should describe the snapshot failure, got: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn install_snapshot_populates_captured_error_on_failure() {
+        // Fix 3 for the InstallSnapshot dispatch branch. Use the
+        // missing-voter-set halt path because it doesn't require any
+        // injector wiring.
+        let (mut driver, _sm, _ss) = build_dispatch_driver();
+        let meta = SnapshotMeta {
+            last_included_index: LogIndex(10),
+            last_included_term: Term(2),
+            id: "no-voters".to_string(),
+            voter_set: None,
+            size_bytes: None,
+            checksum: None,
+        };
+
+        let captured = driver
+            .process_actions(
+                vec![Action::InstallSnapshot {
+                    metadata: meta,
+                    data: b"x".to_vec(),
+                }],
+                None,
+            )
+            .await;
+
+        assert!(driver.halt_reason.is_some());
+        let err = captured
+            .error
+            .expect("captured.error must be set for InstallSnapshot failure");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("missing required voter_set"),
+            "captured.error should describe the install failure, got: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn apply_committed_halts_on_inverted_range() {
+        // Defensive guard against an inverted range arriving at the
+        // dispatch helper. The engine's contract is from <= to, but
+        // `apply_committed` is reachable from direct test dispatch
+        // and any future engine bug would otherwise panic on the
+        // subtraction in `expected_len`. Halting is the safe choice.
+        let (mut driver, sm, _ss) = build_dispatch_driver();
+        seed_committed_entries(&mut driver, 4);
+
+        let captured = driver
+            .process_actions(
+                vec![Action::ApplyToStateMachine {
+                    from: LogIndex(3),
+                    to: LogIndex(1),
+                }],
+                None,
+            )
+            .await;
+
+        let halt = driver
+            .halt_reason
+            .as_ref()
+            .expect("must halt on inverted range");
+        assert!(
+            halt.contains("invalid range"),
+            "halt reason should call out invalid range, got: {halt}"
+        );
+        assert!(captured.error.is_some());
+        assert!(sm.snapshot_handle().lock().unwrap().is_empty());
     }
 }
