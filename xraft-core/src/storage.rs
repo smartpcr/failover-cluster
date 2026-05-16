@@ -28,6 +28,33 @@ pub trait LogStore: Send + Sync {
     fn term_at(&self, index: LogIndex) -> Result<Option<Term>>;
     /// Flush buffered writes to durable storage.
     fn flush(&mut self) -> Result<()>;
+    /// Remove all entries with `index <= through_index_inclusive` from
+    /// the log.
+    ///
+    /// Called by the driver after a snapshot has been durably persisted
+    /// to the [`SnapshotStore`] — the snapshot supersedes all entries at
+    /// or below `through_index_inclusive`, so the log can reclaim them.
+    ///
+    /// **Contract:**
+    /// - Idempotent: a no-op when no entries are at or below
+    ///   `through_index_inclusive` (e.g. an already-compacted log).
+    /// - After the call returns, `get(idx)`, `get_range(.., idx + 1)`,
+    ///   and `term_at(idx)` MUST return `None` for every
+    ///   `idx <= through_index_inclusive`.
+    /// - The purge MUST be restart-safe: any durable state that would
+    ///   otherwise resurrect a compacted entry on replay (e.g. WAL
+    ///   segment frames) must be either deleted OR shadowed by a
+    ///   persisted low-watermark marker.
+    /// - Implementations MAY retain physical bytes (segments, WAL
+    ///   frames) that span the purge boundary; only the *logical view*
+    ///   returned by reads must respect the cut.
+    ///
+    /// Required so that the driver's
+    /// `Action::TruncateLog(PrefixThroughInclusive)` arm can rely on
+    /// every concrete `LogStore` actually reclaiming the prefix rather
+    /// than silently ignoring the request — see Stage 5.3 snapshot
+    /// coordination in `implementation-plan.md`.
+    fn purge_prefix(&mut self, through_index_inclusive: LogIndex) -> Result<()>;
 }
 
 /// Persistent hard state (term + vote).
