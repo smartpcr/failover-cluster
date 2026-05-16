@@ -148,27 +148,52 @@ pub enum OutboundResult {
         /// The response payload.
         response: FetchResponse,
     },
-    /// `FetchSnapshot` stream completed cleanly (a final chunk with
-    /// `done == true` was observed).
+    /// `FetchSnapshot` stream drained cleanly at the transport level.
+    /// May represent either:
+    ///
+    /// * **Full snapshot completion** — `completed == true`: a chunk
+    ///   with `done == true` was observed. Phase 5 can install the
+    ///   reconstructed snapshot and advance the follower.
+    /// * **Legitimate partial-window response** — `completed == false`
+    ///   with `bytes_received == request.max_bytes` (and `max_bytes > 0`):
+    ///   the outbound request asked for a bounded window
+    ///   (`FetchSnapshotRequest.max_bytes > 0`) and the leader honoured
+    ///   it exactly. The snapshot store's
+    ///   [`SnapshotStore::snapshot_reader_from_offset`](xraft_core::storage::SnapshotStore::snapshot_reader_from_offset)
+    ///   explicitly produces `done == false` on the final chunk when
+    ///   the requested window does not cover the snapshot tail — this
+    ///   is the resume path. Phase 5 issues the next FetchSnapshot
+    ///   with `offset = requested_offset + bytes_received` to continue.
+    ///
+    /// Streams that end without `done == true` AND do not fully fill a
+    /// bounded window (i.e. either an unbounded `max_bytes == 0`
+    /// request closed early, or a bounded request returned fewer bytes
+    /// than requested) are surfaced as
+    /// [`OutboundResult::Error`] (kind `"fetch_snapshot"`) — those are
+    /// real transport-level truncations from a misbehaving peer.
     ///
     /// Stage 4.2 does not yet feed chunks back into `RaftNode::step` —
-    /// there is no `Input::SnapshotChunk` variant. The driver collects
-    /// the stream's chunks to verify the transport completed and logs
-    /// the counts; downstream snapshot install lands in Phase 5.
-    ///
-    /// Streams that end WITHOUT a final `done = true` chunk are
-    /// surfaced as [`OutboundResult::Error`] (kind `"fetch_snapshot"`)
-    /// — the `FetchSnapshot` variant is reserved for clean completions
-    /// only and therefore `completed` is always `true` when this
-    /// variant is observed (the field is retained for backwards
-    /// compatibility with any future incremental-chunk consumer).
+    /// there is no `Input::SnapshotChunk` variant. The driver logs the
+    /// counts; downstream snapshot install lands in Phase 5.
     FetchSnapshot {
         /// Peer node id that produced the stream.
         peer: NodeId,
         /// Number of chunks received from the stream.
         chunk_count: u64,
+        /// Total payload bytes received across all chunks in this
+        /// stream. Used by Phase 5 to compute the next resume offset
+        /// (`next_offset = requested_offset + bytes_received`) when
+        /// `completed == false`.
+        bytes_received: u64,
+        /// Byte offset carried by the originating `FetchSnapshotRequest`.
+        /// Combined with `bytes_received` this is enough to compute the
+        /// resume offset for a partial-window response without the
+        /// driver having to track outbound snapshot request state.
+        requested_offset: u64,
         /// True iff the stream terminated with a final chunk
-        /// (`done == true`). Currently always `true` in this variant.
+        /// (`done == true`) — i.e. the full snapshot payload was
+        /// transferred. False indicates a legitimate partial-window
+        /// response that exactly filled `request.max_bytes`.
         completed: bool,
     },
     /// An outbound RPC failed; nothing is fed back into the node — the
@@ -517,12 +542,44 @@ impl<T: Transport + Send + Sync + 'static> MessageRouter<T> {
                 // "fetch_snapshot" }` so the engine / operator can
                 // react (e.g. retry with a different peer) and the
                 // task makes forward progress under load.
+                //
+                // Stream-end disposition follows the
+                // [`SnapshotStore::snapshot_reader_from_offset`](xraft_core::storage::SnapshotStore::snapshot_reader_from_offset)
+                // contract:
+                //   * `done == true` chunk seen  → full snapshot →
+                //       `FetchSnapshot { completed: true }`
+                //   * unbounded request (`max_bytes == 0`) ends
+                //       without `done`            → truncation →
+                //       `Error { kind: "fetch_snapshot" }`
+                //   * bounded request returned exactly `max_bytes`
+                //       and ended without `done`  → legitimate
+                //       partial window →
+                //       `FetchSnapshot { completed: false }`
+                //       (Phase 5 resumes from
+                //       `requested_offset + bytes_received`)
+                //   * bounded request returned fewer than `max_bytes`
+                //       without `done`            → peer truncation
+                //       → `Error { kind: "fetch_snapshot" }`
+                //   * bounded request returned more than `max_bytes`
+                //                                 → peer violated
+                //       window cap → `Error { kind: "fetch_snapshot" }`
                 let deadline = self.fetch_snapshot_deadline;
+                // Capture the request's `max_bytes` window and `offset`
+                // BEFORE the request is moved into the transport call.
+                // `max_bytes == 0` means "unbounded window"; only a
+                // bounded request can legitimately end with
+                // `done == false`. `requested_offset` is reported back
+                // on the OutboundResult so Phase 5 can compute the
+                // resume offset without re-deriving it from outbound
+                // state the driver does not currently track.
+                let requested_max_bytes = req.max_bytes;
+                let requested_offset = req.offset;
                 self.tasks.spawn(async move {
                     let out = match transport.send_fetch_snapshot(peer, req).await {
                         Ok(mut stream) => {
                             let drain = async {
                                 let mut chunk_count: u64 = 0;
+                                let mut bytes_received: u64 = 0;
                                 let mut completed = false;
                                 let mut err: Option<String> = None;
                                 loop {
@@ -533,6 +590,8 @@ impl<T: Transport + Send + Sync + 'static> MessageRouter<T> {
                                     match next {
                                         Some(Ok(chunk)) => {
                                             chunk_count += 1;
+                                            bytes_received = bytes_received
+                                                .saturating_add(chunk.data.len() as u64);
                                             if chunk.done {
                                                 completed = true;
                                             }
@@ -544,39 +603,77 @@ impl<T: Transport + Send + Sync + 'static> MessageRouter<T> {
                                         None => break,
                                     }
                                 }
-                                (chunk_count, completed, err)
+                                (chunk_count, bytes_received, completed, err)
                             };
                             match tokio::time::timeout(deadline, drain).await {
-                                Ok((chunk_count, completed, err)) => {
+                                Ok((chunk_count, bytes_received, completed, err)) => {
                                     if let Some(e) = err {
                                         OutboundResult::Error {
                                             peer,
                                             kind: "fetch_snapshot",
                                             err: e,
                                         }
-                                    } else if !completed {
-                                        // Stream ended without a `done = true`
-                                        // chunk — this is a transport-level
-                                        // truncation (peer closed the stream
-                                        // before the snapshot was fully sent).
-                                        // Surface as `Error` so the engine /
-                                        // operator can distinguish a truncated
-                                        // transfer from a successful one. The
-                                        // `OutboundResult::FetchSnapshot`
-                                        // variant is therefore only emitted on
-                                        // a clean `completed=true` stream.
+                                    } else if completed {
+                                        // Full snapshot transferred —
+                                        // a `done == true` chunk was
+                                        // observed. Phase 5 can install.
+                                        OutboundResult::FetchSnapshot {
+                                            peer,
+                                            chunk_count,
+                                            bytes_received,
+                                            requested_offset,
+                                            completed: true,
+                                        }
+                                    } else if requested_max_bytes > 0
+                                        && bytes_received == requested_max_bytes
+                                    {
+                                        // Legitimate partial-window
+                                        // response: the bounded
+                                        // request was honoured
+                                        // exactly. Phase 5 resumes
+                                        // from `requested_offset +
+                                        // bytes_received`.
+                                        OutboundResult::FetchSnapshot {
+                                            peer,
+                                            chunk_count,
+                                            bytes_received,
+                                            requested_offset,
+                                            completed: false,
+                                        }
+                                    } else if requested_max_bytes > 0
+                                        && bytes_received > requested_max_bytes
+                                    {
+                                        // Peer violated its own
+                                        // bounded window — over-served
+                                        // bytes. Surface as Error so
+                                        // the buggy/malicious peer is
+                                        // not silently trusted.
                                         OutboundResult::Error {
                                             peer,
                                             kind: "fetch_snapshot",
                                             err: format!(
-                                                "FetchSnapshot stream ended after {chunk_count} chunks without done=true"
+                                                "FetchSnapshot peer over-served bounded window: requested_max_bytes={requested_max_bytes}, bytes_received={bytes_received}"
                                             ),
                                         }
                                     } else {
-                                        OutboundResult::FetchSnapshot {
+                                        // Truncation. Two cases:
+                                        //  * unbounded request that
+                                        //    closed before done=true
+                                        //  * bounded request that
+                                        //    returned fewer bytes
+                                        //    than requested without
+                                        //    done=true
+                                        // Both are protocol violations
+                                        // — distinguish by
+                                        // requested_max_bytes in the
+                                        // error string for
+                                        // operability.
+                                        OutboundResult::Error {
                                             peer,
-                                            chunk_count,
-                                            completed,
+                                            kind: "fetch_snapshot",
+                                            err: format!(
+                                                "FetchSnapshot stream ended after {chunk_count} chunks ({bytes_received} bytes) without done=true (requested_max_bytes={requested_max_bytes})"
+                                            ),
                                         }
                                     }
                                 }
@@ -884,13 +981,20 @@ where
             OutboundResult::FetchSnapshot {
                 peer,
                 chunk_count,
+                bytes_received,
+                requested_offset,
                 completed,
             } => {
                 // Stage 4.2 — no `Input::SnapshotChunk` exists yet.
                 // Phase 5 will pipe chunks through `RaftNode::step`.
+                // `completed == false` here is a legitimate
+                // partial-window response — Phase 5 will resume from
+                // `requested_offset + bytes_received`. Logged at
+                // `debug` so operators can correlate transfers
+                // without flooding `info`.
                 debug!(
                     target: "xraft_server::driver",
-                    %peer, chunk_count, completed,
+                    %peer, chunk_count, bytes_received, requested_offset, completed,
                     "outbound FetchSnapshot stream finished"
                 );
             }
@@ -1104,9 +1208,31 @@ where
         } else {
             Some(req.max_bytes)
         };
-        // `chunk_size` of 0 makes the store pick its default; the
-        // store also uses `chunk_size == 0 → default` semantics.
-        let chunk_size: usize = max_bytes_opt.map(|n| n as usize).unwrap_or(0);
+        // `chunk_size` and `max_bytes` are SEMANTICALLY INDEPENDENT —
+        // do NOT derive one from the other. `chunk_size` is the
+        // per-chunk streaming granularity used by
+        // [`SnapshotStore::snapshot_reader_from_offset`](xraft_core::storage::SnapshotStore::snapshot_reader_from_offset)
+        // (passing `0` delegates to the store's default, typically 1
+        // MiB), while `max_bytes` is the **window cap** — the maximum
+        // total bytes returned in this single response so a follower
+        // can resume from a higher offset. Deriving `chunk_size` from
+        // `max_bytes` would:
+        //   1. Turn a large bounded window into a single giant chunk,
+        //      defeating the chunked-streaming design (each chunk is
+        //      sent as a separate gRPC stream message; one giant chunk
+        //      eliminates intra-window backpressure).
+        //   2. Make `chunk_index` arithmetic depend on the *caller's*
+        //      `max_bytes`, so the same byte at offset 1MB would have
+        //      different `chunk_index` values depending on how the
+        //      follower paginates — breaking receiver-side bookkeeping
+        //      that assumes a stable indexing scheme.
+        //   3. Need an unchecked `u64 as usize` conversion (lossy on
+        //      32-bit platforms for windows > 4 GiB).
+        // Stage 4.2 has no DriverConfig knob for chunk size yet;
+        // passing `0` here is the right default — Phase 5 can surface
+        // a configurable chunk size when the snapshot install
+        // pipeline lands.
+        let chunk_size: usize = 0;
         let iter = match self.snapshot_store.snapshot_reader_from_offset(
             &meta,
             chunk_size,
@@ -2629,6 +2755,262 @@ port = 6022
     }
 
     // -----------------------------------------------------------------
+    // Inbound happy-path chunking (pins iter-2 evaluator item #1:
+    // chunk_size MUST be independent from req.max_bytes).
+    // -----------------------------------------------------------------
+
+    /// Test SnapshotStore double seeded with a single canonical
+    /// snapshot. Used by the inbound happy-path / bounded-window
+    /// chunking tests to drive the default
+    /// `SnapshotStore::snapshot_reader_from_offset` impl with a real
+    /// payload — `TestSnapshotStore` cannot, since its
+    /// `load_snapshot` returns `None`.
+    ///
+    /// Deliberately bypasses the `voter_set.is_some()` save-time
+    /// guard that `MemorySnapshotStore` enforces, so tests don't have
+    /// to build a real `VoterSet` (which requires real `DirectoryId`s
+    /// and endpoints — orthogonal to what these tests exercise).
+    struct SeededSnapshotStore {
+        meta: SnapshotMeta,
+        data: Vec<u8>,
+    }
+
+    impl SnapshotStore for SeededSnapshotStore {
+        fn save_snapshot(&mut self, _metadata: SnapshotMeta, _data: &[u8]) -> XResult<()> {
+            Ok(())
+        }
+        fn load_latest_snapshot(&self) -> XResult<Option<(SnapshotMeta, Vec<u8>)>> {
+            Ok(Some((self.meta.clone(), self.data.clone())))
+        }
+        fn load_snapshot(
+            &self,
+            index: LogIndex,
+            term: Term,
+        ) -> XResult<Option<(SnapshotMeta, Vec<u8>)>> {
+            if self.meta.last_included_index == index && self.meta.last_included_term == term {
+                Ok(Some((self.meta.clone(), self.data.clone())))
+            } else {
+                Ok(None)
+            }
+        }
+        fn list_snapshots(&self) -> XResult<Vec<SnapshotMeta>> {
+            Ok(vec![self.meta.clone()])
+        }
+        fn delete_snapshot(&mut self, _id: &str) -> XResult<()> {
+            Ok(())
+        }
+        fn snapshot_exists(&self, index: LogIndex, term: Term) -> bool {
+            self.meta.last_included_index == index && self.meta.last_included_term == term
+        }
+    }
+
+    type SeededDriver = Driver<
+        NoopTransport,
+        TestLogStore,
+        TestHardStateStore,
+        SeededSnapshotStore,
+        TestStateMachine,
+    >;
+
+    /// Build a driver wired to a `SeededSnapshotStore` containing a
+    /// single snapshot of `data.len()` bytes with id
+    /// `snap_id`. The replica `extra_peer` is injected into the
+    /// node's `peers` map so the membership fence (step 4 of
+    /// `handle_inbound_fetch_snapshot`) accepts the request.
+    fn build_driver_with_seeded_snapshot(
+        config: ClusterConfig,
+        extra_peer: NodeId,
+        snap_id: &str,
+        data: Vec<u8>,
+    ) -> (SeededDriver, DriverHandle) {
+        let mut node = RaftNode::new_with_seed(config, 1234).expect("RaftNode ctor");
+        node.peers
+            .insert(extra_peer, xraft_core::PeerState::new(true));
+        let log = TestLogStore::default();
+        let hs = TestHardStateStore::default();
+        let meta = SnapshotMeta {
+            last_included_index: LogIndex(10),
+            last_included_term: Term(1),
+            id: snap_id.into(),
+            // Seeded test double bypasses the voter_set save guard.
+            voter_set: None,
+            size_bytes: Some(data.len() as u64),
+            checksum: None,
+        };
+        let ss = SeededSnapshotStore { meta, data };
+        let sm = TestStateMachine::default();
+        let transport = Arc::new(NoopTransport::default());
+        let driver = Driver::new(
+            node,
+            log,
+            hs,
+            ss,
+            sm,
+            transport,
+            DriverConfig {
+                tick_interval: Duration::from_millis(2),
+                max_fetch_batch: 8,
+                shutdown_drain_deadline: Duration::from_secs(2),
+                fetch_snapshot_deadline: Duration::from_secs(2),
+            },
+        );
+        let handle = driver.handle();
+        (driver, handle)
+    }
+
+    /// Drain a `SnapshotChunkStream` synchronously by polling it
+    /// repeatedly. Tests build small payloads so the stream is
+    /// always immediately ready.
+    async fn drain_chunk_stream(mut stream: SnapshotChunkStream) -> Vec<FetchSnapshotChunk> {
+        let mut out = Vec::new();
+        loop {
+            let next = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await;
+            match next {
+                Some(Ok(c)) => out.push(c),
+                Some(Err(e)) => panic!("chunk stream yielded error: {e}"),
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// Default chunk size honoured by the store's
+    /// `snapshot_reader_from_offset` when `chunk_size == 0` is
+    /// passed (matches `xraft_core::storage::SnapshotStore` doc:
+    /// "typically 1 MiB").
+    const STORE_DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
+
+    /// Inbound happy-path: a full unbounded request (`max_bytes=0`)
+    /// against a multi-MiB snapshot yields N chunks of the **store's
+    /// default chunk size**, with the final chunk carrying
+    /// `done=true`. Independent assertion that the engine actually
+    /// drives `snapshot_reader_from_offset` with `chunk_size=0`
+    /// (delegating to the store's default), not some derived value.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fetch_snapshot_full_window_uses_default_chunk_size() {
+        // 3-MiB payload → 3 chunks of 1 MiB each at the store's
+        // default chunk size.
+        let payload = vec![0xABu8; 3 * STORE_DEFAULT_CHUNK_SIZE];
+        let snap_id = "snapshot-0000000001-00000000000000000010";
+        let cfg = single_voter_config(2);
+        let (driver, handle) = build_driver_with_seeded_snapshot(
+            cfg,
+            NodeId(2),
+            snap_id,
+            payload.clone(),
+        );
+        let run_task = tokio::spawn(driver.run());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let inbound = handle.inbound_handler();
+        let stream = inbound
+            .handle_fetch_snapshot(FetchSnapshotRequest {
+                cluster_id: "test-driver".into(),
+                leader_epoch: 1,
+                replica_id: NodeId(2),
+                snapshot_id: snap_id.into(),
+                offset: 0,
+                max_bytes: 0, // unbounded — full snapshot
+            })
+            .await
+            .expect("expected Ok(stream) for valid FetchSnapshot");
+
+        let chunks = drain_chunk_stream(stream).await;
+        assert_eq!(
+            chunks.len(),
+            3,
+            "expected 3 chunks at default 1MiB chunk_size for a 3MiB snapshot, got {}",
+            chunks.len()
+        );
+        for c in &chunks[..2] {
+            assert_eq!(
+                c.data.len(),
+                STORE_DEFAULT_CHUNK_SIZE,
+                "non-final chunk must be exactly default chunk size"
+            );
+            assert!(!c.done, "non-final chunk must have done=false");
+        }
+        assert_eq!(chunks[2].data.len(), STORE_DEFAULT_CHUNK_SIZE);
+        assert!(
+            chunks[2].done,
+            "final chunk of an unbounded request must carry done=true"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
+    }
+
+    /// Inbound bounded-window: a request with `max_bytes` set to a
+    /// value strictly greater than the store's default chunk size
+    /// must still produce MULTIPLE chunks (each of the default chunk
+    /// size), with the final chunk carrying `done=false` because
+    /// the window does NOT cover the snapshot tail.
+    ///
+    /// This is the pinned regression test for the iter-1 evaluator
+    /// gap: the prior iteration derived `chunk_size` from
+    /// `req.max_bytes`, which would have collapsed the 2-MiB window
+    /// into a SINGLE 2-MiB chunk (defeating chunked streaming and
+    /// making `chunk_index` arithmetic depend on caller-selected
+    /// `max_bytes`). With the fix, chunk_size is held at the
+    /// store's default and the window is split into 2 chunks.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fetch_snapshot_bounded_window_chunks_independent_of_max_bytes() {
+        // 3-MiB snapshot, 2-MiB bounded window → 2 chunks of 1 MiB
+        // each at the store's default chunk size. Buggy code would
+        // produce 1 chunk of 2 MiB.
+        let payload = vec![0xCDu8; 3 * STORE_DEFAULT_CHUNK_SIZE];
+        let snap_id = "snapshot-0000000001-00000000000000000010";
+        let cfg = single_voter_config(2);
+        let (driver, handle) = build_driver_with_seeded_snapshot(
+            cfg,
+            NodeId(2),
+            snap_id,
+            payload,
+        );
+        let run_task = tokio::spawn(driver.run());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let inbound = handle.inbound_handler();
+        let stream = inbound
+            .handle_fetch_snapshot(FetchSnapshotRequest {
+                cluster_id: "test-driver".into(),
+                leader_epoch: 1,
+                replica_id: NodeId(2),
+                snapshot_id: snap_id.into(),
+                offset: 0,
+                max_bytes: 2 * STORE_DEFAULT_CHUNK_SIZE as u64,
+            })
+            .await
+            .expect("expected Ok(stream) for valid bounded FetchSnapshot");
+
+        let chunks = drain_chunk_stream(stream).await;
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected 2 chunks at default 1MiB chunk_size for a 2MiB window, got {} — \
+             this likely means chunk_size was incorrectly derived from req.max_bytes",
+            chunks.len()
+        );
+        assert_eq!(chunks[0].data.len(), STORE_DEFAULT_CHUNK_SIZE);
+        assert_eq!(chunks[1].data.len(), STORE_DEFAULT_CHUNK_SIZE);
+        for c in &chunks {
+            assert!(
+                !c.done,
+                "bounded window that does NOT cover the snapshot tail \
+                 must have done=false on every chunk (incl. the last) — \
+                 the follower will resume from offset = 2MiB"
+            );
+        }
+        // Total bytes across the window match max_bytes exactly.
+        let total: usize = chunks.iter().map(|c| c.data.len()).sum();
+        assert_eq!(total, 2 * STORE_DEFAULT_CHUNK_SIZE);
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
+    }
+
+
+    // -----------------------------------------------------------------
     // Helper sanity check: inbound Vote always replies (default-deny on drop).
     // -----------------------------------------------------------------
 
@@ -3300,10 +3682,17 @@ port = 6012
             OutboundResult::FetchSnapshot {
                 peer,
                 chunk_count,
+                bytes_received,
+                requested_offset,
                 completed,
             } => {
                 assert_eq!(peer, NodeId(2));
                 assert_eq!(chunk_count, 1);
+                assert_eq!(
+                    bytes_received, 4,
+                    "expected bytes_received to equal the single chunk's payload length"
+                );
+                assert_eq!(requested_offset, 0);
                 assert!(
                     completed,
                     "expected completed=true for a stream ending with done=true"
@@ -3367,6 +3756,234 @@ port = 6012
             other => {
                 panic!("expected OutboundResult::Error (incomplete snapshot stream), got {other:?}")
             }
+        }
+    }
+
+    /// Router test: a FetchSnapshot stream that ends WITHOUT a
+    /// `done=true` chunk but EXACTLY fills the request's bounded
+    /// `max_bytes` window MUST be surfaced as
+    /// `OutboundResult::FetchSnapshot { completed: false, ... }` —
+    /// NOT as an error. This is the resume-protocol contract:
+    /// `SnapshotStore::snapshot_reader_from_offset` explicitly
+    /// returns `done=false` on the final chunk of a window that does
+    /// not cover the snapshot tail; the follower is expected to
+    /// resume at `requested_offset + bytes_received`.
+    ///
+    /// Pinned to iter-1 evaluator item #2 (router incorrectly
+    /// treated all `done=false` stream-ends as truncation,
+    /// rejecting legitimate partial-window responses).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn message_router_dispatches_bounded_window_partial_fetch_snapshot_stream() {
+        const WINDOW_BYTES: u64 = 1024;
+        // Single chunk exactly filling `max_bytes` with `done=false`
+        // — the snapshot store's bounded-window contract.
+        let chunk = FetchSnapshotChunk {
+            cluster_id: "test-router".into(),
+            leader_epoch: 1,
+            chunk_index: 0,
+            data: vec![0xA5; WINDOW_BYTES as usize],
+            done: false, // <-- KEY: partial window, NOT a truncation.
+            metadata: Some(SnapshotMeta {
+                id: "snap-1".into(),
+                last_included_index: LogIndex(10),
+                last_included_term: Term(1),
+                voter_set: None,
+                size_bytes: Some(4096),
+                checksum: None,
+            }),
+        };
+        let transport = Arc::new(ChunkProducingTransport::new(vec![Ok(chunk)]));
+        let (tx, mut rx) = mpsc::channel::<OutboundResult>(16);
+        let mut router = MessageRouter::new(transport, tx);
+
+        router.dispatch(
+            NodeId(2),
+            OutboundMessage::FetchSnapshotRequest(FetchSnapshotRequest {
+                cluster_id: "test-router".into(),
+                leader_epoch: 1,
+                replica_id: NodeId(1),
+                snapshot_id: "snap-1".into(),
+                offset: 2048, // partway through the snapshot
+                max_bytes: WINDOW_BYTES,
+            }),
+        );
+
+        let evt = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("router did not produce result within 2s")
+            .expect("router channel closed");
+        match evt {
+            OutboundResult::FetchSnapshot {
+                peer,
+                chunk_count,
+                bytes_received,
+                requested_offset,
+                completed,
+            } => {
+                assert_eq!(peer, NodeId(2));
+                assert_eq!(chunk_count, 1);
+                assert_eq!(
+                    bytes_received, WINDOW_BYTES,
+                    "bounded-window response must report bytes_received == request.max_bytes"
+                );
+                assert_eq!(
+                    requested_offset, 2048,
+                    "requested_offset must be echoed back so Phase 5 can compute resume offset"
+                );
+                assert!(
+                    !completed,
+                    "completed=false signals a partial-window response; Phase 5 resumes from offset+bytes_received"
+                );
+            }
+            other => panic!(
+                "expected OutboundResult::FetchSnapshot {{ completed: false }} for a legitimate \
+                 bounded-window partial response, got {other:?}"
+            ),
+        }
+    }
+
+    /// Router test: a bounded-window request whose peer returns
+    /// FEWER bytes than `max_bytes` without a `done=true` chunk MUST
+    /// be surfaced as `OutboundResult::Error` — this is real peer
+    /// truncation (a buggy or malicious leader closing the stream
+    /// early), not a legitimate partial window. The router
+    /// distinguishes by comparing `bytes_received` against the
+    /// originating request's `max_bytes`.
+    ///
+    /// Pairs with the partial-window test above to lock down both
+    /// halves of the bounded-window contract.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn message_router_dispatches_bounded_window_short_response_is_error() {
+        const REQUESTED_WINDOW: u64 = 1024;
+        // Peer claims a 1 KiB window but only ships 8 bytes with
+        // done=false — that's a real protocol violation, not a
+        // legitimate partial window.
+        let chunk = FetchSnapshotChunk {
+            cluster_id: "test-router".into(),
+            leader_epoch: 1,
+            chunk_index: 0,
+            data: vec![0xFF; 8],
+            done: false,
+            metadata: Some(SnapshotMeta {
+                id: "snap-1".into(),
+                last_included_index: LogIndex(10),
+                last_included_term: Term(1),
+                voter_set: None,
+                size_bytes: Some(4096),
+                checksum: None,
+            }),
+        };
+        let transport = Arc::new(ChunkProducingTransport::new(vec![Ok(chunk)]));
+        let (tx, mut rx) = mpsc::channel::<OutboundResult>(16);
+        let mut router = MessageRouter::new(transport, tx);
+
+        router.dispatch(
+            NodeId(2),
+            OutboundMessage::FetchSnapshotRequest(FetchSnapshotRequest {
+                cluster_id: "test-router".into(),
+                leader_epoch: 1,
+                replica_id: NodeId(1),
+                snapshot_id: "snap-1".into(),
+                offset: 0,
+                max_bytes: REQUESTED_WINDOW,
+            }),
+        );
+
+        let evt = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("router did not produce result within 2s")
+            .expect("router channel closed");
+        match evt {
+            OutboundResult::Error { peer, kind, err } => {
+                assert_eq!(peer, NodeId(2));
+                assert_eq!(kind, "fetch_snapshot");
+                assert!(
+                    err.contains("without done=true")
+                        && err.contains(&REQUESTED_WINDOW.to_string()),
+                    "expected truncation error mentioning requested_max_bytes, got: {err}"
+                );
+            }
+            other => panic!(
+                "expected OutboundResult::Error for a short bounded-window response \
+                 (peer under-served its own window), got {other:?}"
+            ),
+        }
+    }
+
+    /// Router test: a bounded-window request whose peer ships MORE
+    /// bytes than `max_bytes` (without `done=true`) MUST be surfaced
+    /// as `OutboundResult::Error` — a peer that violates its own
+    /// declared window cap is either buggy or malicious and must
+    /// not be silently trusted (otherwise the follower's resume
+    /// bookkeeping `offset = requested_offset + bytes_received`
+    /// would skip past bytes the leader never acknowledged sending
+    /// within the agreed window, corrupting installed snapshots).
+    ///
+    /// Locks down the third branch of the bounded-window
+    /// classification (`requested_max_bytes > 0 && bytes_received >
+    /// requested_max_bytes`) so a future refactor cannot silently
+    /// collapse it back into the "legitimate partial" case.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn message_router_dispatches_bounded_window_over_served_is_error() {
+        const REQUESTED_WINDOW: u64 = 1024;
+        // Two chunks summing to 2 KiB, but the request only allowed
+        // a 1 KiB window. Neither chunk carries done=true.
+        let mk_chunk = |idx: u64, len: usize| FetchSnapshotChunk {
+            cluster_id: "test-router".into(),
+            leader_epoch: 1,
+            chunk_index: idx,
+            data: vec![0x5A; len],
+            done: false,
+            metadata: if idx == 0 {
+                Some(SnapshotMeta {
+                    id: "snap-1".into(),
+                    last_included_index: LogIndex(10),
+                    last_included_term: Term(1),
+                    voter_set: None,
+                    size_bytes: Some(4096),
+                    checksum: None,
+                })
+            } else {
+                None
+            },
+        };
+        let transport = Arc::new(ChunkProducingTransport::new(vec![
+            Ok(mk_chunk(0, 1024)),
+            Ok(mk_chunk(1, 1024)),
+        ]));
+        let (tx, mut rx) = mpsc::channel::<OutboundResult>(16);
+        let mut router = MessageRouter::new(transport, tx);
+
+        router.dispatch(
+            NodeId(2),
+            OutboundMessage::FetchSnapshotRequest(FetchSnapshotRequest {
+                cluster_id: "test-router".into(),
+                leader_epoch: 1,
+                replica_id: NodeId(1),
+                snapshot_id: "snap-1".into(),
+                offset: 0,
+                max_bytes: REQUESTED_WINDOW,
+            }),
+        );
+
+        let evt = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("router did not produce result within 2s")
+            .expect("router channel closed");
+        match evt {
+            OutboundResult::Error { peer, kind, err } => {
+                assert_eq!(peer, NodeId(2));
+                assert_eq!(kind, "fetch_snapshot");
+                assert!(
+                    err.contains("over-served")
+                        && err.contains(&REQUESTED_WINDOW.to_string()),
+                    "expected over-served error mentioning requested_max_bytes, got: {err}"
+                );
+            }
+            other => panic!(
+                "expected OutboundResult::Error for a peer that exceeded its bounded \
+                 window, got {other:?}"
+            ),
         }
     }
 
