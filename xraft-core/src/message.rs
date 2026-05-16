@@ -287,7 +287,12 @@ pub struct FetchSnapshotChunk {
     pub leader_epoch: u64,
     pub chunk_index: u64,
     pub data: Vec<u8>,
-    /// True when this is the final chunk.
+    /// True when this is the final chunk **of the entire snapshot
+    /// payload**. A bounded-window response
+    /// (`FetchSnapshotRequest.max_bytes > 0`) whose window does not
+    /// cover the snapshot tail legitimately ends with the last chunk
+    /// of the window carrying `done = false`; the caller resumes
+    /// from `offset = request.offset + bytes_received`.
     pub done: bool,
     /// Snapshot metadata — present only in the first chunk.
     pub metadata: Option<SnapshotMeta>,
