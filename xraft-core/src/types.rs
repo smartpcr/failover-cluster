@@ -76,13 +76,25 @@ pub enum NodeRole {
 
 /// Safety-critical voting state persisted before any RPC reply.
 ///
-/// Only `current_term` and `voted_for` are persisted; `commit_index` and
-/// `last_applied` are volatile and rebuilt from the log on recovery
-/// (per `architecture.md` §3.3 / `implementation-plan.md` Stage 1.2).
+/// `current_term` and `voted_for` are persisted before any vote / term-bump
+/// is observable on the wire (Raft S1 safety invariant). `commit_index` is
+/// a checkpoint of the engine's known-committed offset: it is persisted on
+/// each [`current_term`] / [`voted_for`] change and at graceful shutdown,
+/// always clamped to the durable log tip so the recovered value is never
+/// ahead of the log. `last_applied` remains volatile and is rebuilt from
+/// the snapshot baseline + log-tail re-application on recovery
+/// (`architecture.md` §3.3, `implementation-plan.md` Stage 2.2 — the
+/// Stage 7.2 brief calls out `commit_index` explicitly as part of the
+/// persisted hard state shape).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HardState {
     pub current_term: Term,
     pub voted_for: Option<NodeId>,
+    /// Stage 7.2: durable lower bound on the engine's `commit_index`.
+    /// `#[serde(default)]` keeps Stage 1.2-7.1 on-disk files
+    /// deserialisable (legacy files only carry term + vote).
+    #[serde(default)]
+    pub commit_index: LogIndex,
 }
 
 /// A network endpoint for reaching a node.
@@ -519,9 +531,11 @@ mod tests {
         let hs = HardState {
             current_term: Term(5),
             voted_for: Some(NodeId(3)),
+            commit_index: LogIndex(0),
         };
         assert_eq!(hs.current_term, Term(5));
         assert_eq!(hs.voted_for, Some(NodeId(3)));
+        assert_eq!(hs.commit_index, LogIndex(0));
     }
 
     #[test]
@@ -529,6 +543,7 @@ mod tests {
         let hs = HardState {
             current_term: Term(1),
             voted_for: None,
+            commit_index: LogIndex(0),
         };
         assert!(hs.voted_for.is_none());
     }
@@ -538,10 +553,25 @@ mod tests {
         let hs = HardState {
             current_term: Term(10),
             voted_for: Some(NodeId(2)),
+            commit_index: LogIndex(42),
         };
         let json = serde_json::to_string(&hs).unwrap();
         let hs2: HardState = serde_json::from_str(&json).unwrap();
         assert_eq!(hs, hs2);
+        // Sanity: the field is present in the wire form.
+        assert!(json.contains("commit_index"), "wire json = {json}");
+    }
+
+    /// Stage 7.2 iter-3 finding #1: legacy on-disk JSON written by
+    /// Stage 1.2-7.1 code lacks `commit_index`. The `#[serde(default)]`
+    /// attribute MUST let it deserialise with `commit_index = 0`.
+    #[test]
+    fn hard_state_legacy_json_without_commit_index_deserialises() {
+        let raw = r#"{"current_term":7,"voted_for":3}"#;
+        let hs: HardState = serde_json::from_str(raw).unwrap();
+        assert_eq!(hs.current_term, Term(7));
+        assert_eq!(hs.voted_for, Some(NodeId(3)));
+        assert_eq!(hs.commit_index, LogIndex(0));
     }
 
     #[test]

@@ -13,7 +13,7 @@ bytes = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
 futures-core = "0.3"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 rand = { workspace = true }
 thiserror = { workspace = true }
 

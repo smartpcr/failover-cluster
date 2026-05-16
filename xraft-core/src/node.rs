@@ -49,9 +49,10 @@ use crate::config::ClusterConfig;
 use crate::error::Result;
 use crate::message::Entry;
 use crate::message::{
-    Action, EntryPayload, FetchRequest, FetchResponse, Input, OutboundMessage, PreVoteRequest,
-    PreVoteResponse, VoteRequest, VoteResponse,
+    Action, EntryPayload, FetchRequest, FetchResponse, FetchSnapshotRequest, Input, LogTruncation,
+    OutboundMessage, PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse,
 };
+use crate::storage::SnapshotMeta;
 use crate::types::{HardState, LogIndex, NodeId, NodeRole, Term, VoteGrantedSet, VoterSet};
 
 // ---------------------------------------------------------------------------
@@ -192,6 +193,19 @@ pub struct PeerState {
     /// log end. Used to gate leadership-transfer and membership-change
     /// protocols. Spec name: `last_caught_up_time` (architecture.md ┬º3.2).
     pub last_caught_up_time: u64,
+    /// Stage 7.1 (iter-6 evaluator finding #1) ΓÇö monotonic per-leader
+    /// sequence number stamped on every accepted [`FetchRequest`] from
+    /// this peer. Distinct from [`Self::last_fetch_time`] which is a
+    /// tick timestamp used for lease-window aging: `last_fetch_seq` is
+    /// used by the leader-lease *slow-path* (ReadIndex confirmation
+    /// round-trip) to prove "this peer has acknowledged my leadership
+    /// at or after the moment a pending read was captured", with
+    /// strict-greater (`>`) ordering and without the coarse-tick
+    /// ambiguity that affects timestamp comparisons. The corresponding
+    /// monotonic source is [`RaftNode::fetch_seq`]; on every accepted
+    /// `FetchRequest` the leader bumps `self.fetch_seq` and copies the
+    /// new value into the requesting peer's `last_fetch_seq`.
+    pub last_fetch_seq: u64,
     /// Whether this peer participates in quorum decisions (false for
     /// `Observer` nodes ΓÇö non-voting replicas).
     pub is_voter: bool,
@@ -206,6 +220,7 @@ impl PeerState {
             last_fetch_offset: LogIndex(0),
             last_fetch_time: 0,
             last_caught_up_time: 0,
+            last_fetch_seq: 0,
             is_voter,
         }
     }
@@ -242,7 +257,14 @@ pub struct RaftNode {
     pub id: NodeId,
     /// Current role in the cluster.
     pub role: NodeRole,
-    /// Durable state: current term + vote.
+    /// Durable state: current term, vote, and (Stage 7.2 iter-3)
+    /// the persisted lower bound on `commit_index`. The recovery
+    /// path in `xraft-server::Server::start_with_state_machine`
+    /// raises [`Self::commit_index`] from
+    /// `hard_state.commit_index` (clamped to the durable log tip)
+    /// so a node that restarts with a non-empty log resumes apply
+    /// from the same watermark it had pre-crash, rather than
+    /// waiting for the leader to re-commit.
     pub hard_state: HardState,
     /// Index of the highest log entry known to be committed.
     pub commit_index: LogIndex,
@@ -308,6 +330,70 @@ pub struct RaftNode {
     /// [`Input::Tick`] emits a fresh `FetchRequest` to `leader_id`. Cleared
     /// to `None` on every role change (so a new follower fetches eagerly).
     pub last_fetch_tick: Option<u64>,
+    /// Metadata for the most recent durable snapshot, if any.
+    ///
+    /// Set on:
+    /// - [`Input::SnapshotComplete`] — the driver has finished saving a
+    ///   snapshot the engine asked for via [`Action::TakeSnapshot`].
+    /// - [`Input::SnapshotInstalled`] — the driver has finished restoring
+    ///   a leader-supplied snapshot.
+    ///
+    /// Stage 5.2 wiring — see `implementation-plan.md` §5.2.
+    pub last_snapshot_meta: Option<SnapshotMeta>,
+    /// `true` while a previously-emitted [`Action::TakeSnapshot`] has not
+    /// yet completed (the driver has not fed back
+    /// [`Input::SnapshotComplete`]). Stage 5.2 trigger debouncer (see
+    /// `implementation-plan.md` §5.2 step 1 and `maybe_take_snapshot`):
+    /// without this flag, every committed entry past the threshold would
+    /// re-emit `TakeSnapshot`, drowning the driver in duplicate snapshot
+    /// requests.
+    ///
+    /// Cleared on:
+    /// - [`Input::SnapshotComplete`] — the in-flight snapshot finished.
+    /// - [`Input::SnapshotInstalled`] — a leader-supplied snapshot
+    ///   superseded any in-flight local snapshot.
+    ///
+    /// On a fail-stop driver halt (e.g. `state_machine.snapshot()`
+    /// returns `Err`) the flag stays set, but the driver halts so no
+    /// further `step` calls happen — the operator-restart recovery path
+    /// recreates the engine from durable state with the flag at default
+    /// (`false`).
+    pub snapshot_in_flight: bool,
+    /// Logical-tick timestamp at which this node became Leader, used as
+    /// the "baseline" for Leader-Lease validation. Set to
+    /// `Some(logical_tick)` in [`become_leader`] and cleared in
+    /// [`become_follower`] / `become_pre_candidate` / `become_candidate`.
+    /// Stage 7.1: the lease check requires `peer.last_fetch_time >
+    /// leader_started_tick` so a freshly-elected leader does not report a
+    /// false-positive lease before any follower has actually fetched
+    /// (the pre-stamped `peer.last_fetch_time = logical_tick` in
+    /// `become_leader` is a Check-Quorum grace-period baseline, NOT
+    /// evidence of real follower contact).
+    pub leader_started_tick: Option<u64>,
+    /// Logical-tick counter incremented each [`Input::Tick`] while
+    /// `role == Leader && config.enable_check_quorum` is true. When the
+    /// counter reaches [`Self::check_quorum_interval_ticks`], the engine
+    /// runs one Check-Quorum pass (counting voters with recent
+    /// `peer.last_fetch_time`) and resets the counter to zero. Cleared
+    /// on every role transition so a re-elected leader gets a fresh
+    /// grace window before the first check fires.
+    pub check_quorum_elapsed_ticks: u64,
+    /// Pre-computed Check-Quorum / Leader-Lease window in logical ticks
+    /// (ceiling-division of `config.effective_check_quorum_interval_ms`
+    /// by `config.tick_interval_ms`, floored at 1). Derived at engine
+    /// construction time so the hot tick path is not re-doing the
+    /// division.
+    pub check_quorum_interval_ticks: u64,
+    /// Stage 7.1 (iter-6 evaluator finding #1) ΓÇö monotonic counter
+    /// incremented on every accepted inbound [`FetchRequest`]. Used as
+    /// the source value stamped into [`PeerState::last_fetch_seq`] so
+    /// the driver's lease *slow-path* (ReadIndex round-trip) can prove
+    /// quorum acknowledgement strictly after a pending read was
+    /// captured. Unlike a tick-based timestamp, this counter advances
+    /// once per RPC rather than once per tick, so within-tick fetches
+    /// are still distinguishable. Never reset on role transitions
+    /// (u64-monotonic across the node's lifetime).
+    pub fetch_seq: u64,
     /// RNG used to randomise election timeouts. Seeded from the system
     /// entropy by default; tests use [`RaftNode::new_with_seed`] for
     /// deterministic behaviour.
@@ -344,6 +430,28 @@ impl RaftNode {
         // degrading the engine into an unable-to-elect state.
         config.validate()?;
         let voter_set = config.build_voter_set()?;
+        // Stage 7.2: emit a warning when the cluster is configured with
+        // an even number of unique voters. An even voter count provides
+        // strictly worse per-node fault tolerance than the next-lower
+        // odd count (e.g. a 4-node cluster still only tolerates 1
+        // failure, identical to a 3-node cluster, while consuming an
+        // extra machine). The cluster is still allowed to form ΓÇö
+        // operators occasionally run even-sized clusters during planned
+        // membership transitions ΓÇö but the warn is the single
+        // canonical signal that surfaces the misconfiguration in logs.
+        if let Some(vs) = voter_set.as_ref() {
+            let n = vs.unique_node_count();
+            if n > 0 && n % 2 == 0 {
+                tracing::warn!(
+                    target: "xraft::node::bootstrap",
+                    node_id = config.node_id.0,
+                    voter_count = n,
+                    "voter set has an even number of voters ({n}); this provides no \
+                     improvement in fault tolerance over the next-lower odd count and \
+                     is not recommended for production"
+                );
+            }
+        }
         let mut peers = HashMap::new();
         if let Some(vs) = voter_set.as_ref() {
             for v in vs.voters() {
@@ -352,6 +460,41 @@ impl RaftNode {
                 }
             }
         }
+        // Stage 7.2 — observer registration: configured observers are
+        // non-voting peers that pull the log via Fetch RPCs. The
+        // leader's known-sender guard in `handle_fetch_request` and
+        // `handle_fetch_request_acked` rejects any sender that is not
+        // a voter AND not present in `peers`. Seeding observers here
+        // (as `PeerState::new(false)`) is what makes the leader
+        // accept their Fetch RPCs while still excluding them from
+        // quorum computation (see `try_advance_commit_index` which
+        // explicitly skips peers with `is_voter == false`). Skip
+        // self — a node never tracks a `PeerState` for itself.
+        // Also skip any observer id that happens to overlap a voter
+        // (`NodeConfig::validate_membership` already rejects that for
+        // the local node; this is a belt-and-braces guard for the
+        // remote-observer case so a misconfiguration cannot silently
+        // demote a voter to non-voting status by overwriting its
+        // `PeerState`).
+        for observer_id in &config.observers {
+            let nid = NodeId(*observer_id);
+            if nid == config.node_id {
+                continue;
+            }
+            peers.entry(nid).or_insert_with(|| PeerState::new(false));
+        }
+        // Stage 6.1: seed the local node's initial role as Observer
+        // when its `node_id` appears in `config.observers`. Otherwise
+        // every node starts as Follower per the Raft baseline (it may
+        // become Candidate/PreCandidate/Leader after the first election
+        // timeout). Observer nodes never time out into an election —
+        // see the `tick()` arm in this file which skips
+        // `become_pre_candidate` for `NodeRole::Observer`.
+        let initial_role = if config.observers.contains(&config.node_id.0) {
+            NodeRole::Observer
+        } else {
+            NodeRole::Follower
+        };
         // We seed the timer's RNG from the same source so the entire engine is
         // deterministic when constructed via `new_with_seed`.
         let mut timer_rng = StdRng::seed_from_u64(rng.next_u64());
@@ -364,10 +507,11 @@ impl RaftNode {
 
         Ok(Self {
             id: config.node_id,
-            role: NodeRole::Follower,
+            role: initial_role,
             hard_state: HardState {
                 current_term: Term(0),
                 voted_for: None,
+                commit_index: LogIndex(0),
             },
             commit_index: LogIndex(0),
             last_applied: LogIndex(0),
@@ -376,7 +520,6 @@ impl RaftNode {
             pre_votes_received: VoteGrantedSet::new(),
             peers,
             voter_set,
-            config,
             leader_id: None,
             last_leader_contact_tick: None,
             logical_tick: 0,
@@ -384,6 +527,21 @@ impl RaftNode {
             last_log_term: Term(0),
             leader_no_op_index: None,
             last_fetch_tick: None,
+            last_snapshot_meta: None,
+            snapshot_in_flight: false,
+            leader_started_tick: None,
+            check_quorum_elapsed_ticks: 0,
+            // ceil-div so a sub-tick window still translates to at least
+            // one tick of grace. Floored at 1 so an over-eager operator
+            // cannot collapse the window to 0 ticks (which would fire on
+            // every leader tick and likely cause leader churn).
+            check_quorum_interval_ticks: {
+                let window_ms = config.effective_check_quorum_interval_ms();
+                let tick_ms = config.tick_interval_ms.max(1);
+                window_ms.div_ceil(tick_ms).max(1)
+            },
+            fetch_seq: 0,
+            config,
             rng: StdRng::seed_from_u64(rng.next_u64()),
         })
     }
@@ -440,6 +598,11 @@ impl RaftNode {
                 replica_id,
                 confirmed_offset,
             } => self.handle_fetch_request_acked(replica_id, confirmed_offset),
+            Input::SnapshotComplete { metadata } => self.handle_snapshot_complete(metadata),
+            Input::SnapshotInstalled { metadata } => self.handle_snapshot_installed(metadata),
+            Input::FetchSnapshotReceived { metadata, data } => {
+                self.handle_fetch_snapshot_received(metadata, data)
+            }
         }
     }
 
@@ -479,16 +642,92 @@ impl RaftNode {
 
         let mut actions = Vec::new();
 
-        // Stage 3.3: follower / observer fetch scheduling.
+        // Stage 3.3 / Stage 7.2: follower / observer fetch scheduling.
+        //
+        // Steady-state (leader_id known): emit a directed FetchRequest
+        // to the leader on the usual fetch-interval cadence.
+        //
+        // Bootstrap-discovery (leader_id == None): a freshly-started
+        // Follower / Observer has no leader hint until it RECEIVES a
+        // `FetchResponse` carrying `leader_id` (set in
+        // `handle_fetch_response`). Because KRaft-style replication is
+        // pull-based, the engine cannot wait for the leader to push —
+        // it must issue Fetches itself to discover who the leader is.
+        // Broadcast a Fetch to every voter peer; the actual leader
+        // replies with a `FetchResponse` (which sets `leader_id`) and
+        // non-leaders silently drop the request (see
+        // `handle_fetch_request` at the `self.role != Leader` arm).
+        // After the first round of discovery, `last_fetch_tick` is
+        // stamped so the broadcast is rate-limited at the same
+        // `fetch_interval_ticks` cadence as the steady-state path —
+        // there is no fetch storm during bootstrap.
+        //
+        // The architecture explicitly describes this discovery flow
+        // (`architecture.md` §2.5, `e2e-scenarios.md` Feature 11). Without
+        // it, a 3-node cluster cannot complete Stage 7.2's
+        // `bootstrap-voter-set` acceptance scenario: Node X wins the
+        // election but Nodes Y/Z never set `leader_id`, never fetch,
+        // and time out into competing elections (leader thrashing).
         if matches!(self.role, NodeRole::Follower | NodeRole::Observer)
-            && let Some(leader) = self.leader_id
             && let Some(req) = self.maybe_build_fetch_request()
         {
-            actions.push(Action::SendMessage {
-                to: leader,
-                message: OutboundMessage::FetchRequest(req),
-            });
-            self.last_fetch_tick = Some(self.logical_tick);
+            match self.leader_id {
+                Some(leader) => {
+                    actions.push(Action::SendMessage {
+                        to: leader,
+                        message: OutboundMessage::FetchRequest(req),
+                    });
+                    self.last_fetch_tick = Some(self.logical_tick);
+                }
+                None => {
+                    let mut sent = false;
+                    for (peer_id, peer_state) in self.peers.iter() {
+                        // Defensive self-skip — construction never seeds
+                        // self into `peers`, but a future config path
+                        // that does would otherwise loopback here.
+                        if *peer_id == self.id || !peer_state.is_voter {
+                            continue;
+                        }
+                        actions.push(Action::SendMessage {
+                            to: *peer_id,
+                            message: OutboundMessage::FetchRequest(req.clone()),
+                        });
+                        sent = true;
+                    }
+                    if sent {
+                        self.last_fetch_tick = Some(self.logical_tick);
+                    }
+                }
+            }
+        }
+
+        // Stage 7.1: leader Check-Quorum tick. Distinct from the election
+        // timeout — the leader runs its own coarser-grained reachability
+        // check at `check_quorum_interval_ticks` (typically 2× the upper
+        // bound of election timeout) and steps down if it cannot count
+        // itself plus a majority of voters with recent Fetch activity.
+        if self.role == NodeRole::Leader && self.config.enable_check_quorum {
+            self.check_quorum_elapsed_ticks = self.check_quorum_elapsed_ticks.saturating_add(1);
+            if self.check_quorum_elapsed_ticks >= self.check_quorum_interval_ticks {
+                self.check_quorum_elapsed_ticks = 0;
+                if !self.check_quorum_reachable() {
+                    tracing::warn!(
+                        node_id = %self.id,
+                        term = %self.hard_state.current_term,
+                        interval_ticks = self.check_quorum_interval_ticks,
+                        "Check-Quorum failed: leader could not count a majority of voters \
+                         with recent Fetch activity; stepping down to Follower"
+                    );
+                    // Same-term step-down. `become_follower` does NOT emit
+                    // PersistHardState when the term is unchanged (we are
+                    // already durable at this term + self-vote), but DOES
+                    // emit `Action::StepDown` so the driver can drop
+                    // leader-side state (waiters, replication-lag metrics).
+                    let current_term = self.hard_state.current_term;
+                    actions.extend(self.become_follower(current_term, None));
+                    return actions;
+                }
+            }
         }
 
         if !self.election_timer.is_expired() {
@@ -598,7 +837,23 @@ impl RaftNode {
             prior_role,
             NodeRole::Leader | NodeRole::Candidate | NodeRole::PreCandidate
         );
-        self.role = NodeRole::Follower;
+        // Stage 7.2 (evaluator iter-1 finding #3): the Observer
+        // role is a configuration identity, NOT a transient state
+        // — a node that booted as Observer (because its `node_id`
+        // is in `ClusterConfig.observers`) MUST remain Observer
+        // across every higher-term reconciliation. Demoting an
+        // Observer to Follower would let the election timer fire
+        // and let `handle_tick` enter `become_pre_candidate`,
+        // turning the observer into a candidate on the next term
+        // bump (violating the "never participates in elections"
+        // contract from the workstream brief). Preserve the
+        // Observer role here; every other prior role collapses
+        // to Follower as the canonical Raft step-down behavior.
+        if prior_role == NodeRole::Observer {
+            self.role = NodeRole::Observer;
+        } else {
+            self.role = NodeRole::Follower;
+        }
         self.leader_id = leader_id;
         // Record leader contact when transitioning with a known leader so the
         // Pre-Vote rejection window (architecture ┬º2.1) starts from now.
@@ -616,6 +871,19 @@ impl RaftNode {
         // fetch scheduling cursor.
         self.leader_no_op_index = None;
         self.last_fetch_tick = None;
+        // Stage 7.1 (iter-5 evaluator finding #3): clear leader-only
+        // Check-Quorum / Leader-Lease bookkeeping on every step-down.
+        // `leader_started_tick` is the lease baseline (Some(tick) only
+        // while we are leader) and `check_quorum_elapsed_ticks` is the
+        // Check-Quorum interval counter (incremented on Tick while
+        // leader); both must reset to their default-construction values
+        // so a future re-election starts with a clean slate. The peer
+        // sister role-transitions (`become_pre_candidate`,
+        // `become_candidate`) already do this; mirroring it here closes
+        // the gap on the higher-term VoteRequest / FetchResponse /
+        // VoteResponse paths that go through `become_follower`.
+        self.leader_started_tick = None;
+        self.check_quorum_elapsed_ticks = 0;
         self.election_timer.reset(&mut self.rng);
         if stepping_down {
             actions.push(Action::StepDown);
@@ -660,13 +928,25 @@ impl RaftNode {
         // does not pull from a leader).
         self.leader_no_op_index = None;
         self.last_fetch_tick = None;
+        // Stage 7.1: clear leader-side Check-Quorum / Leader-Lease state.
+        self.leader_started_tick = None;
+        self.check_quorum_elapsed_ticks = 0;
         self.election_timer.reset(&mut self.rng);
 
         let next_term = Term(self.hard_state.current_term.0.saturating_add(1));
         let mut actions = Vec::new();
-        for peer_id in self.peers.keys().copied() {
+        // Stage 7.2 (evaluator iter-1 finding #2): observers are
+        // non-voting and MUST NOT participate in elections, neither
+        // as candidates nor as solicited grantors. Filter the
+        // broadcast to voter peers only so a PreVoteRequest does
+        // not even reach an observer (a defense-in-depth on top of
+        // `is_known_voter` filtering in `handle_pre_vote_request`).
+        for (peer_id, peer_state) in self.peers.iter() {
+            if !peer_state.is_voter {
+                continue;
+            }
             actions.push(Action::SendMessage {
-                to: peer_id,
+                to: *peer_id,
                 message: OutboundMessage::PreVoteRequest(PreVoteRequest {
                     cluster_id: self.config.cluster_id.clone(),
                     leader_epoch: 0,
@@ -710,13 +990,28 @@ impl RaftNode {
         // Stage 3.3: clear leader-only no-op marker and fetch cursor.
         self.leader_no_op_index = None;
         self.last_fetch_tick = None;
+        // Stage 7.1: clear leader-side Check-Quorum / Leader-Lease state
+        // (defensive — the candidate path is reachable directly from
+        // single-voter pre-vote cascade and from the historical fast-path
+        // election trigger).
+        self.leader_started_tick = None;
+        self.check_quorum_elapsed_ticks = 0;
         self.election_timer.reset(&mut self.rng);
 
         let mut actions = vec![Action::PersistHardState];
         let term = self.hard_state.current_term;
-        for peer_id in self.peers.keys().copied() {
+        // Stage 7.2 (evaluator iter-1 finding #2): observers are
+        // non-voting and MUST NOT participate in real elections —
+        // mirror `become_pre_candidate`'s voter-only broadcast so
+        // a VoteRequest never reaches an observer in the first
+        // place (in addition to the `is_known_voter` guard on the
+        // receiving side).
+        for (peer_id, peer_state) in self.peers.iter() {
+            if !peer_state.is_voter {
+                continue;
+            }
             actions.push(Action::SendMessage {
-                to: peer_id,
+                to: *peer_id,
                 message: OutboundMessage::VoteRequest(VoteRequest {
                     cluster_id: self.config.cluster_id.clone(),
                     leader_epoch: 0,
@@ -770,6 +1065,15 @@ impl RaftNode {
         self.pre_votes_received.clear();
         // Stage 3.3: a leader does not pull from itself.
         self.last_fetch_tick = None;
+        // Stage 7.1: record the logical-tick baseline used by Leader-Lease.
+        // `peer.last_fetch_time` is pre-stamped to `logical_tick` below as a
+        // Check-Quorum grace baseline, but lease evaluation requires a STRICT
+        // `peer.last_fetch_time > leader_started_tick` so the lease only
+        // becomes active after at least one real post-election Fetch. This
+        // is the rubber-duck Blocker 1 fix: without the strict baseline the
+        // lease would be falsely active for one tick after every election.
+        self.leader_started_tick = Some(self.logical_tick);
+        self.check_quorum_elapsed_ticks = 0;
         self.election_timer.reset(&mut self.rng);
 
         // Initialise per-peer replication state. In the pull model the leader
@@ -812,11 +1116,11 @@ impl RaftNode {
 
         // Single-voter cluster: the no-op is already replicated to a quorum
         // (just the leader), so commit_index and last_applied can advance
-        // immediately without waiting for any peer Fetch.
-        if self.try_advance_commit_index().is_some()
-            && let Some(apply) = self.maybe_apply()
-        {
-            actions.push(apply);
+        // immediately without waiting for any peer Fetch. Stage 5.2:
+        // `drain_apply_pipeline` also emits `Action::TakeSnapshot` if the
+        // post-apply log lag has crossed the configured threshold.
+        if self.try_advance_commit_index().is_some() {
+            actions.extend(self.drain_apply_pipeline());
         }
 
         actions
@@ -863,6 +1167,112 @@ impl RaftNode {
             .filter(|id| voter_ids.contains(id))
             .count();
         granted >= needed
+    }
+
+    /// Stage 7.1 — Check-Quorum reachability test.
+    ///
+    /// Returns `true` when this leader counts **itself plus voter peers
+    /// whose `last_fetch_time` is within the Check-Quorum window** to a
+    /// quorum (i.e. `(n/2)+1` of the configured voter set). Returns
+    /// `false` otherwise, signalling the caller (the `handle_tick`
+    /// Check-Quorum branch) to step down.
+    ///
+    /// "Within the window" is defined as
+    /// `logical_tick - peer.last_fetch_time < check_quorum_interval_ticks`
+    /// (strict `<` — the boundary `==` tick is OUTSIDE the window because
+    /// it is exactly `check_quorum_interval_ticks` old). The leader
+    /// always counts itself as one of the in-window voters.
+    ///
+    /// When no `voter_set` is configured (legacy flat `peers` mode),
+    /// returns `true` so a node running without structured voter metadata
+    /// is never spuriously stepped down by Check-Quorum.
+    pub fn check_quorum_reachable(&self) -> bool {
+        let Some(vs) = self.voter_set.as_ref() else {
+            return true;
+        };
+        let needed = vs.quorum_size();
+        let voter_ids: std::collections::HashSet<NodeId> =
+            vs.voters().iter().map(|v| v.node_id).collect();
+
+        // Self always counts when we are still the leader (we are
+        // trivially "in contact" with ourselves). The leader-self count
+        // is the rubber-duck reminder that a 3-voter cluster needs only
+        // ONE other reachable voter for quorum (1 + 1 + 1 = quorum=2 of 3).
+        let mut reachable_voters: usize = if voter_ids.contains(&self.id) { 1 } else { 0 };
+        let window = self.check_quorum_interval_ticks;
+        for (peer_id, peer) in self.peers.iter() {
+            if !voter_ids.contains(peer_id) {
+                continue;
+            }
+            // Saturating subtraction guards against logical-tick wrap
+            // (which would take centuries at 10ms ticks but stay
+            // defensive — overflow here would falsely report a giant
+            // age and trip an unnecessary step-down).
+            let age = self.logical_tick.saturating_sub(peer.last_fetch_time);
+            if age < window {
+                reachable_voters = reachable_voters.saturating_add(1);
+            }
+        }
+        reachable_voters >= needed
+    }
+
+    /// Stage 7.1 — Leader-Lease evaluation.
+    ///
+    /// Returns `true` only when **all** of the following hold:
+    /// 1. `config.enable_leader_lease` is on.
+    /// 2. This node is currently the Leader.
+    /// 3. Counting self plus voter peers whose `last_fetch_time` strictly
+    ///    exceeds `leader_started_tick` AND is within the
+    ///    `check_quorum_interval_ticks` window, the leader can form a
+    ///    quorum of the configured voter set.
+    ///
+    /// Condition (3) is the rubber-duck Blocker 1 fix: `become_leader`
+    /// pre-stamps every peer's `last_fetch_time` to the current
+    /// `logical_tick` as a Check-Quorum grace baseline. Without the
+    /// strict `> leader_started_tick` filter the lease would be falsely
+    /// active for the entire first window after every election, before
+    /// any follower has actually sent a Fetch RPC.
+    ///
+    /// Single-voter clusters: self alone is a quorum, so a single-voter
+    /// leader with the flag enabled holds the lease at all times while
+    /// leading.
+    ///
+    /// **Internal optimisation only.** Per `tech-spec.md` §2.5 XRAFT v1
+    /// does not expose an external client read API; this helper is for
+    /// admin status queries and engine-internal `StateMachine` lookups
+    /// that want to skip an extra commit-index confirmation round-trip.
+    pub fn has_active_lease(&self) -> bool {
+        if !self.config.enable_leader_lease {
+            return false;
+        }
+        if self.role != NodeRole::Leader {
+            return false;
+        }
+        let Some(vs) = self.voter_set.as_ref() else {
+            return false;
+        };
+        let Some(started_tick) = self.leader_started_tick else {
+            return false;
+        };
+        let needed = vs.quorum_size();
+        let voter_ids: std::collections::HashSet<NodeId> =
+            vs.voters().iter().map(|v| v.node_id).collect();
+        let mut lease_voters: usize = if voter_ids.contains(&self.id) { 1 } else { 0 };
+        let window = self.check_quorum_interval_ticks;
+        for (peer_id, peer) in self.peers.iter() {
+            if !voter_ids.contains(peer_id) {
+                continue;
+            }
+            // Real post-election fetch evidence required.
+            if peer.last_fetch_time <= started_tick {
+                continue;
+            }
+            let age = self.logical_tick.saturating_sub(peer.last_fetch_time);
+            if age < window {
+                lease_voters = lease_voters.saturating_add(1);
+            }
+        }
+        lease_voters >= needed
     }
 
     // ---------------------------------------------------------------------
@@ -987,6 +1397,25 @@ impl RaftNode {
             );
             return Vec::new();
         }
+        // Stage 7.2 (evaluator iter-1 finding #2): observers MUST
+        // NOT cast votes in real elections. Reject early — before
+        // any term reconciliation — so an observer cannot
+        // accidentally grant a vote AND so a higher-term
+        // VoteRequest cannot trigger the inline step-down below
+        // (which would risk demoting the observer to Follower).
+        // The voter-only candidate-side broadcast in
+        // `become_candidate` already prevents observers from
+        // receiving VoteRequests in well-formed clusters; this
+        // guard is defense-in-depth for misrouted / replayed
+        // RPCs and across protocol versions.
+        if self.role == NodeRole::Observer {
+            tracing::debug!(
+                node_id = %self.id,
+                candidate_id = %req.candidate_id,
+                "dropping VoteRequest: this node is an Observer and cannot vote"
+            );
+            return Vec::new();
+        }
         if !self.is_known_voter(req.candidate_id) {
             tracing::debug!(
                 node_id = %self.id,
@@ -1026,6 +1455,20 @@ impl RaftNode {
             self.last_leader_contact_tick = None;
             self.votes_received.clear();
             self.pre_votes_received.clear();
+            // Stage 7.1 (iter-5 evaluator finding #3): the inline
+            // higher-term step-down here intentionally bypasses
+            // `become_follower` (to coalesce the term-bump + vote-grant
+            // into a single PersistHardState — rubber-duck issue #3),
+            // so we MUST manually mirror `become_follower`'s leader-
+            // only state cleanup. Without this, a stepped-down former
+            // leader keeps `leader_started_tick = Some(_)` and the
+            // accumulated `check_quorum_elapsed_ticks`, which would
+            // make `has_active_lease()` and the next leadership
+            // cycle's Check-Quorum window observe stale leader-only
+            // bookkeeping (Stage 7.1 field docs at §"Cleared on" call
+            // out follower transition as the canonical reset point).
+            self.leader_started_tick = None;
+            self.check_quorum_elapsed_ticks = 0;
             // Adopting a higher term means our election round is invalidated;
             // start a fresh timer for the new term.
             self.election_timer.reset(&mut self.rng);
@@ -1146,6 +1589,26 @@ impl RaftNode {
     #[tracing::instrument(level = "debug", skip(self), fields(node_id = %self.id, current_term = %self.hard_state.current_term))]
     pub fn handle_pre_vote_request(&self, req: PreVoteRequest) -> Vec<Action> {
         if req.cluster_id != self.config.cluster_id {
+            return Vec::new();
+        }
+        // Stage 7.2 (evaluator iter-1 finding #2): observers MUST
+        // NOT grant pre-votes. Pre-vote is the first step toward
+        // an election round; an observer issuing a grant could
+        // tip a real candidate into believing it has quorum that
+        // does not actually include the observer (since
+        // `has_pre_election_quorum` correctly does not count
+        // non-voter peers, but a quorum-via-self optimistic
+        // computation should never have to model this defensively).
+        // The voter-only candidate-side broadcast in
+        // `become_pre_candidate` already prevents PreVoteRequests
+        // from reaching observers in well-formed clusters; this
+        // guard is defense-in-depth.
+        if self.role == NodeRole::Observer {
+            tracing::debug!(
+                node_id = %self.id,
+                candidate_id = %req.candidate_id,
+                "dropping PreVoteRequest: this node is an Observer and cannot vote"
+            );
             return Vec::new();
         }
         if !self.is_known_voter(req.candidate_id) {
@@ -1366,6 +1829,70 @@ impl RaftNode {
         Some(Action::ApplyToStateMachine { from, to })
     }
 
+    /// Stage 5.2 trigger logic (`implementation-plan.md` §5.2 step 1).
+    ///
+    /// Returns [`Action::TakeSnapshot`] when:
+    /// - no snapshot is currently in flight ([`Self::snapshot_in_flight`] is
+    ///   `false`), AND
+    /// - `commit_index - last_snapshot_index > config.max_log_entries_before_compaction`.
+    ///
+    /// Sets `snapshot_in_flight = true` so subsequent `maybe_take_snapshot`
+    /// calls (made from later `step`s) won't re-emit the action while the
+    /// driver is still working on the previous one. Cleared on
+    /// [`Input::SnapshotComplete`] / [`Input::SnapshotInstalled`].
+    ///
+    /// `through_index` is set to the current `commit_index` — every entry
+    /// up to and including this index is durably committed and safe to
+    /// fold into the snapshot.
+    fn maybe_take_snapshot(&mut self) -> Option<Action> {
+        if self.snapshot_in_flight {
+            return None;
+        }
+        let snap_idx = self
+            .last_snapshot_meta
+            .as_ref()
+            .map(|m| m.last_included_index.0)
+            .unwrap_or(0);
+        let lag = self.commit_index.0.saturating_sub(snap_idx);
+        if lag > self.config.max_log_entries_before_compaction {
+            self.snapshot_in_flight = true;
+            tracing::debug!(
+                node_id = %self.id,
+                commit_index = %self.commit_index,
+                last_snapshot_index = snap_idx,
+                threshold = self.config.max_log_entries_before_compaction,
+                "snapshot threshold crossed; emitting Action::TakeSnapshot"
+            );
+            Some(Action::TakeSnapshot {
+                through_index: self.commit_index,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Stage 5.2 internal helper that bundles the standard "after a
+    /// commit-index advance" action sequence:
+    /// 1. [`Action::ApplyToStateMachine`] for the newly-committed range
+    ///    (via [`Self::maybe_apply`]),
+    /// 2. [`Action::TakeSnapshot`] when the post-apply log lag has
+    ///    crossed `max_log_entries_before_compaction`
+    ///    (via [`Self::maybe_take_snapshot`]).
+    ///
+    /// Returns the actions in the canonical order so callers can simply
+    /// `actions.extend(self.drain_apply_pipeline())`. Empty when nothing
+    /// is pending.
+    fn drain_apply_pipeline(&mut self) -> Vec<Action> {
+        let mut out = Vec::new();
+        if let Some(apply) = self.maybe_apply() {
+            out.push(apply);
+        }
+        if let Some(snap) = self.maybe_take_snapshot() {
+            out.push(snap);
+        }
+        out
+    }
+
     /// Stage 3.3 step 5 (`implementation-plan.md` ┬º3.3): emit
     /// [`Action::ApplyToStateMachine`] for every log entry between
     /// `last_applied + 1` and `commit_index`, advancing `last_applied`.
@@ -1380,8 +1907,208 @@ impl RaftNode {
     /// `become_leader` cascade on a single-voter cluster ΓÇö already calls
     /// the internal helper as part of their action sequence, so the public
     /// method exists primarily as a manual-trigger / re-entry point.
-    pub fn apply_committed(&mut self) -> Option<Action> {
-        self.maybe_apply()
+    /// Stage 3.3 step 5 (`implementation-plan.md` §3.3): emit
+    /// [`Action::ApplyToStateMachine`] for every log entry between
+    /// `last_applied + 1` and `commit_index`, advancing `last_applied`.
+    /// Returns `Vec::new()` when `last_applied == commit_index` (nothing
+    /// pending).
+    ///
+    /// This is the **public** Stage 3.3 entry point a driver can call
+    /// directly when it wants to drain the apply pipeline outside of a
+    /// regular [`step`](Self::step) call (e.g. during shutdown, snapshot
+    /// installation, or after a manual `set_last_log`/`commit_index` repair).
+    /// The standard hot path — leader after a peer ack, follower after a
+    /// `FetchResponse` HW advance, leader after `ClientPropose`,
+    /// `become_leader` cascade on a single-voter cluster — already calls
+    /// the internal helper as part of their action sequence, so the public
+    /// method exists primarily as a manual-trigger / re-entry point.
+    ///
+    /// Stage 5.2: the returned vector also carries an
+    /// [`Action::TakeSnapshot`] when the apply has crossed the snapshot
+    /// threshold (`commit_index - last_snapshot_index >
+    /// max_log_entries_before_compaction`).
+    pub fn apply_committed(&mut self) -> Vec<Action> {
+        self.drain_apply_pipeline()
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 5.2 — Snapshot Coordination (`implementation-plan.md` §5.2)
+    //
+    // The engine itself is still I/O-free: it owns no snapshot bytes, no
+    // state-machine state, and no `SnapshotStore`. The driver does the
+    // actual `state_machine.snapshot()` / `state_machine.restore()` /
+    // `SnapshotStore::save_snapshot` calls and then feeds the resulting
+    // metadata back into the engine via [`Input::SnapshotComplete`] or
+    // [`Input::SnapshotInstalled`]. These handlers update the engine's
+    // view of the most recent durable snapshot and, in the
+    // `SnapshotComplete` case where the completion actually advances the
+    // engine's snapshot anchor, instruct the driver to compact the now-
+    // redundant log prefix via
+    // [`Action::TruncateLog`](`Action::TruncateLog`) with the
+    // [`LogTruncation::PrefixThroughInclusive`] variant. A stale
+    // completion (one whose `last_included_index` does not raise the
+    // anchor) clears the debouncer but emits no follow-on truncation —
+    // the engine already anchors at a fresher index, so instructing the
+    // driver to purge through a stale, lower index would express the
+    // wrong intent even though prefix purge is idempotent in practice.
+    // ---------------------------------------------------------------------
+
+    /// Handle [`Input::SnapshotComplete`]: the driver finished saving a
+    /// snapshot the engine asked for. Records the snapshot metadata and,
+    /// when the completion actually advances the engine's snapshot
+    /// anchor, emits an [`Action::TruncateLog`] of the
+    /// [`LogTruncation::PrefixThroughInclusive`] variety so the driver
+    /// can compact the log prefix that is now fully covered by the
+    /// snapshot. A stale completion (same- or lower-indexed than the
+    /// anchor already on record) returns an empty action vec: the
+    /// fresher anchor already covers a longer prefix, so emitting a
+    /// purge instruction at the stale, lower index would misrepresent
+    /// the engine's intent — even though prefix purge is idempotent in
+    /// practice. The in-flight debouncer flag is cleared in both
+    /// branches so a subsequent threshold crossing can re-emit
+    /// [`Action::TakeSnapshot`].
+    fn handle_snapshot_complete(&mut self, metadata: SnapshotMeta) -> Vec<Action> {
+        // Raise-only update of `last_snapshot_meta`: a same- or
+        // lower-indexed completion (e.g. a stale `Input::SnapshotComplete`
+        // accidentally delivered after a newer snapshot has already been
+        // recorded) must not clobber the fresher anchor. The driver path
+        // never replays older completions in practice, but the engine
+        // enforces the invariant directly so unit tests and any future
+        // alternate driver still see coherent metadata.
+        let is_fresh = Self::is_snapshot_meta_newer(self.last_snapshot_meta.as_ref(), &metadata);
+        // Stage 5.2 trigger debouncer: a previously-emitted
+        // `Action::TakeSnapshot` has now completed; future commit-index
+        // advances may emit another `TakeSnapshot` once the lag re-crosses
+        // the threshold. Clearing happens in both branches because the
+        // driver-side save attempt has resolved one way or the other.
+        self.snapshot_in_flight = false;
+        if !is_fresh {
+            // Stale completion: the engine already anchors at an equal-or-
+            // newer snapshot. Emitting `TruncateLog` here would instruct
+            // the driver to purge a prefix the engine no longer considers
+            // authoritative — the fresher anchor's truncation already
+            // covered (or will cover) a longer prefix. Prefix purge is
+            // idempotent today, but expressing the wrong intent would
+            // bite us once Stage 6.2 wires up physical purging.
+            return Vec::new();
+        }
+        let through = metadata.last_included_index;
+        self.last_snapshot_meta = Some(metadata);
+        vec![Action::TruncateLog(LogTruncation::PrefixThroughInclusive {
+            through_index_inclusive: through,
+        })]
+    }
+
+    /// Returns `true` when `candidate` should replace `current` as the
+    /// node's `last_snapshot_meta` anchor. The rule is "raise-only on
+    /// `last_included_index`": `None` is always replaced; `Some(prior)`
+    /// is replaced only when `candidate.last_included_index >
+    /// prior.last_included_index`. Combined with the engine's existing
+    /// raise-only updates of `last_applied` / `commit_index` /
+    /// `last_log_*`, this keeps the entire post-snapshot state coherent
+    /// even if a stale completion or install is delivered to the engine.
+    #[inline]
+    fn is_snapshot_meta_newer(current: Option<&SnapshotMeta>, candidate: &SnapshotMeta) -> bool {
+        match current {
+            None => true,
+            Some(prior) => candidate.last_included_index > prior.last_included_index,
+        }
+    }
+
+    /// Handle [`Input::SnapshotInstalled`]: the driver finished
+    /// restoring a leader-supplied snapshot into the state machine and
+    /// persisting it to the [`SnapshotStore`](crate::storage::SnapshotStore).
+    /// Advances `last_applied` and `commit_index` to the snapshot's
+    /// `last_included_index` (no-op if either is already ahead) and
+    /// records the metadata.
+    ///
+    /// The engine deliberately does NOT emit a follow-on
+    /// [`Action::TruncateLog`] here: when the driver writes the snapshot
+    /// it must also already have purged any stale log entries (the
+    /// installed snapshot supersedes them); the engine has no entries
+    /// to enforce truncation against on this side of the pipeline.
+    fn handle_snapshot_installed(&mut self, metadata: SnapshotMeta) -> Vec<Action> {
+        let through = metadata.last_included_index;
+        if through > self.last_applied {
+            self.last_applied = through;
+        }
+        if through > self.commit_index {
+            self.commit_index = through;
+        }
+        // The snapshot encodes the log tip at the time it was taken, so
+        // the engine's in-memory `last_log_*` mirror must be at least
+        // that far along — otherwise a subsequent FetchRequest would
+        // claim a position behind the snapshot's coverage and the leader
+        // would re-send entries the follower has already absorbed.
+        //
+        // This is a raise-only safety net: the driver is the authoritative
+        // reconciler post-install (it calls `set_last_log(effective_log_tip)`
+        // immediately after this `step` returns) and may LOWER `last_log_*`
+        // when a mismatched-term wipe leaves the durable log empty. We
+        // keep the raise here so that direct `Input::SnapshotInstalled`
+        // tests / accidental in-engine callers still get a coherent
+        // `last_log_*` view without depending on the driver path.
+        if through > self.last_log_index {
+            self.last_log_index = through;
+            self.last_log_term = metadata.last_included_term;
+        }
+        // Raise-only update of `last_snapshot_meta`: the driver-side
+        // stale-install guard in `handle_install_snapshot` already
+        // rejects `metadata.last_included_index <= node.last_applied`
+        // before reaching this handler, so this branch is belt-and-
+        // braces — it lets the engine's snapshot anchor stay coherent
+        // even on direct-step unit tests or any future alternate driver
+        // that forgets the install-side guard.
+        if Self::is_snapshot_meta_newer(self.last_snapshot_meta.as_ref(), &metadata) {
+            self.last_snapshot_meta = Some(metadata);
+        }
+        // Stage 5.2 trigger debouncer: a leader-supplied snapshot has
+        // superseded any in-flight local snapshot; clear the flag so the
+        // next threshold crossing can re-emit `Action::TakeSnapshot`.
+        self.snapshot_in_flight = false;
+        Vec::new()
+    }
+
+    /// Handle [`Input::FetchSnapshotReceived`]: the driver has
+    /// reassembled a `FetchSnapshot` stream into `(metadata, data)`
+    /// and applied the envelope-level fences (cluster_id, leader_epoch,
+    /// peer-is-leader, metadata-present). The engine emits exactly one
+    /// [`Action::InstallSnapshot`] for the driver to fulfil, OR no
+    /// action when the snapshot is stale (its coverage does not advance
+    /// `last_applied`).
+    ///
+    /// **Why route through the engine?** The Stage 5.3 contract
+    /// (`implementation-plan.md` §5.2 step 3) requires that "receiving
+    /// a FetchSnapshot response produces `Action::InstallSnapshot
+    /// { metadata, data }`". By emitting the action here — rather than
+    /// having the driver call its install handler directly — the
+    /// production path exercises the same action contract as
+    /// synthetic / test-injected callers, so a contract regression in
+    /// the action arm cannot ship undetected.
+    ///
+    /// **Engine staleness guard.** The engine refuses to regress
+    /// `last_applied` / `commit_index` (see [`handle_snapshot_installed`]),
+    /// so a stale snapshot that did reach `state_machine.restore`
+    /// would diverge the state machine (older view) from the engine
+    /// (newer applied position). Reject those here so the action is
+    /// never emitted; the driver's install handler also keeps a
+    /// belt-and-braces stale guard for direct `Action::InstallSnapshot`
+    /// callers.
+    fn handle_fetch_snapshot_received(
+        &mut self,
+        metadata: SnapshotMeta,
+        data: Vec<u8>,
+    ) -> Vec<Action> {
+        if metadata.last_included_index <= self.last_applied {
+            tracing::debug!(
+                node_id = %self.id,
+                stale_index = %metadata.last_included_index,
+                current_last_applied = %self.last_applied,
+                "Input::FetchSnapshotReceived ignored: not newer than last_applied"
+            );
+            return Vec::new();
+        }
+        vec![Action::InstallSnapshot { metadata, data }]
     }
 
     /// Handle a `FetchRequest` received by this (leader) node from a
@@ -1406,8 +2133,19 @@ impl RaftNode {
     ///    has validated the follower's `last_fetched_epoch` against the
     ///    leader's log ΓÇö otherwise a divergent follower could inflate
     ///    quorum (rubber-duck blocking issue #1).
-    /// 6. Emit an [`Action::ServeFetch`] carrying the envelope fields so
-    ///    the driver can construct and dispatch the [`FetchResponse`].
+    /// 6. **Stage 5.3 snapshot redirect** (implementation-plan §5.2
+    ///    step 4): if `last_snapshot_meta.is_some()` and
+    ///    `req.fetch_offset <= snap.last_included_index` and the
+    ///    snapshot has a non-empty canonical id, emit an
+    ///    [`Action::RedirectToSnapshot`] instead of
+    ///    [`Action::ServeFetch`]. The follower's offset falls inside
+    ///    the compacted prefix; the only correct response is to send
+    ///    it through `FetchSnapshot` to install the snapshot before
+    ///    resuming log replication. Mutually exclusive with `ServeFetch`
+    ///    for this request.
+    /// 7. Otherwise emit an [`Action::ServeFetch`] carrying the envelope
+    ///    fields so the driver can construct and dispatch the
+    ///    [`FetchResponse`].
     #[tracing::instrument(level = "debug", skip(self), fields(node_id = %self.id, current_term = %self.hard_state.current_term))]
     pub fn handle_fetch_request(&mut self, req: FetchRequest) -> Vec<Action> {
         if req.cluster_id != self.config.cluster_id {
@@ -1489,13 +2227,79 @@ impl RaftNode {
         }
 
         // Update peer-liveness fields ΓÇö but NOT replication progress.
+        // Stage 7.1 (iter-6 evaluator finding #1): also bump the
+        // monotonic `fetch_seq` and stamp `peer.last_fetch_seq` so the
+        // driver-level lease slow-path can prove "this voter has acked
+        // leadership at or after the captured baseline" with a strict
+        // (`>`) comparison that does not depend on tick granularity.
+        self.fetch_seq = self.fetch_seq.saturating_add(1);
         if let Some(peer) = self.peers.get_mut(&req.replica_id) {
             peer.last_fetch_time = self.logical_tick;
+            peer.last_fetch_seq = self.fetch_seq;
         }
         // Refresh self-contact: leader observed activity from the cluster.
         self.last_leader_contact_tick = Some(self.logical_tick);
 
         let high_watermark = self.commit_index;
+
+        // Stage 5.3 (implementation-plan §5.2 step 4) — leader-side
+        // snapshot redirect, emitted by the engine. When the follower's
+        // `fetch_offset` falls at or below the compacted prefix
+        // (`fetch_offset <= last_snapshot_meta.last_included_index`),
+        // the entries in that range have been logically compacted out
+        // of the log and the follower must catch up via a
+        // `FetchSnapshot` stream rather than waiting for entries the
+        // leader no longer holds. Emit `Action::RedirectToSnapshot` so
+        // the driver can materialise a `FetchResponse` carrying a
+        // `SnapshotRedirect` envelope (mutually exclusive with
+        // `entries` and `diverging_epoch`).
+        //
+        // The redirect requires a canonical, non-empty `snapshot_id`
+        // because the follower echoes it back on
+        // `FetchSnapshotRequest::snapshot_id` to identify which
+        // snapshot to pull. An empty id (e.g. test snapshots written
+        // without `SnapshotStore::save_snapshot` normalisation) cannot
+        // be the target of a useful redirect — fall through to
+        // `ServeFetch` and let the driver produce a divergence /
+        // empty-entries response. A `warn!` records the misconfiguration
+        // so operators can spot it in logs.
+        if let Some(snap) = self.last_snapshot_meta.as_ref()
+            && req.fetch_offset.0 <= snap.last_included_index.0
+        {
+            if !snap.id.is_empty() {
+                tracing::debug!(
+                    node_id = %self.id,
+                    replica = %req.replica_id,
+                    fetch_offset = %req.fetch_offset,
+                    snapshot_id = %snap.id,
+                    last_included_index = %snap.last_included_index,
+                    "follower offset is at/below compacted prefix; emitting Action::RedirectToSnapshot"
+                );
+                return vec![Action::RedirectToSnapshot {
+                    to: req.replica_id,
+                    cluster_id: self.config.cluster_id.clone(),
+                    leader_epoch: self.hard_state.current_term.0,
+                    leader_id: self.id,
+                    high_watermark,
+                    snapshot_metadata: snap.clone(),
+                }];
+            }
+            // Redirect predicate matched but the snapshot has no
+            // canonical id. This should not happen for snapshots written
+            // by `SnapshotStore::save_snapshot` (it normalises ids), but
+            // direct-driver tests or legacy on-disk snapshots could
+            // produce this state. Log loudly and fall through to
+            // `ServeFetch` so the driver can at least surface a
+            // divergence signal.
+            tracing::warn!(
+                node_id = %self.id,
+                replica = %req.replica_id,
+                fetch_offset = %req.fetch_offset,
+                last_included_index = %snap.last_included_index,
+                "snapshot redirect predicate matched but snapshot_id is empty; falling through to ServeFetch"
+            );
+        }
+
         vec![Action::ServeFetch {
             to: req.replica_id,
             cluster_id: self.config.cluster_id.clone(),
@@ -1547,10 +2351,8 @@ impl RaftNode {
         }
 
         let mut actions = Vec::new();
-        if self.try_advance_commit_index().is_some()
-            && let Some(apply) = self.maybe_apply()
-        {
-            actions.push(apply);
+        if self.try_advance_commit_index().is_some() {
+            actions.extend(self.drain_apply_pipeline());
         }
         actions
     }
@@ -1601,23 +2403,52 @@ impl RaftNode {
             return Vec::new();
         }
 
-        // Stage 3.3 finding-1 fix (iter 3): only accept FetchResponse from a
-        // recognised leader. The sender must be either a configured voter
-        // (`is_known_voter`) or a known peer (`peers.contains_key`). An
-        // unknown sender masquerading as a leader could otherwise push
-        // entries via `become_follower(_, Some(resp.leader_id))` (higher
-        // term branch) or via the `if self.leader_id.is_none()` adopt path
-        // (same-term branch) without any membership check. This guard runs
-        // BEFORE any state mutation ΓÇö including the higher-term step-down ΓÇö
-        // so an unknown sender cannot force a term bump either. Mirrors the
-        // identical filter on `handle_fetch_request` and matches KRaft's
-        // requirement that a leader id be a configured voter.
-        if !self.is_known_voter(resp.leader_id) && !self.peers.contains_key(&resp.leader_id) {
+        // Stage 7.2 bootstrap-discovery fix: ignore non-authoritative
+        // responses entirely. The server-driver returns
+        // `default_deny_fetch` (FetchResponse with `is_leader = false`)
+        // when a non-leader receives a FetchRequest — the responder's
+        // `leader_id` is then a best-effort hint and may even be the
+        // responder's own id when no leader is known (see
+        // `xraft-server::driver::default_deny_fetch`). Without this
+        // guard the engine treats those phony leader claims as real:
+        //   - it adopts the wrong leader_id via the "leader matches /
+        //     no leader yet" arm (causing replication to be routed at
+        //     a non-leader), or
+        //   - it trips the two-leaders fencing branch and drops every
+        //     subsequent legitimate response (locking up replication).
+        // The `is_leader` field is documented on `FetchResponse` (see
+        // `xraft-core::message::FetchResponse::is_leader`) precisely
+        // for this purpose; both the client routing cache and the
+        // engine must honour it.
+        if !resp.is_leader {
+            tracing::trace!(
+                node_id = %self.id,
+                claimed_leader = %resp.leader_id,
+                claimed_epoch = resp.leader_epoch,
+                "dropping non-authoritative FetchResponse (is_leader=false)"
+            );
+            return Vec::new();
+        }
+
+        // Stage 7.2 iter-3 finding #3: a leader claim is only acceptable
+        // from a CONFIGURED VOTER. Observers are non-voting and cannot be
+        // leaders (`architecture.md` §2.1, `tech-spec.md` §2.7) — but
+        // observers ARE seeded into `peers` (so the leader's known-sender
+        // guard accepts their Fetch RPCs). The iter-2 predicate
+        // `is_known_voter || peers.contains_key` accidentally let an
+        // observer's FetchResponse with `is_leader = true` slip past as
+        // a "tracked peer" — that path is what this filter closes. The
+        // strict voter-only check below cannot be relaxed without
+        // breaking the static-voter-set invariant. `handle_fetch_request`
+        // KEEPS the `peers.contains_key` fallback because observers
+        // legitimately send Fetch *requests* (replication direction is
+        // leader → observer).
+        if !self.is_known_voter(resp.leader_id) {
             tracing::warn!(
                 node_id = %self.id,
                 unknown_leader = %resp.leader_id,
                 claimed_epoch = resp.leader_epoch,
-                "dropping FetchResponse from unknown leader (not a voter and not a tracked peer)"
+                "dropping FetchResponse: claimed leader is not a configured voter (observers cannot be leaders)"
             );
             return Vec::new();
         }
@@ -1690,12 +2521,53 @@ impl RaftNode {
         self.last_leader_contact_tick = Some(self.logical_tick);
         self.election_timer.reset(&mut self.rng);
 
+        // Stage 5.2 (implementation-plan §5.2 step 4) — leader-side
+        // snapshot redirect. The leader has signalled that the
+        // follower's `fetch_offset` is at or below the compacted
+        // prefix; switch to FetchSnapshot to catch up. This branch
+        // runs AFTER all fencing (cluster_id, known leader, term
+        // reconciliation, two-leader fencing, role adoption) and
+        // BEFORE divergence/entries processing per the
+        // `FetchResponse` mutual-exclusivity contract: when a
+        // redirect is present the response carries no entries and
+        // no divergence signal, so we emit the FetchSnapshotRequest
+        // and return immediately.
+        //
+        // The follower asks for the snapshot from offset 0 with
+        // `max_bytes = 0` (no caller-imposed limit; the leader's
+        // chunker decides chunk size). The driver's outbound pipeline
+        // reassembles chunks and dispatches `Action::InstallSnapshot`
+        // with the validated metadata + bytes.
+        if let Some(redirect) = resp.snapshot_redirect {
+            tracing::info!(
+                node_id = %self.id,
+                leader = %resp.leader_id,
+                snapshot_id = %redirect.snapshot_id,
+                last_included_index = %redirect.last_included_index,
+                last_included_term = %redirect.last_included_term,
+                "leader redirected fetch to snapshot install"
+            );
+            actions.push(Action::SendMessage {
+                to: resp.leader_id,
+                message: OutboundMessage::FetchSnapshotRequest(FetchSnapshotRequest {
+                    cluster_id: self.config.cluster_id.clone(),
+                    leader_epoch: self.hard_state.current_term.0,
+                    replica_id: self.id,
+                    snapshot_id: redirect.snapshot_id,
+                    offset: 0,
+                    max_bytes: 0,
+                }),
+            });
+            self.last_fetch_tick = Some(self.logical_tick);
+            return actions;
+        }
+
         // Divergence resolution path.
         if let Some(de) = resp.diverging_epoch {
             let truncate_from = LogIndex(de.end_offset.0.saturating_add(1));
-            actions.push(Action::TruncateLog {
+            actions.push(Action::TruncateLog(LogTruncation::SuffixFromInclusive {
                 from_index_inclusive: truncate_from,
-            });
+            }));
             // Immediate re-fetch using the leader-supplied consistent point.
             // The driver's TruncateLog handler will subsequently call
             // set_last_log with the actual post-truncation values, so
@@ -1773,9 +2645,7 @@ impl RaftNode {
         let new_commit = LogIndex(resp.high_watermark.0.min(self.last_log_index.0));
         if new_commit > self.commit_index {
             self.commit_index = new_commit;
-            if let Some(apply) = self.maybe_apply() {
-                actions.push(apply);
-            }
+            actions.extend(self.drain_apply_pipeline());
         }
 
         actions
@@ -1815,10 +2685,8 @@ impl RaftNode {
         self.last_log_term = new_term;
 
         let mut actions = vec![Action::AppendEntries(vec![entry])];
-        if self.try_advance_commit_index().is_some()
-            && let Some(apply) = self.maybe_apply()
-        {
-            actions.push(apply);
+        if self.try_advance_commit_index().is_some() {
+            actions.extend(self.drain_apply_pipeline());
         }
         actions
     }
@@ -1920,6 +2788,68 @@ port = 6000
         assert!(node.leader_id.is_none());
     }
 
+    // Stage 6.1 acceptance (iter-3 evaluator finding #3):
+    // `ClusterConfig.observers` containing this node's id must seed
+    // `NodeRole::Observer` at construction. The reverse — node not in
+    // observers — still starts as `Follower`.
+    #[test]
+    fn new_node_starts_as_observer_when_listed_in_observers_field() {
+        let toml = format!(
+            r#"
+node_id = 5
+cluster_id = "test"
+listen_addr = "0.0.0.0:6000"
+tick_interval_ms = 10
+election_timeout_min_ms = 100
+election_timeout_max_ms = 200
+observers = [5]
+
+[[voters]]
+node_id = 1
+directory_id = "{}"
+host = "node1"
+port = 6000
+"#,
+            Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).unwrap();
+        let node = RaftNode::new_with_seed(cfg, 1).unwrap();
+        assert_eq!(
+            node.role,
+            NodeRole::Observer,
+            "node listed in `observers` must construct as Observer"
+        );
+    }
+
+    #[test]
+    fn new_node_with_unrelated_observer_list_still_starts_as_follower() {
+        let toml = format!(
+            r#"
+node_id = 1
+cluster_id = "test"
+listen_addr = "0.0.0.0:6000"
+tick_interval_ms = 10
+election_timeout_min_ms = 100
+election_timeout_max_ms = 200
+observers = [7, 8]
+
+[[voters]]
+node_id = 1
+directory_id = "{}"
+host = "node1"
+port = 6000
+"#,
+            Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).unwrap();
+        let node = RaftNode::new_with_seed(cfg, 1).unwrap();
+        assert_eq!(
+            node.role,
+            NodeRole::Follower,
+            "node NOT listed in `observers` must construct as Follower"
+        );
+    }
+
     #[test]
     fn new_node_has_correct_id() {
         let node = RaftNode::new_with_seed(test_config(), 1).unwrap();
@@ -1979,6 +2909,580 @@ port = 6000
         let node = RaftNode::new_with_seed(test_config(), 1).unwrap();
         assert!(node.voter_set.is_none());
         assert!(node.peers.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Stage 7.2 — observer peer registration
+    // ---------------------------------------------------------------
+
+    /// Build a config with `voters = [1, 2, 3]` and `observers = [4]`,
+    /// running on node `self_id`. Used to exercise observer seeding
+    /// from both the voter-side (leader sees observer in peers) and
+    /// the observer-side (the observer node has its own peer view).
+    fn three_voter_one_observer_config(self_id: u64) -> ClusterConfig {
+        let toml = format!(
+            r#"
+node_id = {self_id}
+cluster_id = "test"
+listen_addr = "0.0.0.0:6000"
+tick_interval_ms = 10
+election_timeout_min_ms = 100
+election_timeout_max_ms = 200
+observers = [4]
+
+[[voters]]
+node_id = 1
+directory_id = "{}"
+host = "node1"
+port = 6000
+
+[[voters]]
+node_id = 2
+directory_id = "{}"
+host = "node2"
+port = 6001
+
+[[voters]]
+node_id = 3
+directory_id = "{}"
+host = "node3"
+port = 6002
+"#,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        ClusterConfig::from_toml_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn observer_seeded_as_non_voting_peer_on_voter_node() {
+        // Voter node 1 sees: voters {1,2,3} + observer {4}. Its peers
+        // map MUST include node 4 with `is_voter = false` so the
+        // leader (when it becomes one) accepts node 4's Fetch RPCs
+        // through the known-sender guard in `handle_fetch_request`.
+        let node = RaftNode::new_with_seed(three_voter_one_observer_config(1), 1).unwrap();
+        assert!(node.voter_set.is_some());
+        // Voters 2, 3 plus observer 4 = 3 peers (self excluded).
+        assert_eq!(node.peers.len(), 3);
+        let p2 = node.peers.get(&NodeId(2)).expect("peer 2 missing");
+        let p3 = node.peers.get(&NodeId(3)).expect("peer 3 missing");
+        let p4 = node.peers.get(&NodeId(4)).expect("observer peer 4 missing");
+        assert!(p2.is_voter, "voter 2 must be a voter peer");
+        assert!(p3.is_voter, "voter 3 must be a voter peer");
+        assert!(
+            !p4.is_voter,
+            "observer 4 MUST be seeded as a non-voting peer so the leader \
+             accepts its Fetch RPCs while excluding it from quorum"
+        );
+    }
+
+    #[test]
+    fn observer_does_not_seed_self_as_peer() {
+        // Observer node 4 should NOT have a `PeerState` for itself
+        // even though it's listed in `observers = [4]`.
+        let node = RaftNode::new_with_seed(three_voter_one_observer_config(4), 1).unwrap();
+        // Observer node 4 sees voters {1,2,3} as voting peers and
+        // does NOT have itself in peers.
+        assert_eq!(node.peers.len(), 3);
+        assert!(!node.peers.contains_key(&NodeId(4)));
+        for nid in [NodeId(1), NodeId(2), NodeId(3)] {
+            let p = node.peers.get(&nid).expect("voter peer missing");
+            assert!(p.is_voter);
+        }
+        // Observer role gating: a node listed in `observers`
+        // constructs as Observer (not Follower).
+        assert_eq!(node.role, NodeRole::Observer);
+    }
+
+    #[test]
+    fn leader_accepts_observer_fetch_and_excludes_from_quorum() {
+        // End-to-end engine test for the observer-replicates-without-voting
+        // Stage 7.2 scenario:
+        // - Voter node 1 becomes leader of a 3-voter + 1-observer
+        //   cluster.
+        // - An observer (node 4) Fetch RPC is accepted (NOT dropped
+        //   by the known-sender guard at `handle_fetch_request:2028`).
+        // - An observer ack with a high `confirmed_offset` does NOT
+        //   advance commit because the observer does not count toward
+        //   the quorum tally in `try_advance_commit_index`.
+        let mut node = RaftNode::new_with_seed(three_voter_one_observer_config(1), 7).unwrap();
+
+        // Force the node to become leader at term 1 by advancing it
+        // through the pre-vote / vote cycle the hard way: bump term,
+        // pretend the prior election round delivered the votes, then
+        // call become_leader directly. This is the same shape used by
+        // existing test `become_leader_initialises_peers_and_emits_noop`.
+        node.hard_state.current_term = Term(1);
+        let actions = node.become_leader();
+        assert!(matches!(node.role, NodeRole::Leader));
+        // No-op append emits AppendEntries; for a 3-voter cluster
+        // the single leader can't commit yet (needs at least one
+        // voter ack), so no apply pipeline should have fired.
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::AppendEntries(_))),
+            "leader emits no-op AppendEntries on becoming leader"
+        );
+
+        // The leader sets `last_log_index = 1` (the no-op). Mirror
+        // that into the engine view so the FetchRequest from the
+        // observer is meaningful.
+        let leader_tail = node.last_log_index;
+        assert_eq!(leader_tail.0, 1);
+
+        // Build an observer Fetch RPC for offset 1 (the no-op) and
+        // verify the leader accepts it (emits ServeFetch, not the
+        // unknown-sender drop).
+        let fetch_req = FetchRequest {
+            cluster_id: node.config.cluster_id.clone(),
+            replica_id: NodeId(4),
+            leader_epoch: node.hard_state.current_term.0,
+            fetch_offset: LogIndex(1),
+            last_fetched_epoch: Term(0),
+        };
+        let actions = node.handle_fetch_request(fetch_req);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::ServeFetch { .. })),
+            "leader must accept observer Fetch and emit ServeFetch — \
+             got actions: {actions:?}"
+        );
+
+        // Now simulate the observer ack: claim confirmed_offset = 1.
+        // The leader should record the observer's progress in
+        // PeerState but NOT advance commit_index since observers
+        // don't count toward quorum.
+        let pre_commit = node.commit_index;
+        let _ = node.handle_fetch_request_acked(NodeId(4), LogIndex(1));
+        assert_eq!(
+            node.commit_index, pre_commit,
+            "observer ack alone must NOT advance commit_index — \
+             observers are excluded from high-watermark quorum"
+        );
+        let observer_peer = node
+            .peers
+            .get(&NodeId(4))
+            .expect("observer peer must still exist");
+        assert!(!observer_peer.is_voter, "observer peer remains non-voting");
+        assert_eq!(
+            observer_peer.last_fetch_offset,
+            LogIndex(1),
+            "observer's fetch progress was recorded for replication accounting"
+        );
+    }
+
+    #[test]
+    fn observer_node_does_not_become_candidate_on_tick() {
+        // Stage 7.2: observer nodes never time out into an election.
+        // Tick the observer past its election-timeout budget and assert
+        // the role is still `Observer`, term is still 0, and there is
+        // no PreVoteRequest in the emitted actions.
+        let mut node = RaftNode::new_with_seed(three_voter_one_observer_config(4), 11).unwrap();
+        assert_eq!(node.role, NodeRole::Observer);
+        let initial_term = node.current_term();
+        // Drive way past max_ticks so a Follower would have moved
+        // into PreCandidate by now.
+        for _ in 0..1000 {
+            let actions = node.step(Input::Tick);
+            assert!(
+                !actions.iter().any(|a| matches!(
+                    a,
+                    Action::SendMessage {
+                        message: OutboundMessage::PreVoteRequest(_),
+                        ..
+                    }
+                )),
+                "Observer must never emit PreVoteRequest"
+            );
+        }
+        assert_eq!(node.role, NodeRole::Observer);
+        assert_eq!(node.current_term(), initial_term);
+    }
+
+    // -------------------------------------------------------------------
+    // Stage 7.2 (evaluator iter-1 finding #2): observers MUST NOT
+    // participate in elections from either side. Tests cover:
+    //   * Candidate-side broadcast filters observers (pre-vote + vote).
+    //   * Observer-side request handlers drop incoming pre-vote and
+    //     vote requests with no state mutation.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn pre_candidate_does_not_send_prevote_to_observer_peers() {
+        // Voter node 1 in a (1,2,3)+observer(4) cluster. When the
+        // election timer expires it enters PreCandidate and must
+        // broadcast PreVoteRequest only to voters 2 and 3, NOT to
+        // observer 4. The candidate-side filter is the structural
+        // fix; the observer-side reject is defense-in-depth.
+        let mut node = RaftNode::new_with_seed(three_voter_one_observer_config(1), 7).unwrap();
+        let actions = node.become_pre_candidate();
+        let recipients: Vec<NodeId> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SendMessage {
+                    to,
+                    message: OutboundMessage::PreVoteRequest(_),
+                } => Some(*to),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            recipients.contains(&NodeId(2)) && recipients.contains(&NodeId(3)),
+            "voters 2 + 3 must receive PreVoteRequest; got {recipients:?}"
+        );
+        assert!(
+            !recipients.contains(&NodeId(4)),
+            "observer 4 MUST NOT receive a PreVoteRequest (non-voting peer); got {recipients:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_does_not_send_vote_to_observer_peers() {
+        // Symmetric to the pre-vote test, but for the real-vote
+        // broadcast. After become_candidate the emitted VoteRequest
+        // recipients must include only voter peers.
+        let mut node = RaftNode::new_with_seed(three_voter_one_observer_config(1), 7).unwrap();
+        let actions = node.become_candidate();
+        let recipients: Vec<NodeId> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SendMessage {
+                    to,
+                    message: OutboundMessage::VoteRequest(_),
+                } => Some(*to),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            recipients.contains(&NodeId(2)) && recipients.contains(&NodeId(3)),
+            "voters 2 + 3 must receive VoteRequest; got {recipients:?}"
+        );
+        assert!(
+            !recipients.contains(&NodeId(4)),
+            "observer 4 MUST NOT receive a VoteRequest (non-voting peer); got {recipients:?}"
+        );
+    }
+
+    #[test]
+    fn observer_drops_incoming_vote_request_without_term_bump() {
+        // An observer that receives a (misrouted / replayed)
+        // VoteRequest at a HIGHER term MUST NOT bump its term, must
+        // NOT cast the vote, and must NOT emit a response. The
+        // observer role is preserved.
+        let mut observer = RaftNode::new_with_seed(three_voter_one_observer_config(4), 1).unwrap();
+        assert_eq!(observer.role, NodeRole::Observer);
+        let initial_term = observer.current_term();
+
+        let req = VoteRequest {
+            cluster_id: "test".into(),
+            leader_epoch: 0,
+            term: Term(initial_term.0 + 5),
+            candidate_id: NodeId(1),
+            last_log_index: LogIndex(0),
+            last_log_term: Term(0),
+        };
+        let actions = observer.handle_vote_request(req);
+        assert!(
+            actions.is_empty(),
+            "observer must emit no actions for VoteRequest; got {actions:?}"
+        );
+        assert_eq!(
+            observer.role,
+            NodeRole::Observer,
+            "observer role preserved across rejected VoteRequest"
+        );
+        assert_eq!(
+            observer.current_term(),
+            initial_term,
+            "observer must NOT bump its term on rejected VoteRequest"
+        );
+        assert!(
+            observer.hard_state.voted_for.is_none(),
+            "observer must NOT cast a vote"
+        );
+    }
+
+    #[test]
+    fn observer_drops_incoming_pre_vote_request() {
+        // Mirror of the VoteRequest test for PreVoteRequest. The
+        // observer must not grant pre-votes.
+        let observer = RaftNode::new_with_seed(three_voter_one_observer_config(4), 1).unwrap();
+        assert_eq!(observer.role, NodeRole::Observer);
+
+        let req = PreVoteRequest {
+            cluster_id: "test".into(),
+            leader_epoch: 0,
+            next_term: Term(observer.current_term().0 + 1),
+            candidate_id: NodeId(1),
+            last_log_index: LogIndex(0),
+            last_log_term: Term(0),
+        };
+        let actions = observer.handle_pre_vote_request(req);
+        assert!(
+            actions.is_empty(),
+            "observer must emit no actions for PreVoteRequest; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn observer_preserves_role_on_higher_term_become_follower() {
+        // Stage 7.2 (evaluator iter-1 finding #3): an observer that
+        // observes a higher term (via FetchResponse, VoteResponse,
+        // PreVoteResponse, or any other become_follower call site)
+        // must remain Observer, NOT collapse to Follower. Otherwise
+        // it would start ticking toward an election on the next
+        // tick — violating the "never participates in elections"
+        // contract.
+        let mut observer = RaftNode::new_with_seed(three_voter_one_observer_config(4), 1).unwrap();
+        assert_eq!(observer.role, NodeRole::Observer);
+        let starting_term = observer.current_term();
+        let higher = Term(starting_term.0 + 42);
+
+        let actions = observer.become_follower(higher, Some(NodeId(1)));
+        // PersistHardState is expected (term changed); StepDown is
+        // NOT expected (observer was never leader / candidate).
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::PersistHardState)),
+            "term change must yield PersistHardState; got {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::StepDown)),
+            "observer that was never leader must NOT emit StepDown; got {actions:?}"
+        );
+        assert_eq!(
+            observer.role,
+            NodeRole::Observer,
+            "observer role MUST be preserved across higher-term become_follower"
+        );
+        assert_eq!(observer.current_term(), higher);
+        assert_eq!(observer.leader_id, Some(NodeId(1)));
+
+        // Further ticks must NOT turn the observer into a PreCandidate.
+        let initial_role = observer.role;
+        for _ in 0..1000 {
+            let actions = observer.step(Input::Tick);
+            assert!(
+                !actions.iter().any(|a| matches!(
+                    a,
+                    Action::SendMessage {
+                        message: OutboundMessage::PreVoteRequest(_),
+                        ..
+                    }
+                )),
+                "post-term-bump observer must still never emit PreVoteRequest"
+            );
+        }
+        assert_eq!(observer.role, initial_role);
+    }
+
+    /// Stage 7.2 bootstrap-discovery: a fresh Follower with no
+    /// `leader_id` MUST broadcast `FetchRequest` to every configured
+    /// voter peer on tick. Without this, a freshly-elected leader is
+    /// never discovered (the leader does not push; followers must pull),
+    /// and the cluster cannot complete first-boot election. See the
+    /// `handle_tick` comment block describing the bootstrap-discovery
+    /// branch for the rationale.
+    #[test]
+    fn follower_without_leader_id_broadcasts_fetch_to_all_voters_on_tick() {
+        // 3-voter config; this node is voter id=1.
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 73).unwrap();
+        // Force the explicit Follower role with no known leader.
+        node.role = NodeRole::Follower;
+        node.leader_id = None;
+        node.hard_state.current_term = Term(0);
+
+        let actions = node.step(Input::Tick);
+        let mut fetch_targets: std::collections::BTreeSet<NodeId> =
+            std::collections::BTreeSet::new();
+        for a in &actions {
+            if let Action::SendMessage {
+                to,
+                message: OutboundMessage::FetchRequest(_),
+            } = a
+            {
+                fetch_targets.insert(*to);
+            }
+        }
+        // 3-voter config voters are {1, 2, 3}; node id is 1.
+        // Broadcast must go to BOTH other voters and never to self.
+        let mut expected: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+        expected.insert(NodeId(2));
+        expected.insert(NodeId(3));
+        assert_eq!(
+            fetch_targets, expected,
+            "bootstrap-discovery: Follower with leader_id=None MUST broadcast \
+             FetchRequest to ALL voter peers (and never to self); got {fetch_targets:?}, \
+             actions = {actions:?}"
+        );
+        assert!(
+            !fetch_targets.contains(&NodeId(1)),
+            "self-skip violated: must not Fetch from self"
+        );
+
+        // The broadcast must rate-limit identically to the directed-fetch
+        // path: an immediate back-to-back Tick must NOT issue another
+        // broadcast (last_fetch_tick was stamped).
+        let actions2 = node.step(Input::Tick);
+        let any_fetch = actions2.iter().any(|a| {
+            matches!(
+                a,
+                Action::SendMessage {
+                    message: OutboundMessage::FetchRequest(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            !any_fetch,
+            "back-to-back Ticks must not re-broadcast: discovery is \
+             rate-limited at fetch_interval_ticks"
+        );
+    }
+
+    /// Stage 7.2: the bootstrap-discovery broadcast also applies to
+    /// Observers — they need the same leader-discovery mechanism to
+    /// start replicating. But the broadcast MUST NOT cause the
+    /// observer to leak into election behaviour (no PreVote, no Vote,
+    /// no role change).
+    #[test]
+    fn observer_without_leader_id_broadcasts_fetch_but_does_not_emit_election_rpc() {
+        // 3-voter + 1-observer config, this node is the observer (id=4).
+        let mut node = RaftNode::new_with_seed(three_voter_one_observer_config(4), 41).unwrap();
+        assert_eq!(node.role, NodeRole::Observer);
+        node.leader_id = None;
+
+        let actions = node.step(Input::Tick);
+        let mut fetch_targets: std::collections::BTreeSet<NodeId> =
+            std::collections::BTreeSet::new();
+        for a in &actions {
+            if let Action::SendMessage {
+                to,
+                message: OutboundMessage::FetchRequest(_),
+            } = a
+            {
+                fetch_targets.insert(*to);
+            }
+        }
+        // Observer should broadcast to all three voters: {1, 2, 3}.
+        let mut expected: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+        expected.insert(NodeId(1));
+        expected.insert(NodeId(2));
+        expected.insert(NodeId(3));
+        assert_eq!(
+            fetch_targets, expected,
+            "bootstrap-discovery (observer): MUST broadcast FetchRequest to \
+             ALL voter peers; got {fetch_targets:?}, actions = {actions:?}"
+        );
+
+        // Critical: the observer MUST NOT emit any election-related RPC.
+        for a in &actions {
+            match a {
+                Action::SendMessage {
+                    message: OutboundMessage::PreVoteRequest(_),
+                    ..
+                }
+                | Action::SendMessage {
+                    message: OutboundMessage::VoteRequest(_),
+                    ..
+                } => panic!("observer must NEVER emit election RPCs on Tick; got {a:?}",),
+                _ => {}
+            }
+        }
+        // The observer's role MUST stay Observer.
+        assert_eq!(
+            node.role,
+            NodeRole::Observer,
+            "observer role must not change as a result of bootstrap-discovery Tick"
+        );
+    }
+
+    #[test]
+    fn even_voter_set_emits_warning_log() {
+        // Acceptance scenario `even-voter-warning`: a 2-voter
+        // configuration must be ACCEPTED but emit a tracing::warn
+        // event so operators are alerted that the cluster has
+        // reduced per-node fault tolerance. The warning is the
+        // single canonical signal — capture it via
+        // `tracing_test::traced_test` and assert presence.
+        use tracing::Level;
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::FmtSubscriber;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let writer = CaptureWriter::default();
+        let buf = writer.0.clone();
+        let subscriber = FmtSubscriber::builder()
+            .with_max_level(Level::WARN)
+            .with_writer(writer)
+            .with_ansi(false)
+            .finish();
+
+        // Build a 2-voter config (even count); the engine must
+        // construct successfully but emit the warning while doing
+        // so.
+        let toml = format!(
+            r#"
+node_id = 1
+cluster_id = "test"
+listen_addr = "0.0.0.0:6000"
+tick_interval_ms = 10
+election_timeout_min_ms = 100
+election_timeout_max_ms = 200
+
+[[voters]]
+node_id = 1
+directory_id = "{}"
+host = "node1"
+port = 6000
+
+[[voters]]
+node_id = 2
+directory_id = "{}"
+host = "node2"
+port = 6001
+"#,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).unwrap();
+
+        with_default(subscriber, || {
+            let node = RaftNode::new(cfg).expect("2-voter config must still construct");
+            assert_eq!(node.voter_set.as_ref().map(|v| v.len()), Some(2));
+        });
+
+        let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("voter set has an even number of voters"),
+            "even-voter-warning scenario: must emit a tracing::warn — captured = {captured:?}"
+        );
+        assert!(
+            captured.contains("WARN"),
+            "captured log must be at WARN level: {captured:?}"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -2114,7 +3618,35 @@ port = 6000
     fn single_tick_does_not_trigger_election() {
         let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
         let actions = node.step(Input::Tick);
-        assert!(actions.is_empty());
+        // Stage 7.2 bootstrap-discovery: a Follower with `leader_id == None`
+        // now broadcasts FetchRequest to all voter peers on Tick (the
+        // pull-based leader-discovery mechanism). The election timer has
+        // NOT expired after a single tick, so no election RPC may be
+        // emitted. Assert the relaxed invariant: no PreVote / Vote / etc.,
+        // and the only emissions are FetchRequest broadcasts.
+        for a in &actions {
+            match a {
+                Action::SendMessage {
+                    message: OutboundMessage::FetchRequest(_),
+                    ..
+                } => {}
+                Action::SendMessage {
+                    message: OutboundMessage::PreVoteRequest(_),
+                    ..
+                }
+                | Action::SendMessage {
+                    message: OutboundMessage::VoteRequest(_),
+                    ..
+                }
+                | Action::PersistHardState
+                | Action::BecomeLeader
+                | Action::StepDown => panic!(
+                    "single Tick on a fresh Follower must NOT trigger an election or \
+                     mutate hard state; got {a:?}"
+                ),
+                _ => {}
+            }
+        }
         assert_eq!(node.role, NodeRole::Follower);
         assert_eq!(node.current_term(), Term(0));
         assert_eq!(node.logical_tick, 1);
@@ -2387,6 +3919,94 @@ port = 6000
         assert_eq!(node.leader_id, Some(NodeId(2)));
     }
 
+    /// Stage 7.1 iter-5 evaluator finding #3 — `become_follower` MUST
+    /// clear the leader-only `leader_started_tick` (the lease
+    /// baseline) and `check_quorum_elapsed_ticks` (the Check-Quorum
+    /// interval counter) on every step-down. Their field docs at
+    /// `pub leader_started_tick` / `pub check_quorum_elapsed_ticks`
+    /// explicitly state the reset point is "follower transition" /
+    /// "every role transition"; without this clearing a stepped-down
+    /// former leader would observe a stale lease baseline on its
+    /// next re-election (or — worse — `has_active_lease()` could
+    /// return `true` against the OLD baseline while in Follower
+    /// role, depending on the lease predicate's role check).
+    #[test]
+    fn become_follower_clears_stage_7_1_leader_only_state() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        // Drive into the Leader role so the Stage 7.1 leader-only
+        // state is non-default.
+        let _ = node.become_candidate();
+        let _ = node.become_leader();
+        assert_eq!(node.role, NodeRole::Leader);
+        assert!(
+            node.leader_started_tick.is_some(),
+            "test precondition: a fresh Leader must have a non-None \
+             leader_started_tick (set in become_leader)"
+        );
+        // Simulate some Check-Quorum tick accumulation.
+        node.check_quorum_elapsed_ticks = 42;
+
+        // Step down to follower at a higher term (the canonical path).
+        let _ = node.become_follower(Term(node.current_term().0 + 1), None);
+
+        assert_eq!(node.role, NodeRole::Follower);
+        assert_eq!(
+            node.leader_started_tick, None,
+            "become_follower MUST clear leader_started_tick on step-down \
+             (Stage 7.1 field doc: 'Cleared in become_follower')"
+        );
+        assert_eq!(
+            node.check_quorum_elapsed_ticks, 0,
+            "become_follower MUST reset check_quorum_elapsed_ticks to 0 \
+             on step-down (Stage 7.1 field doc: 'Cleared on every role \
+             transition')"
+        );
+    }
+
+    /// Stage 7.1 iter-5 evaluator finding #3 — the inline higher-term
+    /// `VoteRequest` path bypasses `become_follower` (to coalesce the
+    /// term-bump + vote grant into a single PersistHardState — see
+    /// rubber-duck non-blocking issue #3) and therefore must
+    /// independently mirror the leader-only Stage 7.1 state cleanup.
+    /// Without this, a leader that steps down via a higher-term
+    /// VoteRequest would keep stale `leader_started_tick` and
+    /// `check_quorum_elapsed_ticks`.
+    #[test]
+    fn handle_vote_request_higher_term_clears_stage_7_1_leader_only_state() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        let _ = node.become_candidate();
+        let _ = node.become_leader();
+        assert_eq!(node.role, NodeRole::Leader);
+        assert!(
+            node.leader_started_tick.is_some(),
+            "test precondition: Leader has leader_started_tick set"
+        );
+        node.check_quorum_elapsed_ticks = 17;
+        let starting_term = node.current_term();
+
+        // Higher-term VoteRequest: takes the inline step-down path
+        // at `node.rs::handle_vote_request` (`req.term >
+        // current_term` branch) — NOT the `become_follower` path.
+        let _ = node.handle_vote_request(vote_req(
+            "test",
+            starting_term.0 + 4,
+            NodeId(2),
+            node.last_log_index.0,
+            node.last_log_term.0,
+        ));
+
+        assert_eq!(node.role, NodeRole::Follower);
+        assert_eq!(
+            node.leader_started_tick, None,
+            "inline higher-term step-down MUST clear leader_started_tick \
+             (otherwise a future re-election observes a stale lease baseline)"
+        );
+        assert_eq!(
+            node.check_quorum_elapsed_ticks, 0,
+            "inline higher-term step-down MUST reset check_quorum_elapsed_ticks"
+        );
+    }
+
     #[test]
     fn become_pre_candidate_emits_pre_vote_requests_without_term_bump() {
         let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
@@ -2590,11 +4210,15 @@ port = 6000
             tls_ca_path: None,
             tls_domain_name: None,
             connect_timeout_ms: 5_000,
-            rpc_timeout_ms: 10_000,
+            rpc_timeout_ms: 30_000,
             max_rpc_retries: 3,
             retry_initial_backoff_ms: 100,
             retry_max_backoff_ms: 5_000,
             max_message_size: 64 * 1024 * 1024,
+            observers: vec![],
+            enable_check_quorum: true,
+            enable_leader_lease: false,
+            check_quorum_interval_ms: None,
         };
         let err = RaftNode::new_with_seed(cfg, 1).expect_err(
             "RaftNode::new_with_seed must propagate invalid voter config as Err, \
@@ -3512,6 +5136,8 @@ port = 6004
             high_watermark: LogIndex(high_watermark),
             entries,
             diverging_epoch,
+            snapshot_redirect: None,
+            is_leader: true,
         }
     }
 
@@ -3785,15 +5411,15 @@ port = 6004
         // TruncateLog action with from_index_inclusive = end_offset + 1.
         let trunc = actions
             .iter()
-            .find(|a| matches!(a, Action::TruncateLog { .. }))
+            .find(|a| matches!(a, Action::TruncateLog(_)))
             .expect("TruncateLog action emitted on divergence");
         match trunc {
-            Action::TruncateLog {
+            Action::TruncateLog(LogTruncation::SuffixFromInclusive {
                 from_index_inclusive,
-            } => {
+            }) => {
                 assert_eq!(*from_index_inclusive, LogIndex(8));
             }
-            other => panic!("expected TruncateLog, got {other:?}"),
+            other => panic!("expected TruncateLog(SuffixFromInclusive), got {other:?}"),
         }
 
         // Re-fetch SendMessage with leader-supplied consistent point.
@@ -4354,11 +5980,117 @@ port = 6004
         );
     }
 
-    /// Stage 3.3 finding-2 fix (iter 3): the entries batch in a
-    /// `FetchResponse` must be index-contiguous end-to-end, not just at
-    /// its first element. The previous code checked `entries[0].index`
-    /// matched `last_log_index + 1` then appended the whole batch ΓÇö so a
-    /// malformed leader sending `[entry(1), entry(3)]` would corrupt the
+    /// Stage 7.2 iter-3 finding #3 regression test: an observer is
+    /// seeded into `peers` so the leader's `handle_fetch_request`
+    /// known-sender guard accepts the observer's Fetch RPC. But the
+    /// REVERSE direction (a FetchResponse with `is_leader = true`
+    /// claiming an observer is the leader) must be DROPPED — observers
+    /// are non-voting and cannot be leaders. The iter-2 predicate
+    /// `is_known_voter || peers.contains_key` accidentally let a
+    /// crafted/buggy observer response claim leadership. This test
+    /// exercises both the higher-term path (term must not bump) and
+    /// the same-term path (leader_id must not be adopted).
+    #[test]
+    fn fetch_response_with_observer_as_leader_dropped() {
+        // 3 voters {1,2,3} + 1 observer {4}, this node = voter 1.
+        let cfg = three_voter_one_observer_config(1);
+
+        // ---------- Case (a): same term, no known leader yet,
+        //                       observer claims leadership. ----------
+        let mut node = RaftNode::new_with_seed(cfg.clone(), 91).unwrap();
+        // Sanity: node 4 IS in peers (observer-seeded) but is NOT a voter.
+        assert!(
+            node.peers.contains_key(&NodeId(4)),
+            "observer 4 must be seeded into peers (defense for handle_fetch_request)"
+        );
+        assert!(
+            !node.is_known_voter(NodeId(4)),
+            "observer 4 must NOT be a configured voter"
+        );
+
+        node.hard_state.current_term = Term(3);
+        node.role = NodeRole::Follower;
+        node.leader_id = None;
+        let max = node.election_timer.max_ticks();
+        for _ in 0..max {
+            node.election_timer.tick();
+        }
+        let pre_elapsed = node.election_timer.elapsed();
+
+        // Observer 4 claims leadership with is_leader=true at same term.
+        let resp_same = build_fetch_response_from(
+            /*leader=*/ NodeId(4),
+            /*leader_epoch=*/ 3,
+            /*high_watermark=*/ 0,
+            Vec::new(),
+            None,
+        );
+        let actions_same = node.step(Input::FetchResponse(resp_same));
+        assert!(
+            actions_same.is_empty(),
+            "same-term observer-as-leader FetchResponse must be dropped, got {actions_same:?}"
+        );
+        assert_eq!(
+            node.leader_id, None,
+            "observer-as-leader must NOT establish leader_id"
+        );
+        assert_eq!(
+            node.current_term(),
+            Term(3),
+            "observer-as-leader must NOT change term"
+        );
+        assert_eq!(
+            node.election_timer.elapsed(),
+            pre_elapsed,
+            "observer-as-leader response must NOT reset election timer"
+        );
+
+        // ---------- Case (b): HIGHER term, observer claims leadership
+        //                       with entries. MUST be dropped (no
+        //                       term bump, no log mutation). ----------
+        let mut node2 = RaftNode::new_with_seed(cfg, 92).unwrap();
+        node2.hard_state.current_term = Term(2);
+        node2.role = NodeRole::Follower;
+        node2.leader_id = Some(NodeId(2));
+        let bogus = Entry {
+            index: LogIndex(1),
+            term: Term(7),
+            payload: EntryPayload::NoOp,
+        };
+        let resp_higher = build_fetch_response_from(
+            /*leader=*/ NodeId(4), // observer
+            /*leader_epoch=*/ 7, // higher term
+            /*high_watermark=*/ 1,
+            vec![bogus],
+            None,
+        );
+        let actions_higher = node2.step(Input::FetchResponse(resp_higher));
+        assert!(
+            actions_higher.is_empty(),
+            "higher-term observer-as-leader FetchResponse must be dropped, got {actions_higher:?}"
+        );
+        assert_eq!(
+            node2.current_term(),
+            Term(2),
+            "observer-as-leader response must NOT bump term — election safety violated otherwise"
+        );
+        assert_eq!(
+            node2.leader_id,
+            Some(NodeId(2)),
+            "observer-as-leader response must NOT overwrite leader_id"
+        );
+        assert_eq!(
+            node2.last_log_index,
+            LogIndex(0),
+            "observer-as-leader response must NOT append entries"
+        );
+        assert_eq!(
+            node2.commit_index,
+            LogIndex(0),
+            "observer-as-leader response must NOT advance commit_index"
+        );
+    }
+
     /// follower's log with a gap at index 2 and silently violate Raft's
     /// log-matching invariant. Validate every adjacent pair before
     /// appending; drop the entire response on any gap.
@@ -4758,6 +6490,1164 @@ port = 6004
         assert!(
             !any_fetch,
             "back-to-back Ticks must not double-schedule a fetch"
+        );
+    }
+
+    // ---- Stage 5.2 — Snapshot Coordination handlers ---------------------
+
+    /// Build a representative `SnapshotMeta` for the snapshot-coordination
+    /// tests. The id is left empty here because the engine treats it as
+    /// opaque metadata; the driver / store are responsible for normalising
+    /// it on save.
+    fn test_snapshot_meta(index: u64, term: u64) -> SnapshotMeta {
+        SnapshotMeta {
+            id: format!("snapshot-{term:010}-{index:020}"),
+            last_included_index: LogIndex(index),
+            last_included_term: Term(term),
+            voter_set: None,
+            size_bytes: Some(42),
+            checksum: None,
+        }
+    }
+
+    #[test]
+    fn handle_snapshot_complete_records_metadata_and_emits_prefix_truncate() {
+        // Scenario seed: SnapshotComplete with metadata pointing at log
+        // index 10 / term 3 → engine records the metadata and emits a
+        // single `Action::TruncateLog(PrefixThroughInclusive { 10 })`.
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 17).unwrap();
+        assert!(node.last_snapshot_meta.is_none());
+
+        let meta = test_snapshot_meta(10, 3);
+        let actions = node.step(Input::SnapshotComplete {
+            metadata: meta.clone(),
+        });
+
+        // Metadata recorded.
+        assert_eq!(
+            node.last_snapshot_meta.as_ref(),
+            Some(&meta),
+            "last_snapshot_meta must be recorded on SnapshotComplete",
+        );
+
+        // Exactly one Action::TruncateLog(PrefixThroughInclusive).
+        assert_eq!(
+            actions.len(),
+            1,
+            "SnapshotComplete must emit exactly one follow-on action, got {actions:?}",
+        );
+        match &actions[0] {
+            Action::TruncateLog(LogTruncation::PrefixThroughInclusive {
+                through_index_inclusive,
+            }) => {
+                assert_eq!(*through_index_inclusive, LogIndex(10));
+            }
+            other => panic!(
+                "expected TruncateLog(PrefixThroughInclusive {{ through_index_inclusive: 10 }}), got {other:?}",
+            ),
+        }
+    }
+
+    #[test]
+    fn handle_snapshot_installed_advances_apply_and_commit_and_records_metadata() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 31).unwrap();
+        assert_eq!(node.last_applied, LogIndex(0));
+        assert_eq!(node.commit_index, LogIndex(0));
+        assert_eq!(node.last_log_index, LogIndex(0));
+        assert!(node.last_snapshot_meta.is_none());
+
+        let meta = test_snapshot_meta(25, 7);
+        let actions = node.step(Input::SnapshotInstalled {
+            metadata: meta.clone(),
+        });
+
+        assert!(
+            actions.is_empty(),
+            "SnapshotInstalled must NOT emit any follow-on actions (engine has no entries to truncate against)",
+        );
+        assert_eq!(
+            node.last_applied,
+            LogIndex(25),
+            "last_applied must advance to the snapshot's last_included_index",
+        );
+        assert_eq!(
+            node.commit_index,
+            LogIndex(25),
+            "commit_index must advance to the snapshot's last_included_index",
+        );
+        // Engine mirrors must move forward so subsequent FetchRequests
+        // don't claim a position behind the snapshot.
+        assert_eq!(node.last_log_index, LogIndex(25));
+        assert_eq!(node.last_log_term, Term(7));
+        assert_eq!(node.last_snapshot_meta.as_ref(), Some(&meta));
+    }
+
+    #[test]
+    fn handle_snapshot_installed_is_idempotent_when_already_ahead() {
+        // If last_applied / commit_index / last_log_index are already
+        // ahead of the snapshot, installing the snapshot must NOT
+        // regress them — it is a no-op for the indices but still
+        // records metadata.
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 41).unwrap();
+        node.last_applied = LogIndex(30);
+        node.commit_index = LogIndex(30);
+        node.last_log_index = LogIndex(40);
+        node.last_log_term = Term(9);
+
+        let meta = test_snapshot_meta(25, 7);
+        let _ = node.step(Input::SnapshotInstalled {
+            metadata: meta.clone(),
+        });
+
+        assert_eq!(node.last_applied, LogIndex(30));
+        assert_eq!(node.commit_index, LogIndex(30));
+        assert_eq!(node.last_log_index, LogIndex(40));
+        assert_eq!(node.last_log_term, Term(9));
+        assert_eq!(node.last_snapshot_meta.as_ref(), Some(&meta));
+    }
+
+    #[test]
+    fn handle_snapshot_installed_preserves_fresher_last_snapshot_meta() {
+        // Defensive belt-and-braces (Stage 5.2): a stale
+        // `Input::SnapshotInstalled` delivered to the engine (e.g. via
+        // a direct unit-test step, or any future alternate driver that
+        // forgets the driver-side stale-install guard) must NOT clobber
+        // a fresher `last_snapshot_meta`. The engine treats the
+        // snapshot anchor as raise-only on `last_included_index`,
+        // matching the existing raise-only semantics on `last_applied`
+        // / `commit_index` / `last_log_*`.
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 53).unwrap();
+        let fresh = test_snapshot_meta(50, 11);
+        node.last_applied = LogIndex(50);
+        node.commit_index = LogIndex(50);
+        node.last_log_index = LogIndex(50);
+        node.last_log_term = Term(11);
+        node.last_snapshot_meta = Some(fresh.clone());
+
+        let stale = test_snapshot_meta(25, 7);
+        let actions = node.step(Input::SnapshotInstalled {
+            metadata: stale.clone(),
+        });
+
+        assert!(
+            actions.is_empty(),
+            "stale SnapshotInstalled must not emit follow-on actions",
+        );
+        // Indices are unchanged (raise-only guards).
+        assert_eq!(node.last_applied, LogIndex(50));
+        assert_eq!(node.commit_index, LogIndex(50));
+        assert_eq!(node.last_log_index, LogIndex(50));
+        assert_eq!(node.last_log_term, Term(11));
+        // The fresher snapshot anchor must survive.
+        assert_eq!(
+            node.last_snapshot_meta.as_ref(),
+            Some(&fresh),
+            "stale Input::SnapshotInstalled must not clobber a fresher last_snapshot_meta",
+        );
+    }
+
+    #[test]
+    fn handle_snapshot_complete_preserves_fresher_last_snapshot_meta() {
+        // Defensive belt-and-braces (Stage 5.2): a same- or lower-indexed
+        // `Input::SnapshotComplete` (e.g. an out-of-order completion
+        // delivered after a newer snapshot has been recorded via either
+        // `SnapshotComplete` or `SnapshotInstalled`) must NOT clobber the
+        // fresher anchor and must NOT emit a follow-on `TruncateLog`. The
+        // engine already anchors at a longer prefix, so instructing the
+        // driver to purge through the stale, lower index would express
+        // the wrong intent (prefix purge is idempotent today, but Stage
+        // 6.2's physical purge would treat the stale instruction as a
+        // genuine — and confusingly named — request). The debouncer
+        // flag still clears because the driver-side save attempt has
+        // resolved either way.
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 67).unwrap();
+        let fresh = test_snapshot_meta(50, 11);
+        node.last_snapshot_meta = Some(fresh.clone());
+        node.snapshot_in_flight = true;
+
+        let stale = test_snapshot_meta(25, 7);
+        let actions = node.step(Input::SnapshotComplete {
+            metadata: stale.clone(),
+        });
+
+        // Stale completion emits no follow-on actions — the fresher
+        // anchor already covers (or will cover) a longer prefix.
+        assert!(
+            actions.is_empty(),
+            "stale Input::SnapshotComplete must not emit any follow-on actions, got {actions:?}",
+        );
+        // The fresher snapshot anchor must survive.
+        assert_eq!(
+            node.last_snapshot_meta.as_ref(),
+            Some(&fresh),
+            "stale Input::SnapshotComplete must not clobber a fresher last_snapshot_meta",
+        );
+        // Debouncer must still clear so the next threshold crossing can
+        // re-emit a TakeSnapshot.
+        assert!(
+            !node.snapshot_in_flight,
+            "snapshot_in_flight must clear even when the completion was stale",
+        );
+    }
+
+    // ---- Stage 5.3 — `Input::FetchSnapshotReceived` action contract -----
+
+    /// Stage 5.3 implementation-plan §5.2 step 3: the driver-side
+    /// `OutboundResult::FetchSnapshot` handler feeds the reassembled
+    /// `(metadata, data)` into the engine as
+    /// `Input::FetchSnapshotReceived`. When the snapshot strictly
+    /// advances `last_applied`, the engine MUST emit exactly one
+    /// `Action::InstallSnapshot { metadata, data }` so the driver
+    /// fulfils it via the same arm synthetic / test-injected actions
+    /// flow through.
+    #[test]
+    fn handle_fetch_snapshot_received_emits_install_snapshot_when_fresh() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 91).unwrap();
+        assert_eq!(node.last_applied, LogIndex(0));
+
+        let meta = test_snapshot_meta(50, 7);
+        let data = b"fresh-snapshot-bytes".to_vec();
+        let actions = node.step(Input::FetchSnapshotReceived {
+            metadata: meta.clone(),
+            data: data.clone(),
+        });
+
+        assert_eq!(
+            actions.len(),
+            1,
+            "fresh FetchSnapshotReceived must emit exactly one action, got {actions:?}",
+        );
+        match &actions[0] {
+            Action::InstallSnapshot {
+                metadata: emitted_meta,
+                data: emitted_data,
+            } => {
+                assert_eq!(emitted_meta, &meta);
+                assert_eq!(emitted_data, &data);
+            }
+            other => {
+                panic!("expected Action::InstallSnapshot {{ metadata, data }}, got {other:?}",)
+            }
+        }
+
+        // Engine indices must NOT advance until the driver completes
+        // the install and feeds Input::SnapshotInstalled back — keeping
+        // the "engine is I/O-free" contract: the snapshot is not yet
+        // durable when we emit the action.
+        assert_eq!(
+            node.last_applied,
+            LogIndex(0),
+            "last_applied must not advance on the receive-side action emission",
+        );
+        assert_eq!(
+            node.commit_index,
+            LogIndex(0),
+            "commit_index must not advance on the receive-side action emission",
+        );
+    }
+
+    /// Stale snapshots (coverage at or behind `last_applied`) must not
+    /// produce an `Action::InstallSnapshot`. Restoring an older state-
+    /// machine view would diverge the state machine (older) from the
+    /// engine (newer applied position), since `handle_snapshot_installed`
+    /// refuses to lower `last_applied`.
+    #[test]
+    fn handle_fetch_snapshot_received_drops_stale_snapshot() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 92).unwrap();
+        node.last_applied = LogIndex(100);
+        node.commit_index = LogIndex(100);
+
+        // Snapshot covers strictly less than last_applied — stale.
+        let stale_below = test_snapshot_meta(50, 7);
+        let actions = node.step(Input::FetchSnapshotReceived {
+            metadata: stale_below.clone(),
+            data: b"stale-below".to_vec(),
+        });
+        assert!(
+            actions.is_empty(),
+            "FetchSnapshotReceived with metadata.last_included_index < last_applied must emit no actions, got {actions:?}",
+        );
+
+        // Snapshot covers exactly last_applied — still stale (no advance).
+        let stale_equal = test_snapshot_meta(100, 9);
+        let actions = node.step(Input::FetchSnapshotReceived {
+            metadata: stale_equal,
+            data: b"stale-equal".to_vec(),
+        });
+        assert!(
+            actions.is_empty(),
+            "FetchSnapshotReceived with metadata.last_included_index == last_applied must emit no actions, got {actions:?}",
+        );
+
+        // Indices must not move on stale receive.
+        assert_eq!(node.last_applied, LogIndex(100));
+        assert_eq!(node.commit_index, LogIndex(100));
+    }
+
+    // ---- Stage 5.2 — auto snapshot trigger (`maybe_take_snapshot`) ------
+
+    /// Single-voter config with a custom `max_log_entries_before_compaction`.
+    /// Used to drive the snapshot-trigger threshold on a one-node cluster
+    /// where a `ClientPropose` immediately satisfies quorum.
+    fn single_voter_config_with_snapshot_threshold(threshold: u64) -> ClusterConfig {
+        let toml = format!(
+            r#"
+node_id = 1
+cluster_id = "test"
+listen_addr = "0.0.0.0:6000"
+tick_interval_ms = 10
+election_timeout_min_ms = 100
+election_timeout_max_ms = 200
+max_log_entries_before_compaction = {threshold}
+
+[[voters]]
+node_id = 1
+directory_id = "{uuid}"
+host = "node1"
+port = 6000
+"#,
+            threshold = threshold,
+            uuid = Uuid::new_v4(),
+        );
+        ClusterConfig::from_toml_str(&toml).unwrap()
+    }
+
+    /// Stage 5.2 implementation-plan §5.2 step 1 / scenario
+    /// `auto-snapshot-trigger`: with `max_log_entries_before_compaction = 10`,
+    /// proposing 12 commands on a single-voter cluster (each immediately
+    /// satisfies quorum and advances `commit_index`) must emit exactly one
+    /// `Action::TakeSnapshot` once the threshold is crossed.
+    #[test]
+    fn auto_snapshot_trigger_emits_take_snapshot_when_threshold_crossed() {
+        let cfg = single_voter_config_with_snapshot_threshold(10);
+        let mut node = RaftNode::new_with_seed(cfg, 71).unwrap();
+
+        // Become leader; this appends a no-op (index 1) and (single voter)
+        // commits + applies it. snapshot_in_flight stays false, last_applied=1.
+        node.become_pre_candidate();
+        node.become_candidate();
+        let leader_actions = node.become_leader();
+        // No snapshot trigger yet — last_applied=1, snap_idx=0, lag=1<=10.
+        assert!(
+            !leader_actions
+                .iter()
+                .any(|a| matches!(a, Action::TakeSnapshot { .. })),
+            "no TakeSnapshot expected before threshold crossed; got {leader_actions:?}",
+        );
+        assert!(!node.snapshot_in_flight);
+
+        // Propose entries 2..=11 (10 more commands). After each, a
+        // single-voter commit advances commit_index. Threshold is
+        // commit_index - snap_idx > 10. snap_idx = 0 because no snapshot
+        // has completed yet. So once commit_index reaches 11 the
+        // condition becomes 11 - 0 = 11 > 10 → emit TakeSnapshot.
+        let mut take_snapshot_actions: Vec<Action> = Vec::new();
+        for i in 2..=12 {
+            let actions = node.step(Input::ClientPropose(bytes::Bytes::from(format!("cmd-{i}"))));
+            for a in &actions {
+                if matches!(a, Action::TakeSnapshot { .. }) {
+                    take_snapshot_actions.push(a.clone());
+                }
+            }
+        }
+
+        // Exactly one TakeSnapshot must have been emitted across the
+        // 11 proposals (debouncing keeps the next 10 from re-emitting).
+        assert_eq!(
+            take_snapshot_actions.len(),
+            1,
+            "exactly one Action::TakeSnapshot must be emitted across the threshold-crossing proposals; got {take_snapshot_actions:?}",
+        );
+        match &take_snapshot_actions[0] {
+            Action::TakeSnapshot { through_index } => {
+                assert!(
+                    through_index.0 >= 11,
+                    "through_index must be at or past the threshold-crossing commit (>=11), got {through_index}",
+                );
+            }
+            other => panic!("expected TakeSnapshot, got {other:?}"),
+        }
+
+        // The in-flight flag is set; no further TakeSnapshot can be
+        // emitted until SnapshotComplete clears it.
+        assert!(
+            node.snapshot_in_flight,
+            "snapshot_in_flight must be set after the trigger fires",
+        );
+        let extra = node.step(Input::ClientPropose(bytes::Bytes::from_static(b"another")));
+        assert!(
+            !extra
+                .iter()
+                .any(|a| matches!(a, Action::TakeSnapshot { .. })),
+            "no second TakeSnapshot must be emitted while snapshot_in_flight is true",
+        );
+
+        // Feed back SnapshotComplete; the flag clears and the next
+        // commit advance can re-emit TakeSnapshot once the lag
+        // re-crosses the threshold.
+        let through = node.commit_index;
+        let _ = node.step(Input::SnapshotComplete {
+            metadata: SnapshotMeta {
+                id: String::new(),
+                last_included_index: through,
+                last_included_term: node.last_log_term,
+                voter_set: node.voter_set.clone(),
+                size_bytes: Some(0),
+                checksum: None,
+            },
+        });
+        assert!(
+            !node.snapshot_in_flight,
+            "snapshot_in_flight must clear on SnapshotComplete",
+        );
+
+        // After SnapshotComplete, snap_idx == commit_index, so the lag
+        // resets to 0. The next 11 proposals must re-trigger exactly
+        // one more TakeSnapshot.
+        let mut more: Vec<Action> = Vec::new();
+        for i in 0..12 {
+            let acts = node.step(Input::ClientPropose(bytes::Bytes::from(format!(
+                "post-{i}"
+            ))));
+            for a in acts {
+                if matches!(a, Action::TakeSnapshot { .. }) {
+                    more.push(a);
+                }
+            }
+        }
+        assert_eq!(
+            more.len(),
+            1,
+            "after SnapshotComplete, the next threshold crossing must re-trigger exactly one TakeSnapshot; got {more:?}",
+        );
+    }
+
+    /// `Input::SnapshotInstalled` (the leader-supplied path) must also
+    /// clear `snapshot_in_flight` so a subsequent local threshold
+    /// crossing can re-emit `Action::TakeSnapshot`.
+    #[test]
+    fn snapshot_installed_clears_in_flight_flag() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 73).unwrap();
+        // Force the flag set as if a TakeSnapshot was emitted.
+        node.snapshot_in_flight = true;
+        let _ = node.step(Input::SnapshotInstalled {
+            metadata: test_snapshot_meta(20, 4),
+        });
+        assert!(
+            !node.snapshot_in_flight,
+            "snapshot_in_flight must clear on SnapshotInstalled too (leader-supplied snapshot supersedes any in-flight local snapshot)",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 5.2 (impl-plan §5.2 step 4) — follower-side snapshot
+    // redirect handling
+    // -----------------------------------------------------------------
+    //
+    // When a `FetchResponse` carries a `SnapshotRedirect`, the follower
+    // must:
+    //   1. NOT process entries / divergence (mutual exclusivity).
+    //   2. Emit a `FetchSnapshotRequest` to the leader carrying the
+    //      canonical snapshot id, offset 0, and max_bytes 0.
+    //   3. Stamp `last_fetch_tick` so a duplicate redirect storm is
+    //      damped while the install is in flight.
+
+    fn fetch_response_with_redirect(
+        leader: NodeId,
+        leader_epoch: u64,
+        snapshot_id: &str,
+        last_included_index: u64,
+        last_included_term: u64,
+    ) -> FetchResponse {
+        FetchResponse {
+            cluster_id: "test".into(),
+            leader_epoch,
+            leader_id: leader,
+            high_watermark: LogIndex(last_included_index),
+            entries: Vec::new(),
+            diverging_epoch: None,
+            snapshot_redirect: Some(crate::message::SnapshotRedirect {
+                snapshot_id: snapshot_id.into(),
+                last_included_index: LogIndex(last_included_index),
+                last_included_term: Term(last_included_term),
+            }),
+            is_leader: true,
+        }
+    }
+
+    #[test]
+    fn handle_fetch_response_with_redirect_emits_fetch_snapshot_request() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 991).unwrap();
+        // Anchor the follower's view: we know NodeId(2) is the
+        // current-term leader.
+        node.hard_state.current_term = Term(7);
+        node.leader_id = Some(NodeId(2));
+        node.role = NodeRole::Follower;
+
+        let resp = fetch_response_with_redirect(NodeId(2), 7, "snap-follower-redirect-1", 42, 6);
+        let actions = node.handle_fetch_response(resp);
+
+        // Exactly one outbound FetchSnapshotRequest, addressed to the
+        // leader, with the redirect's snapshot_id.
+        assert_eq!(
+            actions.len(),
+            1,
+            "redirect must produce exactly one follow-on action, got {actions:?}",
+        );
+        match &actions[0] {
+            Action::SendMessage { to, message } => {
+                assert_eq!(
+                    *to,
+                    NodeId(2),
+                    "FetchSnapshotRequest must target the leader"
+                );
+                match message {
+                    OutboundMessage::FetchSnapshotRequest(req) => {
+                        assert_eq!(req.snapshot_id, "snap-follower-redirect-1");
+                        assert_eq!(req.cluster_id, "test");
+                        assert_eq!(req.leader_epoch, 7);
+                        assert_eq!(req.replica_id, node.id);
+                        assert_eq!(req.offset, 0);
+                        assert_eq!(req.max_bytes, 0);
+                    }
+                    other => {
+                        panic!("expected FetchSnapshotRequest, got {other:?}")
+                    }
+                }
+            }
+            other => panic!("expected SendMessage(FetchSnapshotRequest), got {other:?}"),
+        }
+        // Election timer reset is an integral part of the leader-contact
+        // pre-fence; assert the redirect path also stamps last_fetch_tick
+        // so duplicate redirects don't storm the leader while the
+        // install is in flight.
+        assert!(
+            node.last_fetch_tick.is_some(),
+            "redirect path must stamp last_fetch_tick (debounce)",
+        );
+    }
+
+    /// Mutual exclusivity (FetchResponse contract): when redirect is
+    /// present, `entries` and `diverging_epoch` are ignored. This guards
+    /// against a misbehaving leader that smuggles entries or a
+    /// divergence signal alongside the redirect — the follower must
+    /// only honour the redirect.
+    #[test]
+    fn handle_fetch_response_redirect_takes_precedence_over_divergence_or_entries() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 1313).unwrap();
+        node.hard_state.current_term = Term(4);
+        node.leader_id = Some(NodeId(2));
+        node.role = NodeRole::Follower;
+        // Snapshot the engine's last-log mirror BEFORE handling the
+        // (would-be) entries so we can prove they were not applied.
+        let baseline_last_index = node.last_log_index;
+        let baseline_last_term = node.last_log_term;
+
+        let resp = FetchResponse {
+            cluster_id: "test".into(),
+            leader_epoch: 4,
+            leader_id: NodeId(2),
+            high_watermark: LogIndex(50),
+            // Smuggle entries — must be ignored.
+            entries: vec![Entry {
+                index: LogIndex(99),
+                term: Term(4),
+                payload: EntryPayload::NoOp,
+            }],
+            // Smuggle a divergence signal — must be ignored.
+            diverging_epoch: Some(DivergingEpoch {
+                epoch: Term(3),
+                end_offset: LogIndex(7),
+            }),
+            snapshot_redirect: Some(crate::message::SnapshotRedirect {
+                snapshot_id: "snap-takes-precedence".into(),
+                last_included_index: LogIndex(50),
+                last_included_term: Term(4),
+            }),
+            is_leader: true,
+        };
+
+        let actions = node.handle_fetch_response(resp);
+
+        // Redirect produced exactly one action — no AppendEntries / no
+        // truncation from the divergence path.
+        assert_eq!(
+            actions.len(),
+            1,
+            "exactly one action (the FetchSnapshotRequest) must be emitted; got {actions:?}",
+        );
+        assert!(matches!(
+            &actions[0],
+            Action::SendMessage {
+                message: OutboundMessage::FetchSnapshotRequest(_),
+                ..
+            }
+        ));
+        // Engine state must be unchanged — no entries appended, no
+        // divergence-driven truncation / fetch-pointer reset.
+        assert_eq!(
+            node.last_log_index, baseline_last_index,
+            "redirect must not advance last_log_index via the smuggled entries",
+        );
+        assert_eq!(
+            node.last_log_term, baseline_last_term,
+            "redirect must not advance last_log_term via the smuggled entries",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 5.3 (impl-plan §5.2 step 4) — leader-side snapshot redirect
+    // emitted by the engine via `Action::RedirectToSnapshot`.
+    //
+    // The leader's `handle_fetch_request` must detect when a follower's
+    // `fetch_offset` falls at or below the compacted prefix anchored
+    // by `last_snapshot_meta` and emit `Action::RedirectToSnapshot`
+    // INSTEAD of `Action::ServeFetch` — keeping the redirect decision
+    // I/O-free inside the engine.
+    // -----------------------------------------------------------------
+
+    /// Helper: drive `node` (a fresh three-voter config) into the
+    /// Leader role at term 1 and install `meta` as the leader's
+    /// `last_snapshot_meta` so the redirect predicate can fire.
+    fn drive_leader_with_snapshot_anchor(node: &mut RaftNode, meta: SnapshotMeta) {
+        drive_three_voter_to_leader(node);
+        assert_eq!(node.role, NodeRole::Leader);
+        node.last_snapshot_meta = Some(meta);
+    }
+
+    /// Scenario: install-snapshot-on-slow-follower (engine half).
+    ///
+    /// Given a leader anchored at a snapshot covering `[..=50]`,
+    /// when a follower with `fetch_offset = 10` sends a `FetchRequest`,
+    /// then `handle_fetch_request` MUST emit exactly one
+    /// `Action::RedirectToSnapshot` carrying the snapshot's canonical
+    /// id, indices, and the leader's envelope. No `Action::ServeFetch`
+    /// must be emitted.
+    #[test]
+    fn handle_fetch_request_emits_redirect_when_offset_in_compacted_prefix() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5301).unwrap();
+        // Snapshot covering log entries 1..=50 at term 3.
+        let snap = SnapshotMeta {
+            id: "snap-stage-5.3-redirect".into(),
+            last_included_index: LogIndex(50),
+            last_included_term: Term(3),
+            voter_set: node.voter_set.clone(),
+            size_bytes: Some(1_048_576),
+            checksum: None,
+        };
+        drive_leader_with_snapshot_anchor(&mut node, snap.clone());
+
+        let leader_term = node.current_term().0;
+        let req = build_fetch_request_from(NodeId(2), 10, 0, leader_term);
+        let actions = node.step(Input::FetchRequest(req));
+
+        assert_eq!(
+            actions.len(),
+            1,
+            "exactly one action expected on redirect; got {actions:?}",
+        );
+        match &actions[0] {
+            Action::RedirectToSnapshot {
+                to,
+                cluster_id,
+                leader_epoch,
+                leader_id,
+                high_watermark,
+                snapshot_metadata,
+            } => {
+                assert_eq!(*to, NodeId(2), "redirect must target the asking follower");
+                assert_eq!(cluster_id, "test");
+                assert_eq!(*leader_epoch, leader_term);
+                assert_eq!(*leader_id, node.id);
+                assert_eq!(*high_watermark, node.commit_index);
+                assert_eq!(snapshot_metadata.id, snap.id);
+                assert_eq!(
+                    snapshot_metadata.last_included_index,
+                    snap.last_included_index
+                );
+                assert_eq!(
+                    snapshot_metadata.last_included_term,
+                    snap.last_included_term
+                );
+            }
+            other => panic!("expected Action::RedirectToSnapshot, got {other:?}"),
+        }
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ServeFetch { .. })),
+            "ServeFetch must NOT be emitted alongside a redirect (mutual exclusivity)",
+        );
+    }
+
+    /// Boundary case: `fetch_offset == last_included_index` is still
+    /// inside the compacted prefix (the follower wants the snapshot's
+    /// tail entry which has been compacted), so the redirect must fire.
+    #[test]
+    fn handle_fetch_request_redirect_with_offset_equal_last_included_index() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5302).unwrap();
+        let snap = SnapshotMeta {
+            id: "snap-boundary".into(),
+            last_included_index: LogIndex(50),
+            last_included_term: Term(4),
+            voter_set: node.voter_set.clone(),
+            size_bytes: Some(64),
+            checksum: None,
+        };
+        drive_leader_with_snapshot_anchor(&mut node, snap);
+        let leader_term = node.current_term().0;
+
+        let req = build_fetch_request_from(NodeId(2), 50, 4, leader_term);
+        let actions = node.step(Input::FetchRequest(req));
+
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], Action::RedirectToSnapshot { .. }),
+            "fetch_offset == last_included_index must redirect (the snapshot's tail entry has been compacted); got {:?}",
+            actions[0],
+        );
+    }
+
+    /// Boundary case: `fetch_offset == last_included_index + 1` lies
+    /// just past the compacted prefix, so the engine must NOT redirect.
+    /// The follower is asking for the next entry beyond the snapshot's
+    /// tail — the standard resumption case, handled by `ServeFetch`.
+    #[test]
+    fn handle_fetch_request_does_not_redirect_when_offset_past_snapshot() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5303).unwrap();
+        let snap = SnapshotMeta {
+            id: "snap-resume".into(),
+            last_included_index: LogIndex(50),
+            last_included_term: Term(4),
+            voter_set: node.voter_set.clone(),
+            size_bytes: Some(64),
+            checksum: None,
+        };
+        drive_leader_with_snapshot_anchor(&mut node, snap);
+        let leader_term = node.current_term().0;
+
+        // Lift the engine's last_log_index past the snapshot so the
+        // ServeFetch path is realistic (the leader actually has entry
+        // 51 to potentially serve).
+        node.last_log_index = LogIndex(60);
+        node.last_log_term = Term(4);
+
+        let req = build_fetch_request_from(NodeId(2), 51, 4, leader_term);
+        let actions = node.step(Input::FetchRequest(req));
+
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], Action::ServeFetch { .. }),
+            "fetch_offset > last_included_index must use ServeFetch, not redirect; got {:?}",
+            actions[0],
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::RedirectToSnapshot { .. })),
+            "RedirectToSnapshot must NOT be emitted past the snapshot tail",
+        );
+    }
+
+    /// Even at `fetch_offset == last_included_index + 1` with a WRONG
+    /// `last_fetched_epoch`, the engine still emits `ServeFetch` —
+    /// divergence detection lives in the driver (it consults the log
+    /// store + snapshot anchor to surface the divergence signal). The
+    /// engine MUST NOT short-circuit to a redirect here because the
+    /// follower's fetch tip is past the compacted prefix. This regression
+    /// test guards against accidentally widening the redirect predicate
+    /// to consume divergence cases that belong on the `ServeFetch` path.
+    #[test]
+    fn handle_fetch_request_serves_fetch_when_offset_after_snapshot_tail_even_with_wrong_term() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5304).unwrap();
+        let snap = SnapshotMeta {
+            id: "snap-wrongterm".into(),
+            last_included_index: LogIndex(50),
+            last_included_term: Term(4),
+            voter_set: node.voter_set.clone(),
+            size_bytes: Some(64),
+            checksum: None,
+        };
+        drive_leader_with_snapshot_anchor(&mut node, snap);
+        let leader_term = node.current_term().0;
+        node.last_log_index = LogIndex(60);
+        node.last_log_term = Term(4);
+
+        // last_fetched_epoch = 99 — does not match the snapshot's
+        // last_included_term=4. The engine still emits ServeFetch (the
+        // driver will surface the divergence via DivergingEpoch).
+        let req = build_fetch_request_from(NodeId(2), 51, 99, leader_term);
+        let actions = node.step(Input::FetchRequest(req));
+
+        assert!(
+            matches!(&actions[0], Action::ServeFetch { .. }),
+            "ServeFetch must be emitted so the driver can surface divergence; got {:?}",
+            actions[0],
+        );
+    }
+
+    /// When the snapshot's canonical id is empty (e.g. legacy on-disk
+    /// metadata, or a test driver that fed `SnapshotComplete` with
+    /// `id = String::new()` directly), the engine MUST NOT emit a
+    /// redirect — the follower cannot meaningfully echo an empty
+    /// `snapshot_id` on `FetchSnapshotRequest`. Fall through to
+    /// `ServeFetch` so the driver can at least surface a divergence
+    /// signal. A `warn!` records the misconfiguration; the test only
+    /// asserts the action emission.
+    #[test]
+    fn handle_fetch_request_fallthrough_when_snapshot_id_empty() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5305).unwrap();
+        let snap = SnapshotMeta {
+            id: String::new(),
+            last_included_index: LogIndex(50),
+            last_included_term: Term(4),
+            voter_set: node.voter_set.clone(),
+            size_bytes: Some(64),
+            checksum: None,
+        };
+        drive_leader_with_snapshot_anchor(&mut node, snap);
+        let leader_term = node.current_term().0;
+
+        let req = build_fetch_request_from(NodeId(2), 10, 0, leader_term);
+        let actions = node.step(Input::FetchRequest(req));
+
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], Action::ServeFetch { .. }),
+            "empty snapshot_id must fall through to ServeFetch (no usable redirect target); got {:?}",
+            actions[0],
+        );
+    }
+
+    /// Sanity: when no snapshot has ever been taken (`last_snapshot_meta
+    /// is None`), the engine always emits `ServeFetch` and never a
+    /// redirect, regardless of how small `fetch_offset` is.
+    #[test]
+    fn handle_fetch_request_serves_fetch_when_no_snapshot_anchor() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5306).unwrap();
+        drive_three_voter_to_leader(&mut node);
+        assert!(node.last_snapshot_meta.is_none());
+
+        let leader_term = node.current_term().0;
+        let req = build_fetch_request_from(NodeId(2), 1, 0, leader_term);
+        let actions = node.step(Input::FetchRequest(req));
+
+        assert!(
+            matches!(&actions[0], Action::ServeFetch { .. }),
+            "no snapshot anchor must always use ServeFetch; got {:?}",
+            actions[0],
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::RedirectToSnapshot { .. })),
+        );
+    }
+
+    /// Liveness: the redirect path still updates `peer.last_fetch_time`
+    /// and `last_leader_contact_tick` — a redirect-bound Fetch is
+    /// evidence the follower is alive, which Check-Quorum (Stage 6.1)
+    /// will rely on. Per-peer replication progress
+    /// (`peer.last_fetch_offset`) must NOT advance (that requires the
+    /// driver's `FetchRequestAcked` after divergence validation, which
+    /// is not fed on a redirect — the redirect proves the follower is
+    /// BEHIND the compacted prefix).
+    #[test]
+    fn handle_fetch_request_redirect_updates_liveness_not_progress() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5307).unwrap();
+        let snap = SnapshotMeta {
+            id: "snap-live".into(),
+            last_included_index: LogIndex(50),
+            last_included_term: Term(3),
+            voter_set: node.voter_set.clone(),
+            size_bytes: Some(64),
+            checksum: None,
+        };
+        drive_leader_with_snapshot_anchor(&mut node, snap);
+        let leader_term = node.current_term().0;
+
+        // Drive a few ticks so logical_tick is non-zero — easier to
+        // distinguish a stamped liveness field from the zero default.
+        for _ in 0..3 {
+            node.step(Input::Tick);
+        }
+        let tick_before = node.logical_tick;
+        // Sanity: peer 2's last_fetch_offset starts at zero.
+        let pre_offset = node
+            .peers
+            .get(&NodeId(2))
+            .map(|p| p.last_fetch_offset)
+            .unwrap_or(LogIndex(0));
+        assert_eq!(pre_offset, LogIndex(0));
+
+        let req = build_fetch_request_from(NodeId(2), 5, 0, leader_term);
+        let _ = node.step(Input::FetchRequest(req));
+
+        // Liveness fields stamped at the request-handling tick.
+        let peer = node.peers.get(&NodeId(2)).expect("peer 2 must be tracked");
+        assert_eq!(
+            peer.last_fetch_time, tick_before,
+            "peer.last_fetch_time must be stamped on a redirect-bound Fetch"
+        );
+        assert_eq!(
+            node.last_leader_contact_tick,
+            Some(tick_before),
+            "self-contact must be stamped on a redirect-bound Fetch (Check-Quorum input)"
+        );
+        // Replication progress unchanged — the redirect is NOT proof
+        // the follower has any entry.
+        assert_eq!(
+            peer.last_fetch_offset, pre_offset,
+            "peer.last_fetch_offset must NOT advance on a redirect (the follower is BEHIND the compacted prefix)",
+        );
+    }
+
+    // ===================================================================
+    // Stage 7.1 — Check Quorum and Leader Lease
+    // ===================================================================
+
+    /// Three-voter config with Check-Quorum ON (the default). This node
+    /// = 1; peers = 2 and 3. Election timeout 100-200ms, tick 10ms.
+    /// `check_quorum_interval_ms` defaults to `2 * 200 = 400`, i.e. 40
+    /// ticks.
+    fn three_voter_check_quorum_config() -> ClusterConfig {
+        let mut cfg = three_voter_config();
+        cfg.enable_check_quorum = true;
+        cfg.enable_leader_lease = true;
+        cfg
+    }
+
+    /// Drive the supplied node directly to Leader with a deterministic
+    /// becomes-leader cascade (Pre-Vote → Candidate → Leader). Tests
+    /// that want a "clean" leader for Check-Quorum / Leader-Lease
+    /// scenarios use this helper to skip election plumbing.
+    fn force_leader(node: &mut RaftNode) {
+        let _ = node.become_pre_candidate();
+        let _ = node.become_candidate();
+        // Manually grant the second vote so we cross the threshold;
+        // in a 3-voter cluster the self-vote + one peer vote is a
+        // quorum.
+        node.votes_received.insert(NodeId(2));
+        let _ = node.become_leader();
+        assert_eq!(node.role, NodeRole::Leader, "force_leader did not promote");
+    }
+
+    /// Build a FetchRequest at this leader's current term, from
+    /// `peer_id`, asking for entries starting at the first
+    /// post-snapshot index (1 — `fetch_offset = 0` is rejected by
+    /// the engine as malformed, per the architecture's 1-based
+    /// indexing). `epoch_override` lets callers spoof a higher
+    /// `leader_epoch` for term-bump tests.
+    fn fetch_at(node: &RaftNode, peer_id: NodeId, epoch_override: Option<u64>) -> FetchRequest {
+        let leader_epoch = epoch_override.unwrap_or(node.hard_state.current_term.0);
+        FetchRequest {
+            cluster_id: node.config.cluster_id.clone(),
+            leader_epoch,
+            replica_id: peer_id,
+            // The empty-log case in architecture §5.2 is encoded as
+            // `fetch_offset = 1, last_fetched_epoch = 0`. We use that
+            // so the engine accepts the request and updates
+            // `peer.last_fetch_time` (the data we actually care about
+            // for Check-Quorum / Leader-Lease tests).
+            fetch_offset: LogIndex(1),
+            last_fetched_epoch: Term(0),
+        }
+    }
+
+    /// Run `n` Tick steps against `node`, returning the union of all
+    /// actions emitted (useful for asserting that StepDown happened).
+    fn run_ticks(node: &mut RaftNode, n: u64) -> Vec<Action> {
+        let mut all = Vec::new();
+        for _ in 0..n {
+            all.extend(node.step(Input::Tick));
+        }
+        all
+    }
+
+    #[test]
+    fn check_quorum_interval_ticks_is_derived_from_2x_election_timeout_max() {
+        // Default config: election_timeout_max = 200ms, tick = 10ms.
+        // effective_check_quorum_interval = 2 * 200 = 400ms = 40 ticks.
+        let node = RaftNode::new_with_seed(three_voter_check_quorum_config(), 1).unwrap();
+        assert_eq!(node.check_quorum_interval_ticks, 40);
+    }
+
+    #[test]
+    fn check_quorum_interval_ticks_honours_explicit_override() {
+        let mut cfg = three_voter_check_quorum_config();
+        cfg.check_quorum_interval_ms = Some(123); // 12.3 ticks → ceil to 13
+        let node = RaftNode::new_with_seed(cfg, 1).unwrap();
+        assert_eq!(node.check_quorum_interval_ticks, 13);
+    }
+
+    #[test]
+    fn check_quorum_steps_down_when_partitioned() {
+        // Scenario "check-quorum-steps-down": a 3-voter leader cut off
+        // from both peers for >= `check_quorum_interval_ticks` must
+        // step down. We never feed any FetchRequest so the peers'
+        // `last_fetch_time` stays at the `become_leader` baseline; once
+        // `logical_tick - last_fetch_time >= interval` (40 ticks here)
+        // the leader counts only itself (1) which is < quorum (2 of 3)
+        // and emits StepDown.
+        let mut node = RaftNode::new_with_seed(three_voter_check_quorum_config(), 7).unwrap();
+        force_leader(&mut node);
+        let interval = node.check_quorum_interval_ticks;
+        // Run exactly `interval` ticks — the check fires on the
+        // `interval`-th tick and produces a StepDown.
+        let actions = run_ticks(&mut node, interval);
+        assert_eq!(
+            node.role,
+            NodeRole::Follower,
+            "leader did not step down after {interval} ticks without peer contact"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::StepDown)),
+            "actions did not contain a StepDown: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn check_quorum_keeps_leader_when_healthy_3voter() {
+        // Scenario "check-quorum-healthy": with one peer regularly
+        // fetching, leader + 1 peer = 2 of 3 = quorum, no step-down.
+        let mut node = RaftNode::new_with_seed(three_voter_check_quorum_config(), 9).unwrap();
+        force_leader(&mut node);
+        let interval = node.check_quorum_interval_ticks;
+        // Tick `interval - 1` times, then synthesise a fetch from
+        // peer 2 (which stamps `peer.last_fetch_time = logical_tick`),
+        // then tick `interval` more times. The peer's recency window
+        // is reset on each fetch, so even at the `interval`-th tick
+        // the leader counts self + peer2 = 2 = quorum.
+        run_ticks(&mut node, interval - 1);
+        // Synthesise a Fetch from peer 2 at the current term.
+        let fetch_req = fetch_at(&node, NodeId(2), None);
+        let _ = node.handle_fetch_request(fetch_req);
+        // Now tick another full interval — the peer-2 stamp is
+        // recent, so check-quorum still sees a majority.
+        run_ticks(&mut node, interval);
+        assert_eq!(
+            node.role,
+            NodeRole::Leader,
+            "leader stepped down despite peer-2 fetching within the window"
+        );
+    }
+
+    #[test]
+    fn check_quorum_disabled_does_not_step_down() {
+        // With `enable_check_quorum = false` the partitioned-leader
+        // scenario above MUST NOT trigger any step-down — operators
+        // disabling the flag opt out of leader self-monitoring.
+        let mut cfg = three_voter_check_quorum_config();
+        cfg.enable_check_quorum = false;
+        let mut node = RaftNode::new_with_seed(cfg, 13).unwrap();
+        force_leader(&mut node);
+        // 10x the interval is plenty.
+        let interval = node.check_quorum_interval_ticks;
+        run_ticks(&mut node, interval.saturating_mul(10));
+        assert_eq!(
+            node.role,
+            NodeRole::Leader,
+            "leader stepped down despite enable_check_quorum=false"
+        );
+    }
+
+    #[test]
+    fn leader_lease_inactive_when_disabled() {
+        let mut cfg = three_voter_check_quorum_config();
+        cfg.enable_leader_lease = false;
+        let mut node = RaftNode::new_with_seed(cfg, 17).unwrap();
+        force_leader(&mut node);
+        assert!(
+            !node.has_active_lease(),
+            "lease must be inactive when enable_leader_lease=false"
+        );
+    }
+
+    #[test]
+    fn leader_lease_inactive_before_first_post_election_fetch() {
+        // Rubber-duck Blocker 1: `become_leader` pre-stamps
+        // `peer.last_fetch_time = logical_tick` as the Check-Quorum
+        // grace baseline. The lease check must NOT treat that as
+        // evidence of follower contact, so a freshly-elected leader
+        // with no real Fetch yet returns false.
+        let mut node = RaftNode::new_with_seed(three_voter_check_quorum_config(), 19).unwrap();
+        force_leader(&mut node);
+        assert!(
+            !node.has_active_lease(),
+            "lease must be inactive immediately after election with no post-election fetches"
+        );
+    }
+
+    #[test]
+    fn leader_lease_active_after_majority_recent_fetches() {
+        // After a fetch from one peer (3-voter cluster: leader + 1 peer
+        // = quorum) the lease is active.
+        let mut node = RaftNode::new_with_seed(three_voter_check_quorum_config(), 23).unwrap();
+        force_leader(&mut node);
+        // Advance the logical clock so the post-fetch stamp is
+        // strictly greater than `leader_started_tick`.
+        let _ = node.step(Input::Tick);
+        let fetch_req = fetch_at(&node, NodeId(2), None);
+        let _ = node.handle_fetch_request(fetch_req);
+        assert!(
+            node.has_active_lease(),
+            "lease must be active after a post-election fetch from one peer (leader + peer2 = quorum)"
+        );
+    }
+
+    #[test]
+    fn leader_lease_inactive_after_step_down() {
+        let mut node = RaftNode::new_with_seed(three_voter_check_quorum_config(), 29).unwrap();
+        force_leader(&mut node);
+        let _ = node.step(Input::Tick);
+        let fetch_req = fetch_at(&node, NodeId(2), None);
+        let _ = node.handle_fetch_request(fetch_req);
+        assert!(node.has_active_lease());
+        // Step down. The lease must immediately become inactive.
+        let current_term = node.hard_state.current_term;
+        let _ = node.become_follower(current_term, None);
+        assert!(
+            !node.has_active_lease(),
+            "lease must be inactive once we are no longer leader"
+        );
+    }
+
+    #[test]
+    fn leader_lease_active_for_single_voter_cluster() {
+        // Single-voter cluster: leader counts itself = 1 = quorum
+        // (1 of 1). Lease is always active while leading, even without
+        // any peer fetches (there are no peers).
+        let mut cfg = single_voter_config();
+        cfg.enable_leader_lease = true;
+        cfg.enable_check_quorum = true;
+        let mut node = RaftNode::new_with_seed(cfg, 31).unwrap();
+        // Single-voter cluster cascades to leader via pre_candidate.
+        let _ = node.become_pre_candidate();
+        assert_eq!(node.role, NodeRole::Leader);
+        assert!(
+            node.has_active_lease(),
+            "single-voter leader must hold the lease unconditionally while leading"
+        );
+    }
+
+    #[test]
+    fn higher_term_fetch_snapshot_request_is_rejected_in_node_engine() {
+        // Engine-level: handle_fetch_request already steps down on a
+        // higher leader_epoch (audit confirms). This test makes the
+        // contract explicit so a future refactor cannot regress it.
+        let mut node = RaftNode::new_with_seed(three_voter_check_quorum_config(), 37).unwrap();
+        force_leader(&mut node);
+        let leader_term_before = node.hard_state.current_term;
+        let fetch_req = fetch_at(&node, NodeId(2), Some(leader_term_before.0 + 1));
+        let _ = node.handle_fetch_request(fetch_req);
+        assert_eq!(
+            node.role,
+            NodeRole::Follower,
+            "leader did not step down on a higher-term FetchRequest"
+        );
+        assert!(
+            node.hard_state.current_term.0 > leader_term_before.0,
+            "term did not advance on a higher-term FetchRequest"
         );
     }
 }

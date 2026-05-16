@@ -28,14 +28,92 @@ pub trait LogStore: Send + Sync {
     fn term_at(&self, index: LogIndex) -> Result<Option<Term>>;
     /// Flush buffered writes to durable storage.
     fn flush(&mut self) -> Result<()>;
+    /// Remove all entries with `index <= through_index_inclusive` from
+    /// the log.
+    ///
+    /// Called by the driver after a snapshot has been durably persisted
+    /// to the [`SnapshotStore`] — the snapshot supersedes all entries at
+    /// or below `through_index_inclusive`, so the log can reclaim them.
+    ///
+    /// **Contract:**
+    /// - Idempotent: a no-op when no entries are at or below
+    ///   `through_index_inclusive` (e.g. an already-compacted log).
+    /// - After the call returns, `get(idx)`, `get_range(.., idx + 1)`,
+    ///   and `term_at(idx)` MUST return `None` for every
+    ///   `idx <= through_index_inclusive`.
+    /// - The purge MUST be restart-safe: any durable state that would
+    ///   otherwise resurrect a compacted entry on replay (e.g. WAL
+    ///   segment frames) must be either deleted OR shadowed by a
+    ///   persisted low-watermark marker.
+    /// - Implementations MAY retain physical bytes (segments, WAL
+    ///   frames) that span the purge boundary; only the *logical view*
+    ///   returned by reads must respect the cut.
+    ///
+    /// Required so that the driver's
+    /// `Action::TruncateLog(PrefixThroughInclusive)` arm can rely on
+    /// every concrete `LogStore` actually reclaiming the prefix rather
+    /// than silently ignoring the request — see Stage 5.3 snapshot
+    /// coordination in `implementation-plan.md`.
+    fn purge_prefix(&mut self, through_index_inclusive: LogIndex) -> Result<()>;
 }
 
-/// Persistent hard state (term + vote).
+/// Persistent hard state (term + vote + commit_index) plus the
+/// Stage 7.2 static voter set bootstrap.
+///
+/// **Stage 7.2 extension:** the canonical `quorum-state` file now
+/// carries TWO top-level pieces of durable state — the
+/// [`HardState`] (`current_term` + `voted_for` from Stage 1.2/3.3,
+/// PLUS the Stage 7.2 iter-3 `commit_index` field per the
+/// detailed requirement "`HardState` itself contains
+/// `current_term`, `voted_for`, and `commit_index` per
+/// Stage 2.2"), and the static
+/// [`VoterSet`](crate::types::VoterSet) initialised at first boot
+/// from `ClusterConfig.voters`. Storing both in the same file
+/// (rather than a sibling file) preserves the single atomic
+/// write-tmp + rename + dir-fsync protocol that gives the
+/// quorum-state its crash-safety guarantee: a partial update can
+/// never leave the voter set live without the hard state (or
+/// vice versa).
+///
+/// Each implementor MUST honour the "preserve the other field"
+/// contract: `persist(hard_state)` MUST keep any previously
+/// persisted voter set on disk, and `persist_voter_set(vs)` MUST
+/// keep any previously persisted hard state. See
+/// `xraft-storage/src/hard_state.rs::FileHardStateStore` for the
+/// reference combined-write protocol.
 pub trait HardStateStore: Send + Sync {
-    /// Persist the hard state to durable storage.
+    /// Persist the hard state to durable storage. MUST preserve any
+    /// voter set previously written via
+    /// [`persist_voter_set`](HardStateStore::persist_voter_set).
     fn persist(&mut self, state: &HardState) -> Result<()>;
     /// Load the most recently persisted hard state.
     fn load(&self) -> Result<Option<HardState>>;
+    /// Stage 7.2 ΓÇö persist the static voter set to durable storage.
+    ///
+    /// Called once at cluster bootstrap by the server-assembly path
+    /// (`xraft-server::Server::start_with_state_machine`) after the
+    /// engine has been constructed and `load_voter_set` returned
+    /// `None`. MUST preserve any [`HardState`] previously written
+    /// via [`persist`](HardStateStore::persist) so that a crash
+    /// between the two writes never loses the term/vote evidence
+    /// the engine needs for Raft safety.
+    ///
+    /// For v1 the voter set is **immutable** after first bootstrap
+    /// (per `tech-spec.md` §2.7 and `e2e-scenarios.md` Feature 12 ΓÇö
+    /// dynamic membership is out of scope for v1 and deferred to a
+    /// future story entirely). Re-calling `persist_voter_set` with
+    /// a different voter set is legal at the storage layer (it just
+    /// rewrites the file), but the server-bootstrap path rejects
+    /// any membership-identity drift with `XRaftError::Config`
+    /// before reaching this method.
+    fn persist_voter_set(&mut self, voter_set: &crate::types::VoterSet) -> Result<()>;
+    /// Stage 7.2 ΓÇö load the most recently persisted voter set.
+    ///
+    /// Returns `Ok(None)` on first boot (no `quorum-state` file
+    /// yet) AND on legacy files written by Stage 1.2-7.1 code that
+    /// predates the voter-set field. Either way the caller treats
+    /// `None` as "bootstrap from config and persist".
+    fn load_voter_set(&self) -> Result<Option<crate::types::VoterSet>>;
 }
 
 /// A single chunk yielded by a snapshot reader.

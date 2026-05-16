@@ -670,6 +670,9 @@ cluster_id = "xraft-cluster-001"
 listen_addr = "0.0.0.0:6001"
 peers = ["node0.example.com:6000", "node2.example.com:6002"]
 
+# Admin HTTP listen (CLI `--admin-listen` overrides; optional — default 127.0.0.1:6660).
+admin_listen_addr = "127.0.0.1:6660"
+
 # Timing (all have defaults if omitted)
 election_timeout_min_ms = 150
 election_timeout_max_ms = 300
@@ -682,6 +685,28 @@ max_log_entries_before_compaction = 100000
 
 # Storage
 data_dir = "/var/lib/xraft"
+
+# Voter set — REQUIRED (must be non-empty AND must include `node_id`).
+# A single-voter cluster (the bootstrap / development case) MUST still
+# declare itself here; an empty `voters` is rejected at startup because
+# the engine has no quorum to elect from.
+[[voters]]
+node_id = 1
+directory_id = "00000000-0000-0000-0000-000000000001"
+host = "node1.example.com"
+port = 6001
+
+[[voters]]
+node_id = 0
+directory_id = "00000000-0000-0000-0000-000000000000"
+host = "node0.example.com"
+port = 6000
+
+[[voters]]
+node_id = 2
+directory_id = "00000000-0000-0000-0000-000000000002"
+host = "node2.example.com"
+port = 6002
 ```
 
 Environment variable overrides (applied after TOML parsing, before validation):
