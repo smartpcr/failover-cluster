@@ -1662,8 +1662,19 @@ impl RaftNode {
     ///    has validated the follower's `last_fetched_epoch` against the
     ///    leader's log ΓÇö otherwise a divergent follower could inflate
     ///    quorum (rubber-duck blocking issue #1).
-    /// 6. Emit an [`Action::ServeFetch`] carrying the envelope fields so
-    ///    the driver can construct and dispatch the [`FetchResponse`].
+    /// 6. **Stage 5.3 snapshot redirect** (implementation-plan §5.2
+    ///    step 4): if `last_snapshot_meta.is_some()` and
+    ///    `req.fetch_offset <= snap.last_included_index` and the
+    ///    snapshot has a non-empty canonical id, emit an
+    ///    [`Action::RedirectToSnapshot`] instead of
+    ///    [`Action::ServeFetch`]. The follower's offset falls inside
+    ///    the compacted prefix; the only correct response is to send
+    ///    it through `FetchSnapshot` to install the snapshot before
+    ///    resuming log replication. Mutually exclusive with `ServeFetch`
+    ///    for this request.
+    /// 7. Otherwise emit an [`Action::ServeFetch`] carrying the envelope
+    ///    fields so the driver can construct and dispatch the
+    ///    [`FetchResponse`].
     #[tracing::instrument(level = "debug", skip(self), fields(node_id = %self.id, current_term = %self.hard_state.current_term))]
     pub fn handle_fetch_request(&mut self, req: FetchRequest) -> Vec<Action> {
         if req.cluster_id != self.config.cluster_id {
@@ -1752,6 +1763,65 @@ impl RaftNode {
         self.last_leader_contact_tick = Some(self.logical_tick);
 
         let high_watermark = self.commit_index;
+
+        // Stage 5.3 (implementation-plan §5.2 step 4) — leader-side
+        // snapshot redirect, emitted by the engine. When the follower's
+        // `fetch_offset` falls at or below the compacted prefix
+        // (`fetch_offset <= last_snapshot_meta.last_included_index`),
+        // the entries in that range have been logically compacted out
+        // of the log and the follower must catch up via a
+        // `FetchSnapshot` stream rather than waiting for entries the
+        // leader no longer holds. Emit `Action::RedirectToSnapshot` so
+        // the driver can materialise a `FetchResponse` carrying a
+        // `SnapshotRedirect` envelope (mutually exclusive with
+        // `entries` and `diverging_epoch`).
+        //
+        // The redirect requires a canonical, non-empty `snapshot_id`
+        // because the follower echoes it back on
+        // `FetchSnapshotRequest::snapshot_id` to identify which
+        // snapshot to pull. An empty id (e.g. test snapshots written
+        // without `SnapshotStore::save_snapshot` normalisation) cannot
+        // be the target of a useful redirect — fall through to
+        // `ServeFetch` and let the driver produce a divergence /
+        // empty-entries response. A `warn!` records the misconfiguration
+        // so operators can spot it in logs.
+        if let Some(snap) = self.last_snapshot_meta.as_ref()
+            && req.fetch_offset.0 <= snap.last_included_index.0
+        {
+            if !snap.id.is_empty() {
+                tracing::debug!(
+                    node_id = %self.id,
+                    replica = %req.replica_id,
+                    fetch_offset = %req.fetch_offset,
+                    snapshot_id = %snap.id,
+                    last_included_index = %snap.last_included_index,
+                    "follower offset is at/below compacted prefix; emitting Action::RedirectToSnapshot"
+                );
+                return vec![Action::RedirectToSnapshot {
+                    to: req.replica_id,
+                    cluster_id: self.config.cluster_id.clone(),
+                    leader_epoch: self.hard_state.current_term.0,
+                    leader_id: self.id,
+                    high_watermark,
+                    snapshot_metadata: snap.clone(),
+                }];
+            }
+            // Redirect predicate matched but the snapshot has no
+            // canonical id. This should not happen for snapshots written
+            // by `SnapshotStore::save_snapshot` (it normalises ids), but
+            // direct-driver tests or legacy on-disk snapshots could
+            // produce this state. Log loudly and fall through to
+            // `ServeFetch` so the driver can at least surface a
+            // divergence signal.
+            tracing::warn!(
+                node_id = %self.id,
+                replica = %req.replica_id,
+                fetch_offset = %req.fetch_offset,
+                last_included_index = %snap.last_included_index,
+                "snapshot redirect predicate matched but snapshot_id is empty; falling through to ServeFetch"
+            );
+        }
+
         vec![Action::ServeFetch {
             to: req.replica_id,
             cluster_id: self.config.cluster_id.clone(),
@@ -5556,6 +5626,313 @@ port = 6000
         assert_eq!(
             node.last_log_term, baseline_last_term,
             "redirect must not advance last_log_term via the smuggled entries",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 5.3 (impl-plan §5.2 step 4) — leader-side snapshot redirect
+    // emitted by the engine via `Action::RedirectToSnapshot`.
+    //
+    // The leader's `handle_fetch_request` must detect when a follower's
+    // `fetch_offset` falls at or below the compacted prefix anchored
+    // by `last_snapshot_meta` and emit `Action::RedirectToSnapshot`
+    // INSTEAD of `Action::ServeFetch` — keeping the redirect decision
+    // I/O-free inside the engine.
+    // -----------------------------------------------------------------
+
+    /// Helper: drive `node` (a fresh three-voter config) into the
+    /// Leader role at term 1 and install `meta` as the leader's
+    /// `last_snapshot_meta` so the redirect predicate can fire.
+    fn drive_leader_with_snapshot_anchor(node: &mut RaftNode, meta: SnapshotMeta) {
+        drive_three_voter_to_leader(node);
+        assert_eq!(node.role, NodeRole::Leader);
+        node.last_snapshot_meta = Some(meta);
+    }
+
+    /// Scenario: install-snapshot-on-slow-follower (engine half).
+    ///
+    /// Given a leader anchored at a snapshot covering `[..=50]`,
+    /// when a follower with `fetch_offset = 10` sends a `FetchRequest`,
+    /// then `handle_fetch_request` MUST emit exactly one
+    /// `Action::RedirectToSnapshot` carrying the snapshot's canonical
+    /// id, indices, and the leader's envelope. No `Action::ServeFetch`
+    /// must be emitted.
+    #[test]
+    fn handle_fetch_request_emits_redirect_when_offset_in_compacted_prefix() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5301).unwrap();
+        // Snapshot covering log entries 1..=50 at term 3.
+        let snap = SnapshotMeta {
+            id: "snap-stage-5.3-redirect".into(),
+            last_included_index: LogIndex(50),
+            last_included_term: Term(3),
+            voter_set: node.voter_set.clone(),
+            size_bytes: Some(1_048_576),
+            checksum: None,
+        };
+        drive_leader_with_snapshot_anchor(&mut node, snap.clone());
+
+        let leader_term = node.current_term().0;
+        let req = build_fetch_request_from(NodeId(2), 10, 0, leader_term);
+        let actions = node.step(Input::FetchRequest(req));
+
+        assert_eq!(
+            actions.len(),
+            1,
+            "exactly one action expected on redirect; got {actions:?}",
+        );
+        match &actions[0] {
+            Action::RedirectToSnapshot {
+                to,
+                cluster_id,
+                leader_epoch,
+                leader_id,
+                high_watermark,
+                snapshot_metadata,
+            } => {
+                assert_eq!(*to, NodeId(2), "redirect must target the asking follower");
+                assert_eq!(cluster_id, "test");
+                assert_eq!(*leader_epoch, leader_term);
+                assert_eq!(*leader_id, node.id);
+                assert_eq!(*high_watermark, node.commit_index);
+                assert_eq!(snapshot_metadata.id, snap.id);
+                assert_eq!(
+                    snapshot_metadata.last_included_index,
+                    snap.last_included_index
+                );
+                assert_eq!(
+                    snapshot_metadata.last_included_term,
+                    snap.last_included_term
+                );
+            }
+            other => panic!("expected Action::RedirectToSnapshot, got {other:?}"),
+        }
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ServeFetch { .. })),
+            "ServeFetch must NOT be emitted alongside a redirect (mutual exclusivity)",
+        );
+    }
+
+    /// Boundary case: `fetch_offset == last_included_index` is still
+    /// inside the compacted prefix (the follower wants the snapshot's
+    /// tail entry which has been compacted), so the redirect must fire.
+    #[test]
+    fn handle_fetch_request_redirect_with_offset_equal_last_included_index() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5302).unwrap();
+        let snap = SnapshotMeta {
+            id: "snap-boundary".into(),
+            last_included_index: LogIndex(50),
+            last_included_term: Term(4),
+            voter_set: node.voter_set.clone(),
+            size_bytes: Some(64),
+            checksum: None,
+        };
+        drive_leader_with_snapshot_anchor(&mut node, snap);
+        let leader_term = node.current_term().0;
+
+        let req = build_fetch_request_from(NodeId(2), 50, 4, leader_term);
+        let actions = node.step(Input::FetchRequest(req));
+
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], Action::RedirectToSnapshot { .. }),
+            "fetch_offset == last_included_index must redirect (the snapshot's tail entry has been compacted); got {:?}",
+            actions[0],
+        );
+    }
+
+    /// Boundary case: `fetch_offset == last_included_index + 1` lies
+    /// just past the compacted prefix, so the engine must NOT redirect.
+    /// The follower is asking for the next entry beyond the snapshot's
+    /// tail — the standard resumption case, handled by `ServeFetch`.
+    #[test]
+    fn handle_fetch_request_does_not_redirect_when_offset_past_snapshot() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5303).unwrap();
+        let snap = SnapshotMeta {
+            id: "snap-resume".into(),
+            last_included_index: LogIndex(50),
+            last_included_term: Term(4),
+            voter_set: node.voter_set.clone(),
+            size_bytes: Some(64),
+            checksum: None,
+        };
+        drive_leader_with_snapshot_anchor(&mut node, snap);
+        let leader_term = node.current_term().0;
+
+        // Lift the engine's last_log_index past the snapshot so the
+        // ServeFetch path is realistic (the leader actually has entry
+        // 51 to potentially serve).
+        node.last_log_index = LogIndex(60);
+        node.last_log_term = Term(4);
+
+        let req = build_fetch_request_from(NodeId(2), 51, 4, leader_term);
+        let actions = node.step(Input::FetchRequest(req));
+
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], Action::ServeFetch { .. }),
+            "fetch_offset > last_included_index must use ServeFetch, not redirect; got {:?}",
+            actions[0],
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::RedirectToSnapshot { .. })),
+            "RedirectToSnapshot must NOT be emitted past the snapshot tail",
+        );
+    }
+
+    /// Even at `fetch_offset == last_included_index + 1` with a WRONG
+    /// `last_fetched_epoch`, the engine still emits `ServeFetch` —
+    /// divergence detection lives in the driver (it consults the log
+    /// store + snapshot anchor to surface the divergence signal). The
+    /// engine MUST NOT short-circuit to a redirect here because the
+    /// follower's fetch tip is past the compacted prefix. This regression
+    /// test guards against accidentally widening the redirect predicate
+    /// to consume divergence cases that belong on the `ServeFetch` path.
+    #[test]
+    fn handle_fetch_request_serves_fetch_when_offset_after_snapshot_tail_even_with_wrong_term() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5304).unwrap();
+        let snap = SnapshotMeta {
+            id: "snap-wrongterm".into(),
+            last_included_index: LogIndex(50),
+            last_included_term: Term(4),
+            voter_set: node.voter_set.clone(),
+            size_bytes: Some(64),
+            checksum: None,
+        };
+        drive_leader_with_snapshot_anchor(&mut node, snap);
+        let leader_term = node.current_term().0;
+        node.last_log_index = LogIndex(60);
+        node.last_log_term = Term(4);
+
+        // last_fetched_epoch = 99 — does not match the snapshot's
+        // last_included_term=4. The engine still emits ServeFetch (the
+        // driver will surface the divergence via DivergingEpoch).
+        let req = build_fetch_request_from(NodeId(2), 51, 99, leader_term);
+        let actions = node.step(Input::FetchRequest(req));
+
+        assert!(
+            matches!(&actions[0], Action::ServeFetch { .. }),
+            "ServeFetch must be emitted so the driver can surface divergence; got {:?}",
+            actions[0],
+        );
+    }
+
+    /// When the snapshot's canonical id is empty (e.g. legacy on-disk
+    /// metadata, or a test driver that fed `SnapshotComplete` with
+    /// `id = String::new()` directly), the engine MUST NOT emit a
+    /// redirect — the follower cannot meaningfully echo an empty
+    /// `snapshot_id` on `FetchSnapshotRequest`. Fall through to
+    /// `ServeFetch` so the driver can at least surface a divergence
+    /// signal. A `warn!` records the misconfiguration; the test only
+    /// asserts the action emission.
+    #[test]
+    fn handle_fetch_request_fallthrough_when_snapshot_id_empty() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5305).unwrap();
+        let snap = SnapshotMeta {
+            id: String::new(),
+            last_included_index: LogIndex(50),
+            last_included_term: Term(4),
+            voter_set: node.voter_set.clone(),
+            size_bytes: Some(64),
+            checksum: None,
+        };
+        drive_leader_with_snapshot_anchor(&mut node, snap);
+        let leader_term = node.current_term().0;
+
+        let req = build_fetch_request_from(NodeId(2), 10, 0, leader_term);
+        let actions = node.step(Input::FetchRequest(req));
+
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], Action::ServeFetch { .. }),
+            "empty snapshot_id must fall through to ServeFetch (no usable redirect target); got {:?}",
+            actions[0],
+        );
+    }
+
+    /// Sanity: when no snapshot has ever been taken (`last_snapshot_meta
+    /// is None`), the engine always emits `ServeFetch` and never a
+    /// redirect, regardless of how small `fetch_offset` is.
+    #[test]
+    fn handle_fetch_request_serves_fetch_when_no_snapshot_anchor() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5306).unwrap();
+        drive_three_voter_to_leader(&mut node);
+        assert!(node.last_snapshot_meta.is_none());
+
+        let leader_term = node.current_term().0;
+        let req = build_fetch_request_from(NodeId(2), 1, 0, leader_term);
+        let actions = node.step(Input::FetchRequest(req));
+
+        assert!(
+            matches!(&actions[0], Action::ServeFetch { .. }),
+            "no snapshot anchor must always use ServeFetch; got {:?}",
+            actions[0],
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::RedirectToSnapshot { .. })),
+        );
+    }
+
+    /// Liveness: the redirect path still updates `peer.last_fetch_time`
+    /// and `last_leader_contact_tick` — a redirect-bound Fetch is
+    /// evidence the follower is alive, which Check-Quorum (Stage 6.1)
+    /// will rely on. Per-peer replication progress
+    /// (`peer.last_fetch_offset`) must NOT advance (that requires the
+    /// driver's `FetchRequestAcked` after divergence validation, which
+    /// is not fed on a redirect — the redirect proves the follower is
+    /// BEHIND the compacted prefix).
+    #[test]
+    fn handle_fetch_request_redirect_updates_liveness_not_progress() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 5307).unwrap();
+        let snap = SnapshotMeta {
+            id: "snap-live".into(),
+            last_included_index: LogIndex(50),
+            last_included_term: Term(3),
+            voter_set: node.voter_set.clone(),
+            size_bytes: Some(64),
+            checksum: None,
+        };
+        drive_leader_with_snapshot_anchor(&mut node, snap);
+        let leader_term = node.current_term().0;
+
+        // Drive a few ticks so logical_tick is non-zero — easier to
+        // distinguish a stamped liveness field from the zero default.
+        for _ in 0..3 {
+            node.step(Input::Tick);
+        }
+        let tick_before = node.logical_tick;
+        // Sanity: peer 2's last_fetch_offset starts at zero.
+        let pre_offset = node
+            .peers
+            .get(&NodeId(2))
+            .map(|p| p.last_fetch_offset)
+            .unwrap_or(LogIndex(0));
+        assert_eq!(pre_offset, LogIndex(0));
+
+        let req = build_fetch_request_from(NodeId(2), 5, 0, leader_term);
+        let _ = node.step(Input::FetchRequest(req));
+
+        // Liveness fields stamped at the request-handling tick.
+        let peer = node.peers.get(&NodeId(2)).expect("peer 2 must be tracked");
+        assert_eq!(
+            peer.last_fetch_time, tick_before,
+            "peer.last_fetch_time must be stamped on a redirect-bound Fetch"
+        );
+        assert_eq!(
+            node.last_leader_contact_tick,
+            Some(tick_before),
+            "self-contact must be stamped on a redirect-bound Fetch (Check-Quorum input)"
+        );
+        // Replication progress unchanged — the redirect is NOT proof
+        // the follower has any entry.
+        assert_eq!(
+            peer.last_fetch_offset, pre_offset,
+            "peer.last_fetch_offset must NOT advance on a redirect (the follower is BEHIND the compacted prefix)",
         );
     }
 }

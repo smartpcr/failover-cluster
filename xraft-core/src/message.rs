@@ -188,6 +188,48 @@ pub enum Action {
         fetch_offset: LogIndex,
         last_fetched_epoch: Term,
     },
+    /// Stage 5.3 (implementation-plan §5.2 step 4) — leader-side snapshot
+    /// redirect emitted by the engine.
+    ///
+    /// `RaftNode::handle_fetch_request` emits this action — instead of
+    /// [`Action::ServeFetch`] — when it detects that the follower's
+    /// `fetch_offset` is at or below the compacted prefix anchored by
+    /// `last_snapshot_meta` (i.e. the snapshot covers entries up to
+    /// `snapshot_metadata.last_included_index` and the follower is asking
+    /// for an index inside that range). The driver materialises an empty
+    /// [`FetchResponse`] carrying
+    /// [`snapshot_redirect: Some(SnapshotRedirect{…})`](FetchResponse::snapshot_redirect)
+    /// and dispatches it to `to`; the follower then issues a
+    /// [`FetchSnapshotRequest`] via the redirect handler in
+    /// [`RaftNode::handle_fetch_response`].
+    ///
+    /// **Mutual exclusivity with `Action::ServeFetch`**: for a single
+    /// inbound `FetchRequest` the engine emits exactly one of the two
+    /// actions, never both. `RedirectToSnapshot` carries no
+    /// `fetch_offset` / `last_fetched_epoch` because the follower is
+    /// behind the compacted prefix — the redirect itself supersedes any
+    /// log-tail comparison.
+    ///
+    /// **No `FetchRequestAcked` follow-up**: the redirect does NOT prove
+    /// the follower has replicated any entry. In fact the opposite —
+    /// the follower is BEHIND the compacted prefix. Driver-side
+    /// peer-progress / high-watermark advancement must not run here
+    /// (this is asserted by
+    /// `redirect_to_snapshot_does_not_advance_peer_progress` in
+    /// `xraft-server`).
+    ///
+    /// All envelope fields are captured at action-emit time, matching
+    /// the [`Action::ServeFetch`] contract so the driver does not race
+    /// against subsequent node mutations (e.g. a step-down between
+    /// `step()` and dispatch).
+    RedirectToSnapshot {
+        to: NodeId,
+        cluster_id: String,
+        leader_epoch: u64,
+        leader_id: NodeId,
+        high_watermark: LogIndex,
+        snapshot_metadata: SnapshotMeta,
+    },
     /// Instruct the driver to mutate its durable log.
     ///
     /// Two truncation modes are supported (see [`LogTruncation`]):
