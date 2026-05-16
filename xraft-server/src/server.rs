@@ -43,7 +43,7 @@ use xraft_storage::{FileHardStateStore, FileLogStore, FileSnapshotStore};
 
 use xraft_client::pool::ConnectionPool;
 
-use xraft_transport::grpc::{GrpcTransport, GrpcTransportConfig};
+use xraft_transport::grpc::{GrpcTransport, GrpcTransportConfig, bind_grpc_listener};
 
 use crate::admin::{AdminConfig, AdminServer};
 use crate::driver::{Driver, DriverChannels, DriverConfig, DriverHandle, TriggeredSnapshotInfo};
@@ -354,13 +354,72 @@ pub struct Server;
 impl Server {
     /// Start the server with the default [`NoOpStateMachine`].
     pub async fn start(cfg: ServerConfig) -> XResult<ServerHandle> {
-        Self::start_with_state_machine(cfg, NoOpStateMachine).await
+        Self::start_inner(cfg, NoOpStateMachine, None).await
+    }
+
+    /// Start the server with the default [`NoOpStateMachine`] over
+    /// a caller-supplied **already-bound** `std::net::TcpListener`
+    /// for the gRPC port.
+    ///
+    /// Mirrors [`xraft_transport::grpc::GrpcTransport::start_server_with_listener`]
+    /// one level up the stack so callers (test harnesses,
+    /// systemd-socket-activated operator binaries) can bind the
+    /// listener separately and hand it in. The supplied listener
+    /// MUST correspond to `cfg.cluster.listen_addr`: when
+    /// `cluster.listen_addr` carries a non-zero concrete port, the
+    /// listener's `local_addr().port()` must match it; otherwise
+    /// `Server::start` returns a typed `XRaftError::Config` rather
+    /// than silently serving on a port the rest of the cluster
+    /// cannot reach. A `:0` ephemeral port in the config string is
+    /// accepted unconditionally (the listener's bound port becomes
+    /// the effective one).
+    ///
+    /// Eliminates the TOCTOU race a "pick a port, drop the
+    /// listener, then ask `Server::start` to re-bind that port"
+    /// pattern is exposed to under parallel test load: the listener
+    /// is bound exactly once and never released between the
+    /// allocation and serve steps.
+    pub async fn start_with_listener(
+        cfg: ServerConfig,
+        grpc_listener: std::net::TcpListener,
+    ) -> XResult<ServerHandle> {
+        Self::start_inner(cfg, NoOpStateMachine, Some(grpc_listener)).await
     }
 
     /// Start the server with a caller-supplied state machine.
     pub async fn start_with_state_machine<SM>(
         cfg: ServerConfig,
+        state_machine: SM,
+    ) -> XResult<ServerHandle>
+    where
+        SM: StateMachine + Send + Sync + 'static,
+    {
+        Self::start_inner(cfg, state_machine, None).await
+    }
+
+    /// Start the server with a caller-supplied state machine AND a
+    /// pre-bound gRPC `TcpListener`. See [`Server::start_with_listener`]
+    /// for the listener-passthrough contract.
+    pub async fn start_with_state_machine_and_listener<SM>(
+        cfg: ServerConfig,
+        state_machine: SM,
+        grpc_listener: std::net::TcpListener,
+    ) -> XResult<ServerHandle>
+    where
+        SM: StateMachine + Send + Sync + 'static,
+    {
+        Self::start_inner(cfg, state_machine, Some(grpc_listener)).await
+    }
+
+    /// Shared body for all four public start entry points. The
+    /// `grpc_listener` parameter selects between the legacy
+    /// "bind synchronously from `cluster.listen_addr`" path
+    /// (`None`) and the new "consume a caller-supplied pre-bound
+    /// listener" path (`Some`).
+    async fn start_inner<SM>(
+        cfg: ServerConfig,
         mut state_machine: SM,
+        grpc_listener: Option<std::net::TcpListener>,
     ) -> XResult<ServerHandle>
     where
         SM: StateMachine + Send + Sync + 'static,
@@ -759,18 +818,57 @@ impl Server {
         //   - Captures the ACTUAL local_addr so an ephemeral `:0`
         //     request surfaces the real bound port to the operator
         //     and tests.
-        let listen_sock: std::net::SocketAddr = cluster.listen_addr.parse().map_err(|e| {
-            XRaftError::Config(format!(
-                "invalid listen_addr '{}': {e}",
-                cluster.listen_addr
-            ))
-        })?;
-        let std_listener = std::net::TcpListener::bind(listen_sock).map_err(|e| {
-            XRaftError::Transport(format!("bind gRPC listener {}: {e}", cluster.listen_addr))
-        })?;
-        std_listener
-            .set_nonblocking(true)
-            .map_err(|e| XRaftError::Transport(format!("set_nonblocking on gRPC listener: {e}")))?;
+        //
+        // Binding goes through the shared
+        // [`xraft_transport::grpc::bind_grpc_listener`] helper so that
+        // hostname-form `listen_addr` values (e.g. `"localhost:6000"`)
+        // resolve via `ToSocketAddrs` and bind correctly here too —
+        // closing the iter-2 evaluator's finding that the production
+        // bootstrap rejected hostnames even though the transport-only
+        // entry point accepted them. The previous
+        // `cluster.listen_addr.parse::<SocketAddr>()` step rejected
+        // hostnames before any DNS resolution was attempted.
+        //
+        // When the caller supplied a pre-bound listener (via
+        // [`Server::start_with_listener`] / the
+        // `_and_listener` variant), skip the bind entirely and adopt
+        // it. We still validate the listener's local port against any
+        // non-zero concrete port in `cluster.listen_addr` so a
+        // misconfigured caller surfaces a typed `Config` error rather
+        // than serving on a port the peers cannot reach. A `:0`
+        // ephemeral port in the config string is accepted
+        // unconditionally — the listener's actually-bound port is
+        // logged below and surfaces via `ServerHandle::grpc_listen_addr`.
+        let std_listener = if let Some(l) = grpc_listener {
+            let bound_port = l
+                .local_addr()
+                .map_err(|e| {
+                    XRaftError::Transport(format!("provided gRPC listener local_addr: {e}"))
+                })?
+                .port();
+            let cfg_port = cluster
+                .listen_addr
+                .rsplit(':')
+                .next()
+                .and_then(|s| s.parse::<u16>().ok());
+            if let Some(p) = cfg_port
+                && p != 0
+                && p != bound_port
+            {
+                return Err(XRaftError::Config(format!(
+                    "pre-bound gRPC listener port ({bound_port}) does not match the port \
+                     parsed from cluster.listen_addr ('{}', port {p}); the listener and \
+                     the cluster config must agree so peers reach the same port",
+                    cluster.listen_addr
+                )));
+            }
+            l.set_nonblocking(true).map_err(|e| {
+                XRaftError::Transport(format!("set_nonblocking on pre-bound gRPC listener: {e}"))
+            })?;
+            l
+        } else {
+            bind_grpc_listener(&cluster.listen_addr)?
+        };
         let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(|e| XRaftError::Transport(format!("tokio TcpListener::from_std: {e}")))?;
         let grpc_listen = tokio_listener
@@ -950,6 +1048,22 @@ mod tests {
         port
     }
 
+    fn pick_port_via_hostname() -> u16 {
+        // Pick the candidate port via the SAME hostname-resolution
+        // path the server will exercise (`localhost:0`). On IPv6-
+        // preferring systems `localhost` may resolve `::1` first, in
+        // which case a 127.0.0.1-picked port would not be proven free
+        // on the family the server later binds. Picking through
+        // `localhost:0` keeps the address-family choice consistent
+        // and eliminates the v4/v6 flake the iter-2 evaluator
+        // flagged on the transport-only hostname test.
+        let listener =
+            std::net::TcpListener::bind("localhost:0").expect("bind ephemeral localhost");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
     fn single_voter_config(data_dir: PathBuf) -> ClusterConfig {
         let grpc_port = pick_port();
         ClusterConfig {
@@ -1100,6 +1214,98 @@ mod tests {
         );
 
         drop(admin_blocker);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_start_accepts_hostname_listen_addr() {
+        // Iter-2 evaluator finding: even after `GrpcTransport
+        // ::start_server` learned to accept hostname-form
+        // `listen_addr`, the production bootstrap path
+        // `Server::start` still parsed `listen_addr` as
+        // `std::net::SocketAddr` before binding, so a perfectly
+        // valid `listen_addr = "localhost:{port}"` rejected at
+        // startup. This test drives the FULL production bootstrap
+        // (storage + engine + transport + driver + admin) against a
+        // hostname-form `listen_addr` and asserts the server boots
+        // successfully and reports a non-zero gRPC listen address.
+        //
+        // Probing through hostname-resolution-consistent
+        // `pick_port_via_hostname` so the port is provably free on
+        // whichever address family (`::1` vs `127.0.0.1`) the
+        // resolver hands us — preventing a v4/v6 mismatch flake.
+        let tmp = TempDir::new().unwrap();
+        let grpc_port = pick_port_via_hostname();
+        let cluster = ClusterConfig {
+            node_id: xraft_core::types::NodeId(1),
+            cluster_id: "test-cluster".into(),
+            listen_addr: format!("localhost:{grpc_port}"),
+            peers: vec![],
+            voters: vec![VoterConfig {
+                node_id: 1,
+                directory_id: uuid::Uuid::new_v4().to_string(),
+                host: "localhost".into(),
+                port: grpc_port,
+            }],
+            election_timeout_min_ms: 150,
+            election_timeout_max_ms: 300,
+            fetch_interval_ms: 50,
+            tick_interval_ms: 10,
+            snapshot_interval: 10_000,
+            max_log_entries_before_compaction: 100_000,
+            data_dir: tmp.path().to_path_buf(),
+            snapshot_retention_count: 3,
+            tls_enabled: false,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_ca_path: None,
+            tls_domain_name: None,
+            connect_timeout_ms: 5_000,
+            rpc_timeout_ms: 30_000,
+            max_rpc_retries: 3,
+            retry_initial_backoff_ms: 100,
+            retry_max_backoff_ms: 5_000,
+            max_message_size: 64 * 1024 * 1024,
+            observers: vec![],
+            enable_check_quorum: true,
+            enable_leader_lease: false,
+            check_quorum_interval_ms: None,
+        };
+        let cfg = ServerConfig {
+            cluster,
+            admin_listen_addr: Some("127.0.0.1:0".into()),
+            driver_config: None,
+        };
+
+        // The actual proof: `Server::start` MUST succeed end-to-end
+        // with the hostname-form `listen_addr`. If the iter-2
+        // `parse::<SocketAddr>` step is still in place this fails
+        // with `XRaftError::Config("invalid listen_addr …")`.
+        let handle = Server::start(cfg)
+            .await
+            .expect("Server::start MUST accept hostname-form listen_addr");
+
+        // Sanity-check the bootstrap captured a real bound port.
+        assert!(
+            handle.grpc_listen_addr.contains(':'),
+            "grpc_listen_addr must include a port: {}",
+            handle.grpc_listen_addr
+        );
+        let bound_port: u16 = handle
+            .grpc_listen_addr
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("grpc_listen_addr ends in :<port>");
+        assert_eq!(
+            bound_port, grpc_port,
+            "Server must have bound the requested port via hostname resolution"
+        );
+
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), handle.join())
+            .await
+            .expect("graceful shutdown within 5s")
+            .expect("join ok");
     }
 
     /// Single-voter cluster: a node that is its own quorum elects

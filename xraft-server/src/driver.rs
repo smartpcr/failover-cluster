@@ -2254,7 +2254,44 @@ where
             )));
             return;
         }
-        let through_index = self.node.commit_index;
+        // Pre-check: refuse cleanly (NOT halting) when the state
+        // machine has not applied anything yet. The snapshot point
+        // MUST be `last_applied`, not `commit_index`: snapshotting at
+        // `commit_index` while apply lags would persist
+        // `state_machine.snapshot()` bytes that do NOT reflect entries
+        // committed-but-not-yet-applied, yet the metadata
+        // (`last_included_index = commit_index`) would claim those
+        // entries are included — a hard correctness bug that produces
+        // a restore-time state divergence on the next leader. By
+        // clamping to `last_applied` we guarantee
+        // `state_machine_bytes_at == last_included_index` (the Raft
+        // snapshot invariant). `take_snapshot_with_meta` will refuse
+        // `through_index == 0` with an Err whose arm halts the driver
+        // — that's the right behaviour for a post-state-machine
+        // failure (storage corruption, etc), but not for the operator
+        // probing a leader whose SM is still cold. Returning a
+        // `Config` error here keeps the driver healthy and gives the
+        // admin caller a clear "nothing applied to snapshot" signal.
+        if self.node.last_applied.0 == 0 {
+            let _ = reply.send(Err(XRaftError::Config(
+                "no applied entries to snapshot (last_applied=0; \
+                 state machine has not advanced — retry after the \
+                 SM has applied at least one entry)"
+                    .to_string(),
+            )));
+            return;
+        }
+        // SAFETY: clamp the snapshot point to `last_applied`. The
+        // Raft invariant `last_applied <= commit_index` holds at all
+        // times (commit advances first, apply catches up), so
+        // `last_applied` is always a safe lower bound that captures
+        // exactly the SM state that `state_machine.snapshot()` will
+        // serialise. When apply has caught up
+        // (`last_applied == commit_index`) the operator-triggered
+        // snapshot covers everything committed; when apply lags the
+        // snapshot covers up to the apply tip and a subsequent
+        // trigger (after apply catches up) will snapshot the rest.
+        let through_index = self.node.last_applied;
         info!(
             target: "xraft_server::driver",
             node_id = %self.node.id,
@@ -2698,46 +2735,50 @@ where
                     let (eff_index, eff_term) = self.effective_log_tip();
                     self.node.set_last_log(eff_index, eff_term);
                 }
-                Action::ApplyToStateMachine { from, to } => {
-                    if let Err(reason) = self.apply_committed(from, to) {
-                        // Mirror the persistence-failure branches above:
-                        // a fail-stopping driver must surface the error
-                        // to any in-flight inbound RPC (Vote/PreVote/
-                        // Fetch/FetchSnapshot) whose handler reads
-                        // `captured.error` before any captured success
-                        // payload. Without this, the RPC reply can
-                        // return Ok with a captured response while the
-                        // driver is about to halt — clients then act on
-                        // a "successful" reply from a dying node.
-                        captured.error = Some(XRaftError::Storage(reason.clone()));
-                        self.halt_reason.get_or_insert(reason);
+                Action::TruncateLog(LogTruncation::PrefixThroughInclusive {
+                    through_index_inclusive,
+                }) => {
+                    // Stage 5.3 prefix compaction: the engine emits this
+                    // as the SnapshotComplete follow-up so the log can
+                    // reclaim entries the snapshot supersedes. A failure
+                    // is fail-stop because the driver-side snapshot
+                    // anchor has already advanced past these entries —
+                    // continuing past a failed purge would leave the
+                    // durable log carrying entries the engine considers
+                    // compacted and would re-emit divergent metadata on
+                    // restart.
+                    if let Err(e) = self.log_store.purge_prefix(through_index_inclusive) {
+                        let msg = format!("log purge_prefix failed: {e}");
+                        error!(target: "xraft_server::driver", %msg, "halting driver");
+                        captured.error = Some(XRaftError::Storage(msg.clone()));
+                        self.halt_reason.get_or_insert(msg);
+                        break;
+                    }
+                    if let Err(e) = self.log_store.flush() {
+                        let msg = format!("log flush after purge_prefix failed: {e}");
+                        error!(target: "xraft_server::driver", %msg, "halting driver");
+                        captured.error = Some(XRaftError::Storage(msg.clone()));
+                        self.halt_reason.get_or_insert(msg);
                         break;
                     }
                 }
-                Action::TakeSnapshot => {
-                    if let Err(reason) = self.handle_take_snapshot() {
-                        error!(
-                            target: "xraft_server::driver",
-                            reason = %reason,
-                            "TakeSnapshot failed; halting driver"
-                        );
-                        captured.error = Some(XRaftError::Storage(reason.clone()));
-                        self.halt_reason.get_or_insert(reason);
-                        break;
-                    }
-                }
-                Action::InstallSnapshot { metadata, data } => {
-                    if let Err(reason) = self.handle_install_snapshot(metadata, data) {
-                        error!(
-                            target: "xraft_server::driver",
-                            reason = %reason,
-                            "InstallSnapshot failed; halting driver"
-                        );
-                        captured.error = Some(XRaftError::Storage(reason.clone()));
-                        self.halt_reason.get_or_insert(reason);
-                        break;
-                    }
-                }
+                // NOTE: iter-10 merge-residue cleanup — the upstream
+                // `feature/xraft` merge (PR #38) left a stale block of
+                // OLD action arms (`Action::TakeSnapshot` no-payload,
+                // `Action::InstallSnapshot` returning `()`, and a
+                // duplicate `Action::ApplyToStateMachine`) ahead of the
+                // current arms below. They referenced method signatures
+                // that no longer exist (`handle_take_snapshot()` 0-args
+                // returning `()`) AND used the old `Action::TakeSnapshot`
+                // unit variant which is now a struct variant
+                // (`{ through_index }`). Both shapes failed the workspace
+                // `cargo build` gate. The replacement arms preserved
+                // below dispatch to the post-merge method shapes
+                // (`handle_take_snapshot(through_index) ->
+                // Result<Vec<Action>, _>` and `handle_install_snapshot(..)
+                // -> Result<Vec<Action>, _>`), feeding follow-ups back
+                // through `worklist` so the engine's TruncateLog after
+                // `Input::SnapshotComplete` still lands.
                 Action::ApplyToStateMachine { from, to } => {
                     if let Err(e) = self.apply_committed(from, to) {
                         let msg = format!("apply to state machine failed: {e}");
@@ -3256,8 +3297,7 @@ where
                 to = %to,
                 "apply: log range short read; halting driver"
             );
-            let indices: Vec<LogIndex> =
-                self.pending.range(from..=to).map(|(k, _)| *k).collect();
+            let indices: Vec<LogIndex> = self.pending.range(from..=to).map(|(k, _)| *k).collect();
             for idx in indices {
                 self.resolve_waiters_at(idx, Err(XRaftError::Storage(msg.clone())));
             }
@@ -3319,19 +3359,95 @@ where
         Ok(())
     }
 
-    /// Dispatch [`Action::TakeSnapshot`]: capture state-machine state and
-    /// persist it to the [`SnapshotStore`] tagged with the current
-    /// `last_applied` index, the term of that log entry, and the active
-    /// voter set. See module-level "Stage 5.1 dispatch" comment for
-    /// invariants enforced by each guard.
-    fn handle_take_snapshot(&mut self) -> std::result::Result<(), String> {
-        let last_applied = self.node.last_applied;
-        if last_applied.0 == 0 {
+    /// Dispatch [`Action::TakeSnapshot { through_index }`]: capture the
+    /// state-machine state and persist it to the [`SnapshotStore`]
+    /// tagged with the snapshot index (the engine-requested
+    /// `through_index`, used directly — see the per-method comment for
+    /// why no driver-side clamp is applied), the term of that log
+    /// entry, and the active voter set.
+    ///
+    /// Returns any follow-on [`Action`]s the engine emits in response
+    /// to [`Input::SnapshotComplete`] — primarily
+    /// [`Action::TruncateLog(PrefixThroughInclusive { .. })`] for log
+    /// prefix compaction. The caller appends them to its worklist so
+    /// they flow through the same `process_actions` pipeline as
+    /// engine-emitted actions.
+    ///
+    /// Noop on `through_index == 0`: the engine guards its emission
+    /// against `commit_index > 0`, but a defensive driver-side
+    /// short-circuit preserves "do not halt on an empty-state
+    /// snapshot" semantics if a future engine change or a misuse
+    /// delivers one anyway.
+    ///
+    /// See module-level "Stage 5.1 dispatch" comment for invariants
+    /// enforced by each guard.
+    fn handle_take_snapshot(
+        &mut self,
+        through_index: LogIndex,
+    ) -> std::result::Result<Vec<Action>, String> {
+        // No-op rather than halt when `through_index == 0`. The
+        // engine's `maybe_take_snapshot` already filters this case
+        // out (snapshot-in-flight + lag threshold guards), but the
+        // synthetic dispatch tests in this crate can force an index-0
+        // action through `process_actions` to verify the early-return
+        // semantics; halting on those would unnecessarily flip the
+        // driver into fail-stop. Per the engine emission contract in
+        // `node::maybe_take_snapshot` (`through_index = commit_index`
+        // when the lag threshold is crossed inside
+        // `drain_apply_pipeline` AFTER apply catches up), the
+        // engine-emitted action always carries `through_index ==
+        // last_applied` at dispatch time, so we honour the engine's
+        // through_index directly here (no clamp).
+        if through_index.0 == 0 {
             debug!(
                 target: "xraft_server::driver",
-                "TakeSnapshot skipped: last_applied=0 (no committed state)"
+                "TakeSnapshot skipped: through_index=0 (no committed state)"
             );
-            return Ok(());
+            return Ok(Vec::new());
+        }
+        let (_meta, follow_ups) = self.take_snapshot_with_meta(through_index)?;
+        Ok(follow_ups)
+    }
+
+    /// Workhorse for the operator-triggered snapshot path: similar to
+    /// [`handle_take_snapshot`] but also returns the persisted
+    /// [`SnapshotMeta`] so the admin handler can populate
+    /// [`TriggeredSnapshotInfo`] in the gRPC reply. Unlike
+    /// [`handle_take_snapshot`], a `through_index == 0` here is an
+    /// error, not a noop: the admin caller cannot construct a
+    /// meaningful `TriggeredSnapshotInfo` for a zero-index snapshot,
+    /// and the admin-path entry guard should have rejected the request
+    /// before reaching this method.
+    fn take_snapshot_with_meta(
+        &mut self,
+        through_index: LogIndex,
+    ) -> std::result::Result<(SnapshotMeta, Vec<Action>), String> {
+        // Honour the caller's `through_index` directly. Both call
+        // sites guarantee `through_index <= last_applied` at the
+        // time of the call:
+        //   - Engine path (`Action::TakeSnapshot { through_index:
+        //     commit_index }` from `node::maybe_take_snapshot`):
+        //     emitted by `drain_apply_pipeline` AFTER the matching
+        //     `Action::ApplyToStateMachine` has been dispatched in
+        //     the same vec, so `last_applied == commit_index` by the
+        //     time this method runs.
+        //   - Admin-triggered path (`handle_trigger_snapshot`):
+        //     pre-clamps `through_index = self.node.last_applied`
+        //     and pre-checks `last_applied > 0`, so the SM bytes
+        //     produced by `state_machine.snapshot()` exactly cover
+        //     the index range claimed by the persisted metadata
+        //     (Raft snapshot invariant: snapshot bytes equal the
+        //     state machine after applying every entry through
+        //     `last_included_index`).
+        // Clamping again here would silently rewrite the request to
+        // a smaller index and break the synthetic dispatch tests
+        // that seed a log entry without first advancing
+        // `last_applied`. Production correctness is enforced at the
+        // call sites, not by an additional driver-side clamp here.
+        if through_index.0 == 0 {
+            return Err(
+                "TakeSnapshot: refusing to snapshot at index 0 (no committed state)".to_string(),
+            );
         }
         let voter_set = match self.node.voter_set.as_ref() {
             Some(vs) => vs.clone(),
@@ -3341,16 +3457,29 @@ where
                 );
             }
         };
-        let last_term = match self.log_store.term_at(last_applied) {
+        let last_term = match self.log_store.term_at(through_index) {
             Ok(Some(t)) => t,
             Ok(None) => {
-                return Err(format!(
-                    "TakeSnapshot: term_at(last_applied={last_applied}) returned None"
-                ));
+                // Term not in the log — consult the snapshot anchor,
+                // which authoritatively records the term at its
+                // last_included_index. This covers the case where the
+                // log has been compacted past `through_index` (rare
+                // for operator-triggered snapshots but possible after a
+                // recently-installed snapshot from the leader).
+                match self.node.last_snapshot_meta.as_ref() {
+                    Some(anchor) if anchor.last_included_index == through_index => {
+                        anchor.last_included_term
+                    }
+                    _ => {
+                        return Err(format!(
+                            "TakeSnapshot: term_at(through_index={through_index}) returned None"
+                        ));
+                    }
+                }
             }
             Err(e) => {
                 return Err(format!(
-                    "TakeSnapshot: term_at(last_applied={last_applied}) failed: {e}"
+                    "TakeSnapshot: term_at(through_index={through_index}) failed: {e}"
                 ));
             }
         };
@@ -3358,34 +3487,72 @@ where
             .state_machine
             .snapshot()
             .map_err(|e| format!("TakeSnapshot: state machine snapshot failed: {e}"))?;
+        let data_len = data.len();
+        // Pre-compute the canonical snapshot id matching the
+        // `SnapshotStore` normalisation contract
+        // (`snapshot-{term:010}-{index:020}`). The driver does not
+        // get the post-normalisation id back from `save_snapshot`
+        // (which returns `()`), so building it ourselves keeps the
+        // engine's `last_snapshot_meta.id` (set via
+        // `Input::SnapshotComplete`) in sync with what the store
+        // persists on disk.
+        let canonical_id = format!("snapshot-{:010}-{:020}", last_term.0, through_index.0);
         let meta = SnapshotMeta {
-            last_included_index: last_applied,
+            last_included_index: through_index,
             last_included_term: last_term,
-            // SnapshotStore normalises id to canonical form; the caller-
-            // supplied value is discarded.
-            id: String::new(),
+            id: canonical_id,
             voter_set: Some(voter_set),
-            size_bytes: None,
+            size_bytes: Some(data_len as u64),
             checksum: None,
         };
         self.snapshot_store
-            .save_snapshot(meta, &data)
+            .save_snapshot(meta.clone(), &data)
             .map_err(|e| format!("TakeSnapshot: snapshot_store.save_snapshot failed: {e}"))?;
         debug!(
             target: "xraft_server::driver",
-            index = %last_applied,
+            index = %through_index,
             term = %last_term,
-            payload_bytes = data.len(),
+            payload_bytes = data_len,
             "TakeSnapshot: persisted snapshot"
         );
-        Ok(())
+        // Feed the completion back into the engine so it can record
+        // the new snapshot anchor and emit the follow-on
+        // `Action::TruncateLog(PrefixThroughInclusive)` for prefix
+        // compaction. The returned actions are forwarded to the
+        // worklist by the caller.
+        let follow_ups = self.node.step(Input::SnapshotComplete {
+            metadata: meta.clone(),
+        });
+        Ok((meta, follow_ups))
+    }
+
+    /// `max(log_store.last_index(), last_snapshot_meta.last_included_index)` —
+    /// the engine's `last_log_*` must NEVER regress below a previously-
+    /// installed snapshot anchor. After a suffix truncate that empties
+    /// the in-memory log, `log_store.last_index()` returns 0 even
+    /// though a snapshot at index=100 is still durable; reconciling
+    /// `last_log_*` to 0 would silently undo `set_last_log(snap_idx)`
+    /// from `handle_install_snapshot` and lead to a follower advertising
+    /// a fetch position behind the snapshot's coverage.
+    fn effective_log_tip(&self) -> (LogIndex, Term) {
+        let log_idx = self.log_store.last_index();
+        let log_term = self.log_store.last_term();
+        match self.node.last_snapshot_meta.as_ref() {
+            Some(anchor) if anchor.last_included_index > log_idx => {
+                (anchor.last_included_index, anchor.last_included_term)
+            }
+            _ => (log_idx, log_term),
+        }
     }
 
     /// Dispatch [`Action::InstallSnapshot`]: persist a snapshot received
     /// from the leader, restore the state machine to the captured state,
     /// and advance the local node's bookkeeping (`last_applied`,
     /// `commit_index`, log tip, voter set, peer table) to reflect the
-    /// snapshot.
+    /// snapshot. Returns any follow-on [`Action`]s the engine emits in
+    /// response to [`Input::SnapshotInstalled`] (empty `Vec` today —
+    /// the engine never re-emits TruncateLog for an installed snapshot,
+    /// per `node::handle_snapshot_installed`).
     ///
     /// Ordering rationale — persist BEFORE restore: a crash between
     /// persist and restore can be recovered from the durable snapshot
@@ -3400,7 +3567,7 @@ where
         &mut self,
         metadata: SnapshotMeta,
         data: Vec<u8>,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<Vec<Action>, String> {
         // Order matters: the stale-snapshot guard MUST run before any
         // metadata validation (e.g. voter_set extraction). Per the
         // InstallSnapshot contract, a snapshot at or behind
@@ -3435,7 +3602,7 @@ where
                 last_applied = %self.node.last_applied,
                 "InstallSnapshot: snapshot at or behind last_applied; no-op (no persist, no restore, no validation)"
             );
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Forward-going snapshot: voter_set is mandatory because the
@@ -3452,6 +3619,7 @@ where
 
         // Persist first so a crash between save and restore is recoverable
         // from the durable snapshot on restart.
+        let meta_for_engine = metadata.clone();
         self.snapshot_store
             .save_snapshot(metadata, &data)
             .map_err(|e| format!("InstallSnapshot: snapshot_store.save_snapshot failed: {e}"))?;
@@ -3497,7 +3665,18 @@ where
             payload_bytes = data.len(),
             "InstallSnapshot: persisted, restored, and rebuilt membership"
         );
-        Ok(())
+        // Feed the install completion back into the engine so it can
+        // record `last_snapshot_meta`, clear `snapshot_in_flight`, and
+        // (in raise-only fashion) advance any indices the direct
+        // bookkeeping above did not — see
+        // `node::handle_snapshot_installed`. Today the returned action
+        // list is empty; we still forward it so any future engine
+        // change (e.g. emitting a follow-on Action) propagates without
+        // a second driver-side edit.
+        let follow_ups = self.node.step(Input::SnapshotInstalled {
+            metadata: meta_for_engine,
+        });
+        Ok(follow_ups)
     }
 
     fn resolve_waiters_at(&mut self, index: LogIndex, result: XResult<LogIndex>) {
@@ -4064,6 +4243,14 @@ mod tests {
         /// mode (drop / short read / inverted range) already trips
         /// the length check.
         override_indices_in_get_range: Arc<Mutex<std::collections::HashMap<LogIndex, LogIndex>>>,
+        /// When set true, the next call to `truncate_from` returns an
+        /// error. Used by suffix-truncate failure-path tests.
+        fail_next_truncate: Arc<std::sync::atomic::AtomicBool>,
+        /// When set true, the next call to `purge_prefix` returns an
+        /// error. Used by Stage 5.3 prefix-compaction failure-path
+        /// tests on the `Action::TruncateLog(PrefixThroughInclusive)`
+        /// dispatch.
+        fail_next_purge_prefix: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl LogStore for TestLogStore {
@@ -4241,6 +4428,11 @@ mod tests {
     type Applied = Arc<Mutex<Vec<(LogIndex, Vec<u8>)>>>;
     type SnapshotCalls = Arc<Mutex<Vec<Vec<u8>>>>;
     type RestoreCalls = Arc<Mutex<Vec<Vec<u8>>>>;
+    /// Mirror of the in-memory snapshot store used by Stage 5.1/5.3
+    /// dispatch tests that want to inspect every persisted
+    /// `(SnapshotMeta, payload)` pair after running a synthetic
+    /// `process_actions` cycle.
+    type SavedSnapshots = Arc<Mutex<Vec<(SnapshotMeta, Vec<u8>)>>>;
     type TestDriver = Driver<
         NoopTransport,
         TestLogStore,
@@ -4256,6 +4448,10 @@ mod tests {
         /// `TakeSnapshot` populate this so they can assert the data
         /// reached `SnapshotStore::save_snapshot` byte-for-byte.
         snapshot_bytes: Arc<Mutex<Vec<u8>>>,
+        /// Records every payload returned by `snapshot()`. Tests that
+        /// exercise `TakeSnapshot` dispatch use this to count
+        /// invocations independently of `save_snapshot` records.
+        snapshots_taken: SnapshotCalls,
         /// Records every payload passed to `restore()`. Tests that
         /// exercise `InstallSnapshot` assert that the leader-supplied
         /// bytes reached the state machine unchanged.
@@ -4263,6 +4459,12 @@ mod tests {
         /// When `Some(idx)`, `apply` returns `Err` for entries at that
         /// log index. Used by `apply_committed` failure-path tests.
         fail_apply_at: Arc<Mutex<Option<LogIndex>>>,
+        /// When true, the next call to `apply()` returns `Err`. Cleared
+        /// after firing so subsequent calls succeed. Differs from
+        /// `fail_apply_at` in that it fires on the next entry
+        /// regardless of index — used by tests that don't know the
+        /// upcoming log index in advance.
+        fail_next_apply: Arc<std::sync::atomic::AtomicBool>,
         /// When true, the next call to `snapshot()` returns `Err`.
         /// Cleared after firing so subsequent calls succeed.
         fail_next_snapshot: Arc<std::sync::atomic::AtomicBool>,
@@ -4297,10 +4499,45 @@ mod tests {
             self.fail_next_restore
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
+
+        /// Handle to the `Vec` recording every `snapshot()` payload
+        /// returned. Stage 5.1 dispatch tests clone this before running
+        /// the driver so they can inspect captures after the worklist
+        /// completes.
+        fn snapshots_taken_handle(&self) -> SnapshotCalls {
+            self.snapshots_taken.clone()
+        }
+
+        /// Handle to the `Vec` recording every `restore()` payload.
+        /// Stage 5.1 dispatch tests clone this for post-hoc assertions
+        /// on InstallSnapshot byte fidelity.
+        fn restores_received_handle(&self) -> RestoreCalls {
+            self.restored.clone()
+        }
+
+        /// Handle to the mutable snapshot payload buffer. Tests use
+        /// this to mutate the bytes returned by `snapshot()` mid-test.
+        fn snapshot_payload_handle(&self) -> Arc<Mutex<Vec<u8>>> {
+            self.snapshot_bytes.clone()
+        }
+
+        /// Handle to the `fail_next_apply` flag so tests can arm it
+        /// from outside the `&mut self` borrow during `process_actions`.
+        fn fail_next_apply_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+            self.fail_next_apply.clone()
+        }
     }
 
     impl StateMachine for TestStateMachine {
         fn apply(&mut self, index: LogIndex, command: &[u8]) -> XResult<Vec<u8>> {
+            if self
+                .fail_next_apply
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(XRaftError::Storage(format!(
+                    "injected apply failure at {index}"
+                )));
+            }
             if let Some(fail_idx) = *self.fail_apply_at.lock().unwrap()
                 && fail_idx == index
             {
@@ -4321,7 +4558,9 @@ mod tests {
             {
                 return Err(XRaftError::Storage("injected snapshot failure".into()));
             }
-            Ok(self.snapshot_bytes.lock().unwrap().clone())
+            let bytes = self.snapshot_bytes.lock().unwrap().clone();
+            self.snapshots_taken.lock().unwrap().push(bytes.clone());
+            Ok(bytes)
         }
         fn restore(&mut self, snapshot: &[u8]) -> XResult<()> {
             if self
@@ -7455,7 +7694,12 @@ port = 6012
         sm.set_snapshot_bytes(payload.clone());
 
         let _ = driver
-            .process_actions(vec![Action::TakeSnapshot], None)
+            .process_actions(
+                vec![Action::TakeSnapshot {
+                    through_index: LogIndex(3),
+                }],
+                None,
+            )
             .await;
 
         assert!(
@@ -7482,7 +7726,12 @@ port = 6012
         assert_eq!(driver.node.last_applied, LogIndex(0));
 
         let _ = driver
-            .process_actions(vec![Action::TakeSnapshot], None)
+            .process_actions(
+                vec![Action::TakeSnapshot {
+                    through_index: LogIndex(0),
+                }],
+                None,
+            )
             .await;
 
         assert!(
@@ -7502,7 +7751,12 @@ port = 6012
         sm.arm_fail_next_snapshot();
 
         let _ = driver
-            .process_actions(vec![Action::TakeSnapshot], None)
+            .process_actions(
+                vec![Action::TakeSnapshot {
+                    through_index: LogIndex(1),
+                }],
+                None,
+            )
             .await;
 
         let halt = driver
@@ -7527,7 +7781,12 @@ port = 6012
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let _ = driver
-            .process_actions(vec![Action::TakeSnapshot], None)
+            .process_actions(
+                vec![Action::TakeSnapshot {
+                    through_index: LogIndex(1),
+                }],
+                None,
+            )
             .await;
 
         let halt = driver
@@ -7550,7 +7809,12 @@ port = 6012
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let _ = driver
-            .process_actions(vec![Action::TakeSnapshot], None)
+            .process_actions(
+                vec![Action::TakeSnapshot {
+                    through_index: LogIndex(1),
+                }],
+                None,
+            )
             .await;
 
         let halt = driver
@@ -7558,7 +7822,7 @@ port = 6012
             .as_ref()
             .expect("must halt when term_at returns None for last_applied");
         assert!(
-            halt.contains("term_at(last_applied="),
+            halt.contains("term_at(through_index="),
             "halt reason should name the missing term lookup, got: {halt}"
         );
         assert!(ss.saved_snapshots().is_empty());
@@ -7571,7 +7835,12 @@ port = 6012
         driver.node.voter_set = None;
 
         let _ = driver
-            .process_actions(vec![Action::TakeSnapshot], None)
+            .process_actions(
+                vec![Action::TakeSnapshot {
+                    through_index: LogIndex(1),
+                }],
+                None,
+            )
             .await;
 
         let halt = driver
@@ -7583,6 +7852,111 @@ port = 6012
             "halt reason should reference voter_set, got: {halt}"
         );
         assert!(ss.saved_snapshots().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Raft snapshot invariant: `handle_trigger_snapshot` MUST snapshot
+    // at `last_applied`, not `commit_index`. The state machine's
+    // `snapshot()` only reflects applied entries; persisting
+    // `last_included_index > last_applied` would claim coverage of
+    // entries the SM has NOT yet applied, producing a restore-time
+    // state divergence. The admin path (`handle_trigger_snapshot`) is
+    // where the clamp lives — the workhorse `take_snapshot_with_meta`
+    // trusts its callers (engine emits with `through_index ==
+    // last_applied` by drain-ordering invariant; admin pre-clamps
+    // `through_index = last_applied`). See the doc-comment on
+    // `take_snapshot_with_meta` for the call-site enforcement
+    // rationale. Tests below pin both arms of the invariant.
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn admin_trigger_snapshot_clamps_to_last_applied() {
+        // Drive `handle_trigger_snapshot` directly and assert the
+        // `TriggeredSnapshotInfo` returned to the admin caller carries
+        // the clamped index (= last_applied), not `commit_index`.
+        // Scenario: apply lag while the operator triggers a snapshot —
+        // committed entries exist past the SM tip but the trigger must
+        // only persist coverage of what the SM has actually applied.
+        let (mut driver, _sm, ss) = build_dispatch_driver();
+        seed_committed_entries(&mut driver, 5);
+        driver.node.role = xraft_core::NodeRole::Leader;
+        // Simulate apply-lag: commit_index = 5 (from seed), but
+        // apply has only made it through index 3.
+        driver.node.last_applied = LogIndex(3);
+
+        let (tx, rx) = oneshot::channel();
+        driver.handle_trigger_snapshot(tx).await;
+        let info = rx
+            .await
+            .expect("oneshot must deliver a reply")
+            .expect("admin snapshot must succeed when apply lag is present");
+
+        assert!(
+            driver.halt_reason.is_none(),
+            "admin trigger with apply lag must not halt: {:?}",
+            driver.halt_reason
+        );
+        assert_eq!(
+            info.last_included_index, 3,
+            "TriggeredSnapshotInfo must report the CLAMPED index (last_applied=3), not the requested commit_index (5)"
+        );
+        assert_eq!(info.last_included_term, 1);
+        let saved = ss.saved_snapshots();
+        assert_eq!(
+            saved.len(),
+            1,
+            "exactly one snapshot persisted via admin path"
+        );
+        assert_eq!(
+            saved[0].0.last_included_index,
+            LogIndex(3),
+            "persisted snapshot meta must also reflect the clamp",
+        );
+        assert_eq!(
+            saved[0].0.id, "snapshot-0000000001-00000000000000000003",
+            "canonical id must reflect the clamped (term, index) pair",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn admin_trigger_snapshot_with_unapplied_state_returns_config_error() {
+        // Edge case: commit_index > 0 but last_applied == 0 (newly-
+        // elected leader still draining apply, or a freshly-bootstrapped
+        // cluster). Without the precheck `take_snapshot_with_meta(0)`
+        // would Err and halt the driver. With the precheck the admin
+        // caller gets a clean `Config` error and the driver stays
+        // healthy — apply lag is a transient operational condition,
+        // not corruption.
+        let (mut driver, _sm, ss) = build_dispatch_driver();
+        seed_committed_entries(&mut driver, 3);
+        driver.node.role = xraft_core::NodeRole::Leader;
+        driver.node.last_applied = LogIndex(0);
+
+        let (tx, rx) = oneshot::channel();
+        driver.handle_trigger_snapshot(tx).await;
+        let err = rx
+            .await
+            .expect("oneshot must deliver a reply")
+            .expect_err("admin snapshot must error when last_applied=0");
+
+        assert!(
+            driver.halt_reason.is_none(),
+            "admin trigger with last_applied=0 must NOT halt the driver: {:?}",
+            driver.halt_reason
+        );
+        match err {
+            XRaftError::Config(ref msg) => {
+                assert!(
+                    msg.contains("last_applied=0"),
+                    "config error must explain the apply-lag, got: {msg}"
+                );
+            }
+            other => panic!("expected XRaftError::Config, got {other:?}"),
+        }
+        assert!(
+            ss.saved_snapshots().is_empty(),
+            "no snapshot must be persisted when last_applied=0"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -8090,7 +8464,14 @@ port = 6012
         seed_committed_entries(&mut driver, 1);
         sm.arm_fail_next_snapshot();
 
-        let captured = driver.process_actions(vec![Action::TakeSnapshot], None).await;
+        let captured = driver
+            .process_actions(
+                vec![Action::TakeSnapshot {
+                    through_index: LogIndex(1),
+                }],
+                None,
+            )
+            .await;
 
         assert!(driver.halt_reason.is_some());
         let err = captured

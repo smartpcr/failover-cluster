@@ -41,7 +41,7 @@ use std::time::Duration;
 use xraft_core::config::ClusterConfig;
 use xraft_core::error::{Result as XResult, XRaftError};
 use xraft_core::types::NodeId;
-use xraft_transport::grpc::TlsTransportConfig;
+use xraft_transport::grpc::{TlsTransportConfig, peer_endpoints_from_cluster_config};
 use xraft_transport::grpc_client::{RaftGrpcClient, RaftGrpcClientConfig};
 
 use crate::peer::PeerClient;
@@ -120,12 +120,16 @@ impl ConnectionPool {
     /// so the inbound transport and the operator-visible pool
     /// observe the SAME peer channel cache.
     pub fn from_cluster_config(cluster: &ClusterConfig) -> XResult<Self> {
+        // `peer_endpoints_from_cluster_config` rejects the
+        // legacy-`peers`-only misconfiguration eagerly so the pool
+        // never silently builds an unroutable client. See the
+        // helper's docs for the full rationale.
+        let peer_endpoints = peer_endpoints_from_cluster_config(cluster)?;
         let tls = if cluster.tls_enabled {
             Some(Arc::new(TlsTransportConfig::from_cluster_config(cluster)?))
         } else {
             None
         };
-        let peer_endpoints = cluster.peer_endpoints();
         let client_cfg = RaftGrpcClientConfig {
             peer_endpoints: peer_endpoints.clone(),
             connect_timeout: Duration::from_millis(cluster.connect_timeout_ms),
@@ -424,6 +428,43 @@ mod tests {
         assert_eq!(
             pool.endpoint_for(NodeId(3)).unwrap(),
             "http://10.0.0.3:6000"
+        );
+    }
+
+    #[test]
+    fn from_cluster_config_rejects_legacy_peers_without_voters() {
+        // Iter-2 evaluator finding: the shared
+        // `peer_endpoints_from_cluster_config` helper is exercised
+        // through `GrpcTransportConfig::from_cluster_config` in the
+        // transport integration tests, but there is no DIRECT test
+        // proving the SECOND entry point — `ConnectionPool
+        // ::from_cluster_config` — also surfaces the same misconfig
+        // rather than silently building an unroutable pool.
+        //
+        // This test populates the legacy flat `peers: Vec<String>`
+        // field while leaving the structured `voters` field empty —
+        // the exact misconfig shape the helper guards against —
+        // and asserts:
+        //   1. `ConnectionPool::from_cluster_config` returns Err,
+        //   2. the error message names both `ClusterConfig.peers`
+        //      and `voters` so an operator gets an actionable
+        //      diagnostic at construction time rather than the
+        //      generic "no endpoint configured for peer N" surfaced
+        //      later by the first `send_*` call.
+        let mut cluster = three_node_cluster();
+        cluster.voters.clear();
+        cluster.peers = vec!["10.0.0.2:6000".to_string(), "10.0.0.3:6000".to_string()];
+
+        let err = ConnectionPool::from_cluster_config(&cluster)
+            .expect_err("ConnectionPool MUST reject legacy peers without structured voters");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ClusterConfig.peers"),
+            "error must name the offending field: {msg}"
+        );
+        assert!(
+            msg.contains("voters"),
+            "error must point to the fix (populate voters): {msg}"
         );
     }
 

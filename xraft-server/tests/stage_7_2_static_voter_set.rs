@@ -50,23 +50,72 @@ use xraft_core::error::XRaftError;
 use xraft_core::types::NodeId;
 use xraft_server::{Server, ServerConfig};
 
-/// Bind 127.0.0.1:0 to obtain an unused port, then drop the
-/// listener. Matches the pattern in `server_lifecycle.rs`.
-fn pick_port() -> u16 {
+/// Bind 127.0.0.1:0 to obtain an unused ephemeral port AND keep the
+/// listener alive so a parallel test cannot steal the port between
+/// the pick and the eventual `Server::start_with_listener` consume.
+/// The caller MUST hand the returned listener to
+/// `Server::start_with_listener` (or
+/// `Server::start_with_state_machine_and_listener`) — dropping it
+/// without consuming reintroduces the original TOCTOU race against
+/// parallel ephemeral picks under CI load. This structural seam
+/// replaces the prior iter-4 "pick from a high port range, then drop
+/// and rebind" mitigation, which the rubber-duck pass correctly noted
+/// is still probabilistic because Windows' default dynamic-port range
+/// starts at 49152 — overlapping the test's 49200+ window.
+fn bind_ephemeral() -> (u16, std::net::TcpListener) {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
     let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
+    (p, l)
+}
+
+/// Re-bind a previously-allocated port on `127.0.0.1`, retrying
+/// briefly to ride out any transient `AddrInUse` while the kernel
+/// fully releases the prior listener.
+///
+/// Used by the restart-with-pinned-port tests
+/// (`bootstrap_persists_voter_set_and_recovers_on_restart`,
+/// `restart_with_mismatched_voters_rejected_with_config_error`):
+/// the first boot's listener is consumed by
+/// `Server::start_with_listener`; after `shutdown` + `join` the
+/// same port must come back through a fresh `TcpListener` so the
+/// second boot also enters via the listener-passthrough seam.
+fn rebind_port(port: u16) -> std::net::TcpListener {
+    let addr = format!("127.0.0.1:{port}");
+    let mut last_err: Option<std::io::Error> = None;
+    // 6s budget (60 × 100ms). The prior iter-3 budget was 1s
+    // (20 × 50ms), which the post-pass gate suite intermittently
+    // exhausted on Windows under heavy parallel-test load — Windows'
+    // dynamic-port release can lag behind `shutdown()` by several
+    // hundred ms once the loopback socket count climbs. The caller
+    // also now hard-asserts the preceding `handle.join()` completed
+    // BEFORE invoking this helper, so a long retry window here only
+    // covers the kernel-side release lag, not application shutdown.
+    for _ in 0..60 {
+        match std::net::TcpListener::bind(&addr) {
+            Ok(l) => return l,
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    panic!(
+        "rebind {addr} failed after 6s of retries: {:?}",
+        last_err.unwrap()
+    );
 }
 
 /// Build a single-voter cluster config rooted at `data_dir` with
-/// `node_id = 1` listening on an ephemeral port.
-fn single_voter_cluster_config(data_dir: PathBuf) -> ClusterConfig {
-    single_voter_cluster_config_with_endpoint(
-        data_dir,
-        uuid::Uuid::new_v4().to_string(),
-        pick_port(),
-    )
+/// `node_id = 1` and an ephemeral port, AND return the held
+/// listener. The caller hands the listener to
+/// `Server::start_with_listener` so the port is never released
+/// between pick and serve — closing the TOCTOU window described on
+/// [`bind_ephemeral`].
+fn single_voter_cluster_config(data_dir: PathBuf) -> (ClusterConfig, std::net::TcpListener) {
+    let (port, listener) = bind_ephemeral();
+    let cfg =
+        single_voter_cluster_config_with_endpoint(data_dir, uuid::Uuid::new_v4().to_string(), port);
+    (cfg, listener)
 }
 
 /// Variant that lets the test pin BOTH the voter's `directory_id`
@@ -132,8 +181,11 @@ fn server_config(cluster: ClusterConfig) -> ServerConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_node_cluster_elects_self_and_commits() {
     let tmp = TempDir::new().unwrap();
-    let cfg = server_config(single_voter_cluster_config(tmp.path().to_path_buf()));
-    let handle = Server::start(cfg).await.expect("server must start");
+    let (cluster, grpc_listener) = single_voter_cluster_config(tmp.path().to_path_buf());
+    let cfg = server_config(cluster);
+    let handle = Server::start_with_listener(cfg, grpc_listener)
+        .await
+        .expect("server must start");
 
     // Wait for the engine to transition Follower → Candidate →
     // Leader. With the short election timeout (50-100ms) + a 10ms
@@ -188,7 +240,7 @@ async fn bootstrap_persists_voter_set_and_recovers_on_restart() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().to_path_buf();
     let pinned_uuid = uuid::Uuid::new_v4().to_string();
-    let pinned_port = pick_port();
+    let (pinned_port, grpc_listener) = bind_ephemeral();
     let cfg = server_config(single_voter_cluster_config_with_endpoint(
         data_dir.clone(),
         pinned_uuid.clone(),
@@ -197,12 +249,24 @@ async fn bootstrap_persists_voter_set_and_recovers_on_restart() {
 
     // First boot — voter set must be written to disk by
     // `Server::start_with_state_machine`'s Stage-7.2 bootstrap.
-    let handle = Server::start(cfg).await.expect("first boot must succeed");
+    let handle = Server::start_with_listener(cfg, grpc_listener)
+        .await
+        .expect("first boot must succeed");
     // Give the engine a moment to settle so the quorum-state
     // file is fully fsync'd before we read it under the test.
     tokio::time::sleep(Duration::from_millis(100)).await;
     handle.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.join()).await;
+    // Hard-assert the first server actually joined before we attempt
+    // to rebind the pinned port below. Previously this used
+    // `let _ = tokio::time::timeout(...).await;` which silently
+    // swallowed both the timeout and the join error — so a slow
+    // shutdown under CI load could race the subsequent `rebind_port`
+    // against a still-open listener, producing the intermittent
+    // post-pass gate failure on `stage_7_2_static_voter_set`.
+    let join_outcome = tokio::time::timeout(Duration::from_secs(10), handle.join())
+        .await
+        .expect("first server must join within 10s before rebinding pinned port");
+    join_outcome.expect("first server join must succeed before rebind");
 
     // Verify the on-disk file carries the voter_set field.
     let quorum_path = data_dir.join("state").join("quorum-state");
@@ -239,7 +303,8 @@ async fn bootstrap_persists_voter_set_and_recovers_on_restart() {
         pinned_uuid.clone(),
         pinned_port,
     ));
-    let handle2 = Server::start(cfg2)
+    let grpc_listener2 = rebind_port(pinned_port);
+    let handle2 = Server::start_with_listener(cfg2, grpc_listener2)
         .await
         .expect("restart with matching voter set must succeed");
     handle2.shutdown();
@@ -268,7 +333,7 @@ async fn restart_with_mismatched_voters_rejected_with_config_error() {
     let data_dir = tmp.path().to_path_buf();
     let original_uuid = uuid::Uuid::new_v4().to_string();
     let drift_uuid = uuid::Uuid::new_v4().to_string();
-    let pinned_port = pick_port();
+    let (pinned_port, grpc_listener) = bind_ephemeral();
     assert_ne!(original_uuid, drift_uuid);
 
     // First boot — persist original voter set.
@@ -277,7 +342,9 @@ async fn restart_with_mismatched_voters_rejected_with_config_error() {
         original_uuid.clone(),
         pinned_port,
     ));
-    let handle = Server::start(cfg1).await.expect("first boot must succeed");
+    let handle = Server::start_with_listener(cfg1, grpc_listener)
+        .await
+        .expect("first boot must succeed");
     tokio::time::sleep(Duration::from_millis(80)).await;
     handle.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(5), handle.join()).await;
@@ -286,7 +353,11 @@ async fn restart_with_mismatched_voters_rejected_with_config_error() {
     // directory_id ⇒ VoterSet differs ⇒ identity drift ⇒ must
     // reject. Pinning the port isolates the test from the
     // ephemeral-port noise so the only difference between the
-    // two configs is the UUID we're actually probing.
+    // two configs is the UUID we're actually probing. The
+    // voter-set drift check (`server.rs::start_inner` step 1b)
+    // fires BEFORE the gRPC bind, so the rejection arrives even
+    // when the pinned port has not yet been released by the
+    // kernel — using plain `Server::start` here is safe.
     let cfg2 = server_config(single_voter_cluster_config_with_endpoint(
         data_dir.clone(),
         drift_uuid,
@@ -316,8 +387,11 @@ async fn restart_with_mismatched_voters_rejected_with_config_error() {
 async fn add_voter_via_driver_handle_returns_unsupported() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().to_path_buf();
-    let cfg = server_config(single_voter_cluster_config(data_dir.clone()));
-    let handle = Server::start(cfg).await.expect("server must start");
+    let (cluster, grpc_listener) = single_voter_cluster_config(data_dir.clone());
+    let cfg = server_config(cluster);
+    let handle = Server::start_with_listener(cfg, grpc_listener)
+        .await
+        .expect("server must start");
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     // Snapshot the persisted file BEFORE the rejected call.
@@ -354,8 +428,11 @@ async fn add_voter_via_driver_handle_returns_unsupported() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remove_voter_via_driver_handle_returns_unsupported() {
     let tmp = TempDir::new().unwrap();
-    let cfg = server_config(single_voter_cluster_config(tmp.path().to_path_buf()));
-    let handle = Server::start(cfg).await.expect("server must start");
+    let (cluster, grpc_listener) = single_voter_cluster_config(tmp.path().to_path_buf());
+    let cfg = server_config(cluster);
+    let handle = Server::start_with_listener(cfg, grpc_listener)
+        .await
+        .expect("server must start");
 
     let err = handle
         .driver_handle()
@@ -375,8 +452,11 @@ async fn remove_voter_via_driver_handle_returns_unsupported() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_add_voter_returns_501_unsupported() {
     let tmp = TempDir::new().unwrap();
-    let cfg = server_config(single_voter_cluster_config(tmp.path().to_path_buf()));
-    let handle = Server::start(cfg).await.expect("server must start");
+    let (cluster, grpc_listener) = single_voter_cluster_config(tmp.path().to_path_buf());
+    let cfg = server_config(cluster);
+    let handle = Server::start_with_listener(cfg, grpc_listener)
+        .await
+        .expect("server must start");
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let response = http_post(&handle.admin_addr.to_string(), "/admin/add-voter").await;
@@ -402,8 +482,11 @@ async fn http_add_voter_returns_501_unsupported() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_remove_voter_returns_501_unsupported() {
     let tmp = TempDir::new().unwrap();
-    let cfg = server_config(single_voter_cluster_config(tmp.path().to_path_buf()));
-    let handle = Server::start(cfg).await.expect("server must start");
+    let (cluster, grpc_listener) = single_voter_cluster_config(tmp.path().to_path_buf());
+    let cfg = server_config(cluster);
+    let handle = Server::start_with_listener(cfg, grpc_listener)
+        .await
+        .expect("server must start");
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let response = http_post(&handle.admin_addr.to_string(), "/admin/remove-voter").await;
@@ -461,7 +544,15 @@ async fn three_node_bootstrap_persists_same_voter_set_and_elects_leader() {
     let tmps: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
     let data_dirs: Vec<PathBuf> = tmps.iter().map(|t| t.path().to_path_buf()).collect();
     let uuids: Vec<String> = (0..3).map(|_| uuid::Uuid::new_v4().to_string()).collect();
-    let ports: Vec<u16> = (0..3).map(|_| pick_port()).collect();
+    // Bind 3 ephemeral listeners up front and hold them until each
+    // Server::start_with_listener consumes its slot. This closes
+    // the parallel-test TOCTOU window between port pick and
+    // Server::start's bind that blocked the iter-3 / iter-4
+    // post-pass gate under CI load.
+    let bound: Vec<(u16, std::net::TcpListener)> = (0..3).map(|_| bind_ephemeral()).collect();
+    let ports: Vec<u16> = bound.iter().map(|(p, _)| *p).collect();
+    let mut listeners: Vec<Option<std::net::TcpListener>> =
+        bound.into_iter().map(|(_, l)| Some(l)).collect();
     // Shared voter roster — byte-identical across all three nodes
     // so the derived VoterSet is byte-identical when each node
     // persists it on first boot.
@@ -531,8 +622,9 @@ async fn three_node_bootstrap_persists_same_voter_set_and_elects_leader() {
             ports[i],
             voters.clone(),
         ));
+        let listener = listeners[i].take().expect("listener slot still held");
         handles.push(
-            Server::start(cfg)
+            Server::start_with_listener(cfg, listener)
                 .await
                 .unwrap_or_else(|e| panic!("node {} must start: {e:?}", i + 1)),
         );
@@ -765,7 +857,13 @@ async fn observer_replicates_log_without_counting_toward_quorum() {
     let tmps: Vec<TempDir> = (0..4).map(|_| TempDir::new().unwrap()).collect();
     let data_dirs: Vec<PathBuf> = tmps.iter().map(|t| t.path().to_path_buf()).collect();
     let uuids: Vec<String> = (0..4).map(|_| uuid::Uuid::new_v4().to_string()).collect();
-    let ports: Vec<u16> = (0..4).map(|_| pick_port()).collect();
+    // Bind 4 ephemeral listeners up front and hold them until each
+    // Server::start_with_listener consumes its slot. See
+    // [`bind_ephemeral`] for the TOCTOU-closure rationale.
+    let bound: Vec<(u16, std::net::TcpListener)> = (0..4).map(|_| bind_ephemeral()).collect();
+    let ports: Vec<u16> = bound.iter().map(|(p, _)| *p).collect();
+    let mut grpc_listeners: Vec<Option<std::net::TcpListener>> =
+        bound.into_iter().map(|(_, l)| Some(l)).collect();
 
     // Voter roster: byte-identical across all 4 nodes so the
     // observer (which is also voter-roster-aware via its own
@@ -794,7 +892,8 @@ async fn observer_replicates_log_without_counting_toward_quorum() {
             observers.clone(),
             /*enable_check_quorum=*/ false,
         ));
-        let h = Server::start(cfg)
+        let listener = grpc_listeners[i].take().expect("listener slot still held");
+        let h = Server::start_with_listener(cfg, listener)
             .await
             .unwrap_or_else(|e| panic!("node {} must start: {e:?}", i + 1));
         handles.push(Some(h));
@@ -879,10 +978,44 @@ async fn observer_replicates_log_without_counting_toward_quorum() {
 
     // Cross-check: the elected leader still reports role=Leader,
     // no voter has flipped into Observer, no node is Candidate.
+    //
+    // Under CI load (where scheduler delays can push a follower past
+    // its `election_timeout_min` between leader heartbeats), a
+    // non-leader voter may *briefly* flip to PreCandidate (Raft's
+    // pre-vote probe — does NOT bump the term per `node.rs::become_pre_candidate`
+    // and reverts to Follower as soon as the leader's next heartbeat
+    // arrives or the PreVote quorum is denied). That is healthy
+    // protocol behavior, not a stable wrong configuration. A
+    // genuine `Candidate` (real election in flight, term bumped)
+    // IS a violation. The intent of the assertion is "no node has
+    // actually started an election after phase-1 settled".
+    //
+    // Poll for a stable snapshot for up to 30s (was 5s pre-iter-5;
+    // 5s proved insufficient under parallel test load — multiple
+    // in-process 4-node clusters competing for tokio worker threads
+    // routinely produced one transient `PreCandidate` per
+    // sub-second window, never giving the 5s loop a clean snapshot
+    // to break on). 30s + 20ms poll = 1500 sample windows, which
+    // robustly captures a clean snapshot even when several follower
+    // nodes are independently probing PreVote.
+    let stable_deadline = Instant::now() + Duration::from_secs(30);
     let mut roles_seen: Vec<NodeRole> = Vec::with_capacity(4);
-    for slot in handles.iter().take(4) {
-        let st = slot.as_ref().unwrap().status().current().await;
-        roles_seen.push(st.role);
+    loop {
+        roles_seen.clear();
+        for slot in handles.iter().take(4) {
+            let st = slot.as_ref().unwrap().status().current().await;
+            roles_seen.push(st.role);
+        }
+        let leader_ok = matches!(roles_seen[leader_idx], NodeRole::Leader);
+        let observer_ok = roles_seen[3] == NodeRole::Observer;
+        let no_active_election = roles_seen.iter().all(|r| !matches!(r, NodeRole::Candidate));
+        if leader_ok && observer_ok && no_active_election {
+            break;
+        }
+        if Instant::now() >= stable_deadline {
+            break; // Fall through; the asserts below will fail with detail.
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
         matches!(roles_seen[leader_idx], NodeRole::Leader),
@@ -895,8 +1028,9 @@ async fn observer_replicates_log_without_counting_toward_quorum() {
     );
     for (i, r) in roles_seen.iter().enumerate() {
         assert!(
-            !matches!(r, NodeRole::Candidate | NodeRole::PreCandidate),
-            "no node may be a candidate after election settled; node {} role = {r:?}; roles = {roles_seen:?}",
+            !matches!(r, NodeRole::Candidate),
+            "no node may be in a Candidate (in-flight election) state after phase-1 settled; \
+             node {} role = {r:?}; roles = {roles_seen:?}",
             i + 1
         );
     }

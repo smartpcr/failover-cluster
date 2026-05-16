@@ -132,7 +132,13 @@ pub struct GrpcTransportConfig {
 
 impl GrpcTransportConfig {
     /// Derive a transport config from the canonical `ClusterConfig`.
+    ///
+    /// Returns an error when the user has configured the legacy flat
+    /// `peers: Vec<String>` field but left the structured `voters` field
+    /// empty; see [`peer_endpoints_from_cluster_config`] for the
+    /// rationale.
     pub fn from_cluster_config(cfg: &ClusterConfig) -> XResult<Self> {
+        let peer_endpoints = peer_endpoints_from_cluster_config(cfg)?;
         let tls = if cfg.tls_enabled {
             Some(Arc::new(TlsTransportConfig::from_cluster_config(cfg)?))
         } else {
@@ -140,7 +146,7 @@ impl GrpcTransportConfig {
         };
         Ok(Self {
             listen_addr: cfg.listen_addr.clone(),
-            peer_endpoints: cfg.peer_endpoints(),
+            peer_endpoints,
             connect_timeout: Duration::from_millis(cfg.connect_timeout_ms),
             rpc_timeout: Duration::from_millis(cfg.rpc_timeout_ms),
             max_retries: cfg.max_rpc_retries,
@@ -150,6 +156,81 @@ impl GrpcTransportConfig {
             tls,
         })
     }
+}
+
+/// Bind a Raft gRPC TCP listener synchronously, accepting either a
+/// literal SocketAddr (`"0.0.0.0:6000"`) OR a hostname
+/// (`"localhost:6000"`).
+///
+/// Delegates to [`std::net::TcpListener::bind`], whose `&str` impl
+/// expands [`std::net::ToSocketAddrs::to_socket_addrs`] and tries each
+/// resolved address until one binds successfully — so a hostname-form
+/// `listen_addr` is accepted without us picking a single address
+/// family up front. Note that exactly ONE resolved address is bound
+/// (whichever `bind` succeeded on); operators who must serve every
+/// interface or both address families should use a literal wildcard
+/// (`"0.0.0.0:N"` / `"[::]:N"`) instead of a hostname.
+///
+/// Returning a `std::net::TcpListener` (already set non-blocking)
+/// is what lets the production `xraft_server::Server::start` bootstrap:
+///
+///   1. bind synchronously (port conflicts / DNS-resolution failures
+///      surface as a hard `Err` BEFORE any task is spawned, satisfying
+///      the iter-2 evaluator's "admin-start leak" finding), then
+///   2. convert to `tokio::net::TcpListener::from_std` and capture
+///      `local_addr()` so an ephemeral `:0` request surfaces the real
+///      bound port to the operator,
+///   3. hand the listener to
+///      [`GrpcTransport::start_server_with_listener`] only after every
+///      adjacent listener (admin HTTP) is bound too.
+///
+/// Shared between [`GrpcTransport::start_server`] and
+/// `xraft_server::Server::start` so the transport-only entry point
+/// (used by integration tests) and the production bootstrap path use
+/// IDENTICAL bind semantics — closing the iter-2 evaluator finding
+/// that `Server::start` still parsed `listen_addr` as `SocketAddr`
+/// before binding and rejected hostname listen addresses.
+pub fn bind_grpc_listener(listen_addr: &str) -> XResult<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(listen_addr).map_err(|e| {
+        XRaftError::Transport(format!("bind gRPC listener on '{listen_addr}': {e}"))
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| XRaftError::Transport(format!("set_nonblocking on gRPC listener: {e}")))?;
+    Ok(listener)
+}
+
+/// Resolve a `NodeId -> URL` routing map from the canonical
+/// [`ClusterConfig`], or return an actionable config error when the
+/// caller has populated the legacy flat `peers: Vec<String>` field but
+/// left the structured `voters` field empty.
+///
+/// `ClusterConfig::peer_endpoints` derives its `NodeId` keys from
+/// `cluster.voters`, so a config with `peers` populated but `voters`
+/// empty silently produces an empty map — and any subsequent
+/// `send_*` call would later fail with "no endpoint configured for
+/// peer" rather than at construction time. Surfacing the misconfig
+/// here lets operators fix the deployment before the gRPC transport
+/// is wired into the consensus loop. Shared by both
+/// [`GrpcTransportConfig::from_cluster_config`] and
+/// `xraft_client::ConnectionPool::from_cluster_config` so the two
+/// helpers stay in lockstep on the contract.
+///
+/// Legitimate single-node bootstrap (`peers` empty AND `voters`
+/// empty / self-only) returns `Ok(<empty map>)` — the transport will
+/// simply have no outbound peers.
+pub fn peer_endpoints_from_cluster_config(cfg: &ClusterConfig) -> XResult<HashMap<NodeId, String>> {
+    if cfg.voters.is_empty() && !cfg.peers.is_empty() {
+        return Err(XRaftError::Config(format!(
+            "ClusterConfig.peers (legacy host:port list, {} entr{}) cannot be used for gRPC \
+             outbound routing because it lacks NodeId keys; populate ClusterConfig.voters with \
+             VoterConfig entries (one per cluster member including this node) and re-run. \
+             See ClusterConfig::peer_endpoints docs for the supported routing model.",
+            cfg.peers.len(),
+            if cfg.peers.len() == 1 { "y" } else { "ies" }
+        )));
+    }
+    Ok(cfg.peer_endpoints())
 }
 
 /// gRPC implementation of [`Transport`].
@@ -293,24 +374,29 @@ impl<H: RaftMessageHandler> Transport for GrpcTransport<H> {
         self: Arc<Self>,
     ) -> impl std::future::Future<Output = XResult<()>> + Send + 'static {
         async move {
-            let addr: std::net::SocketAddr = self.config.listen_addr.parse().map_err(|e| {
-                XRaftError::Config(format!(
-                    "invalid listen_addr '{}': {e}",
-                    self.config.listen_addr
-                ))
-            })?;
-            // Pre-bind synchronously so port conflicts surface
-            // before any caller observes the spawned task as "running".
-            // This also unifies the bind path with
-            // `start_server_with_listener` below.
-            let std_listener = std::net::TcpListener::bind(addr)
-                .map_err(|e| XRaftError::Transport(format!("bind gRPC listener {addr}: {e}")))?;
-            std_listener.set_nonblocking(true).map_err(|e| {
-                XRaftError::Transport(format!("set_nonblocking on gRPC listener: {e}"))
-            })?;
-            let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
+            // Delegates to the shared [`bind_grpc_listener`] helper so
+            // this transport-only entry point and the production
+            // `xraft_server::Server::start` bootstrap use IDENTICAL
+            // bind semantics — accepting hostname-form `listen_addr`
+            // such as `"localhost:6000"` and literal SocketAddrs like
+            // `"0.0.0.0:6000"`. The previous `parse::<SocketAddr>()`
+            // -then-bind path rejected hostnames before any DNS
+            // resolution even though `ClusterConfig::validate_address`
+            // accepts them.
+            //
+            // Pre-bind is performed via `std::net::TcpListener::bind`
+            // here too (rather than the prior `tokio::net::TcpListener
+            // ::bind(&str)`) so that on the production path — where
+            // `Server::start` calls this same helper synchronously
+            // before spawning — bind failures surface to the caller
+            // BEFORE any spawned task can leak resources. In this
+            // transport-only future, "sync pre-bind" means only that
+            // the bind happens before `serve_inner`, not before the
+            // caller's `tokio::spawn(transport.start_server())`.
+            let std_listener = bind_grpc_listener(&self.config.listen_addr)?;
+            let listener = tokio::net::TcpListener::from_std(std_listener)
                 .map_err(|e| XRaftError::Transport(format!("tokio TcpListener::from_std: {e}")))?;
-            self.serve_inner(tokio_listener).await
+            self.serve_inner(listener).await
         }
     }
 }
