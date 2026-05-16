@@ -37,6 +37,17 @@ pub enum XRaftError {
     /// Requested snapshot was not found in the store.
     #[error("snapshot not found: {0}")]
     SnapshotNotFound(String),
+    /// Operation explicitly out of scope for v1 — used by Stage 7.2
+    /// `AddVoter` / `RemoveVoter` rejection per `tech-spec.md` §2.7,
+    /// `architecture.md` §5.5, and `e2e-scenarios.md` Feature 12 ΓÇö
+    /// dynamic cluster membership is deferred to a future story
+    /// entirely, not a stretch goal within XRAFT v1. Returned by
+    /// every boundary (admin HTTP, `DriverHandle::add_voter` /
+    /// `remove_voter`) that an operator might use to mutate the
+    /// voter set; the voter set is therefore guaranteed to stay
+    /// static for the v1 deliverable.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }
 
 /// Convenience result alias.
@@ -118,5 +129,23 @@ mod tests {
         let e = XRaftError::SnapshotNotFound("snapshot-0000000002-00000000000000000010".into());
         let msg = format!("{e}");
         assert!(msg.contains("snapshot not found"), "got: {msg}");
+    }
+
+    #[test]
+    fn display_unsupported() {
+        // Stage 7.2 boundary rejection: every `AddVoter` / `RemoveVoter`
+        // entry point must surface the same error variant so callers
+        // can pattern-match `Err(XRaftError::Unsupported(_))` without
+        // string-sniffing the diagnostic.
+        let e = XRaftError::Unsupported(
+            "AddVoter is out of scope for v1 — dynamic membership is deferred to a \
+             future story entirely (per architecture.md §5.5 and e2e-scenarios.md \
+             Feature 12)"
+                .into(),
+        );
+        let msg = format!("{e}");
+        assert!(msg.starts_with("unsupported: "), "got: {msg}");
+        assert!(msg.contains("AddVoter"), "got: {msg}");
+        assert!(msg.contains("out of scope for v1"), "got: {msg}");
     }
 }
