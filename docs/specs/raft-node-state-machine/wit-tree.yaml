@@ -1,0 +1,174 @@
+# WIT (Work Item Tree) for the "Raft Node State Machine" feature.
+#
+# Structure: phase -> stage -> step
+# `expectedFileChanges` is the planning-time PR-size budget: the coding
+# pipeline soft-fails the PR if the actual file count exceeds it.
+#
+# Server-enforced caps (Phase 16.3 / 16.5):
+#   phase -> stage     : <= 20 children
+#   stage -> step      : <= 20 children
+#   step  -> file set  : <= 20 changed files
+#
+# Counts here:
+#   1 phase, 3 stages, 11 steps. Max files-per-step = 2. Well within budget.
+
+feature: "Raft Node State Machine"
+slug: "raft-node-state-machine"
+parent_story: "failover-cluster:XRAFT"
+parent_stage_anchor: "phase-raft-consensus-engine/stage-raft-node-state-machine"
+
+phases:
+  - id: "phase-raft-node-state-machine"
+    title: "Raft Node State Machine"
+    description: >-
+      Pure I/O-free consensus engine: structs, role transitions, and the
+      step() input dispatcher with Tick handling. Foundation for Stage 3.2
+      (Leader Election) and Stage 3.3 (Log Replication).
+    stages:
+      # -------------------------------------------------------------------
+      - id: "stage-engine-data-structures"
+        title: "Engine Data Structures"
+        description: >-
+          ElectionTimer, PeerState, RaftNode struct + accessors, plus the
+          NodeRole::PreCandidate / VoteGrantedSet surface in types.rs.
+          Each step is one self-contained type with unit tests.
+        steps:
+          - id: "step-election-timer"
+            title: "ElectionTimer with logical-tick randomised timeout"
+            description: >-
+              Implements from_config_ms / new / reset / tick / is_expired
+              / remaining, ceiling-division for ms->ticks, and the
+              pick_in_range helper. Unit tests cover randomisation range,
+              reset re-rolls, and edge cases (min==max, sub-tick interval).
+            files:
+              - "xraft-core/src/node.rs"
+            expectedFileChanges: 1
+          - id: "step-peer-state"
+            title: "PeerState per-peer replication tracker"
+            description: >-
+              Fields: last_fetch_offset, last_fetch_time_tick,
+              last_caught_up_time_tick, is_voter. Constructor + record_fetch
+              helper + unit tests.
+            files:
+              - "xraft-core/src/node.rs"
+            expectedFileChanges: 1
+          - id: "step-noderole-precandidate-and-vote-granted-set"
+            title: "NodeRole::PreCandidate and VoteGrantedSet types"
+            description: >-
+              Adds the PreCandidate role and the VoteGrantedSet helper to
+              types.rs; re-exports through lib.rs. Pre-Vote requires
+              PreCandidate to be distinguishable from Candidate so the
+              engine never bumps term during the speculative phase.
+            files:
+              - "xraft-core/src/types.rs"
+              - "xraft-core/src/lib.rs"
+            expectedFileChanges: 2
+          - id: "step-raftnode-struct"
+            title: "RaftNode struct, constructor, accessors, initial-state test"
+            description: >-
+              RaftNode { id, role, current_term, voted_for, log tail mirror,
+              commit_index, last_applied, config, election_timer, peers,
+              rng, vote_set }. new(config, voters) returns a Follower at
+              term 0 with the timer armed. Re-export RaftNode + PeerState +
+              ElectionTimer through lib.rs.
+            files:
+              - "xraft-core/src/node.rs"
+              - "xraft-core/src/lib.rs"
+            expectedFileChanges: 2
+      # -------------------------------------------------------------------
+      - id: "stage-role-transitions"
+        title: "Role Transition Methods"
+        description: >-
+          The four become_* methods. Each has distinct preconditions and
+          side-effects (PersistHardState, AppendEntries, BecomeLeader,
+          StepDown). One PR per transition keeps review surface small.
+        steps:
+          - id: "step-become-follower"
+            title: "become_follower(term, leader_id)"
+            description: >-
+              Sets role=Follower; if term > current_term, clears voted_for
+              and emits PersistHardState. If transitioning from Leader,
+              emits StepDown. Records leader contact tick when leader_id is
+              Some. Tests cover higher-term forces step-down and that
+              voted_for is preserved when term is unchanged.
+            files:
+              - "xraft-core/src/node.rs"
+            expectedFileChanges: 1
+          - id: "step-become-pre-candidate"
+            title: "become_pre_candidate()"
+            description: >-
+              MUST NOT mutate current_term or voted_for. Sets
+              role=PreCandidate, fresh VoteGrantedSet keyed on the
+              hypothetical term current_term + 1, resets election timer.
+              Tests assert term and voted_for are unchanged and self-vote
+              is pre-credited.
+            files:
+              - "xraft-core/src/node.rs"
+            expectedFileChanges: 1
+          - id: "step-become-candidate"
+            title: "become_candidate()"
+            description: >-
+              Increments current_term, sets voted_for = Some(self.id),
+              fresh VoteGrantedSet pre-credited with self-vote, resets
+              election timer, emits PersistHardState. Tests assert term
+              bumps by exactly one and self-vote is the only granted vote
+              initially.
+            files:
+              - "xraft-core/src/node.rs"
+            expectedFileChanges: 1
+          - id: "step-become-leader"
+            title: "become_leader() with peer init and no-op entry"
+            description: >-
+              Initialises peers map (one PeerState per voter except self),
+              last_fetch_offset = last_log_index + 1; emits
+              Action::BecomeLeader followed by
+              Action::AppendEntries(vec![Entry::no_op]). Tests assert no-op
+              entry uses current_term and peers are fully initialised.
+            files:
+              - "xraft-core/src/node.rs"
+            expectedFileChanges: 1
+      # -------------------------------------------------------------------
+      - id: "stage-input-dispatcher-and-tick"
+        title: "Input Dispatcher and Tick Handler"
+        description: >-
+          Public surface (step()) and the only input owned by 3.1
+          (Input::Tick). The unsupported-input fence lives here because it
+          is the boundary with 3.2/3.3.
+        steps:
+          - id: "step-input-action-enum-surface"
+            title: "Extend Input/Action enums for Stage 3.1 surface"
+            description: >-
+              message.rs: declare Input::Tick (handler in 3.2) plus the
+              four vote/pre-vote variants and the stubs for ClientPropose
+              / FetchRequest / FetchResponse / FetchRequestAcked. Action
+              surface adds PersistHardState, AppendEntries, SendMessage,
+              BecomeLeader, StepDown, RejectUnsupportedInput. Re-export
+              through lib.rs.
+            files:
+              - "xraft-core/src/message.rs"
+              - "xraft-core/src/lib.rs"
+            expectedFileChanges: 2
+          - id: "step-step-dispatch-and-tick"
+            title: "step() dispatcher and Input::Tick handling"
+            description: >-
+              Match on Input, dispatch to per-variant helpers, accumulate
+              Vec<Action> via a local buffer. Tick: increment timer; on
+              expiry for Follower/PreCandidate/Candidate, transition
+              (Follower->PreCandidate, PreCandidate->Candidate). Leader
+              Tick is a no-op (KRaft has no leader heartbeat). Adds tracing
+              span per step. Tests cover the cascade and the Leader no-op.
+            files:
+              - "xraft-core/src/node.rs"
+            expectedFileChanges: 1
+          - id: "step-reject-unsupported-inputs"
+            title: "RejectUnsupportedInput fence for deferred handlers"
+            description: >-
+              Seven inputs (ClientPropose, FetchRequest, FetchResponse,
+              FetchRequestAcked, VoteRequest, VoteResponse, PreVoteRequest,
+              PreVoteResponse) must return exactly one
+              Action::RejectUnsupportedInput tagged with the input
+              discriminant. Tests assert no other side effects occur for
+              each.
+            files:
+              - "xraft-core/src/node.rs"
+            expectedFileChanges: 1
