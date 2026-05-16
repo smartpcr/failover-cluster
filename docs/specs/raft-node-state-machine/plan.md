@@ -30,7 +30,8 @@ engine. References that shaped the design:
 The work item **"Raft Node State Machine"** scopes the *engine*: the pure
 state object every node carries, the input dispatcher, and the role-
 transition methods. It is a *new* stage inserted before
-`stage-leader-election` (Stage 3.2 in `implementation-plan.md`) and
+`stage-leader-election` (Stage 3.2 in
+`docs/stories/failover-cluster-XRAFT/implementation-plan.md`) and
 `stage-log-replication` (Stage 3.3), both of which depend on the
 structures and the `step()` dispatcher delivered here.
 
