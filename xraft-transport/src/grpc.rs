@@ -156,6 +156,9 @@ impl GrpcTransportConfig {
 ///
 /// The struct owns:
 /// - the outbound [`RaftGrpcClient`] (handles connection pool + retries),
+///   shared as `Arc<RaftGrpcClient>` so callers (e.g.
+///   [`xraft_client::pool::ConnectionPool`](../../xraft_client/pool/struct.ConnectionPool.html))
+///   can hold the SAME pool instance,
 /// - a shared [`Notify`] used to signal graceful server shutdown,
 /// - the [`RaftMessageHandler`] dispatched into by the inbound server.
 ///
@@ -165,15 +168,53 @@ impl GrpcTransportConfig {
 pub struct GrpcTransport<H: RaftMessageHandler> {
     config: GrpcTransportConfig,
     handler: Arc<H>,
-    client: RaftGrpcClient,
+    client: Arc<RaftGrpcClient>,
     shutdown: Arc<Notify>,
 }
 
 impl<H: RaftMessageHandler> GrpcTransport<H> {
     /// Construct a new gRPC transport with the supplied configuration and
-    /// inbound handler.
+    /// inbound handler. Builds a fresh `RaftGrpcClient` internally.
+    /// Use [`GrpcTransport::with_client`] when you need to *share* the
+    /// outbound client with a caller-owned
+    /// [`ConnectionPool`](../../xraft_client/pool/struct.ConnectionPool.html).
     pub fn new(config: GrpcTransportConfig, handler: Arc<H>) -> Self {
-        let client_cfg = RaftGrpcClientConfig {
+        let client = Arc::new(RaftGrpcClient::new(Self::client_config(&config)));
+        Self::with_client(config, handler, client)
+    }
+
+    /// Construct a new gRPC transport over a caller-supplied
+    /// [`Arc<RaftGrpcClient>`]. Used by
+    /// [`xraft_client::pool::ConnectionPool`](../../xraft_client/pool/struct.ConnectionPool.html)
+    /// so the same pool instance is shared between the server's
+    /// inbound transport and the operator-visible pool surface
+    /// stored on `ServerHandle`.
+    ///
+    /// The supplied `client` MUST have been built from a config
+    /// consistent with `config.peer_endpoints` (typically via
+    /// [`Self::client_config`]); mismatched peer rosters will not
+    /// be reconciled — the inbound side uses `config` and the
+    /// outbound side uses whatever the client was configured with.
+    pub fn with_client(
+        config: GrpcTransportConfig,
+        handler: Arc<H>,
+        client: Arc<RaftGrpcClient>,
+    ) -> Self {
+        let shutdown = Arc::new(Notify::new());
+        Self {
+            config,
+            handler,
+            client,
+            shutdown,
+        }
+    }
+
+    /// Derive a [`RaftGrpcClientConfig`] from a transport config —
+    /// used by both [`Self::new`] and external pool constructors
+    /// (e.g. [`xraft_client::pool::ConnectionPool::from_cluster_config`])
+    /// so the client + transport agree on every knob.
+    pub fn client_config(config: &GrpcTransportConfig) -> RaftGrpcClientConfig {
+        RaftGrpcClientConfig {
             peer_endpoints: config.peer_endpoints.clone(),
             connect_timeout: config.connect_timeout,
             rpc_timeout: config.rpc_timeout,
@@ -182,15 +223,15 @@ impl<H: RaftMessageHandler> GrpcTransport<H> {
             max_backoff: config.retry_max_backoff,
             max_message_size: config.max_message_size,
             tls: config.tls.clone(),
-        };
-        let client = RaftGrpcClient::new(client_cfg);
-        let shutdown = Arc::new(Notify::new());
-        Self {
-            config,
-            handler,
-            client,
-            shutdown,
         }
+    }
+
+    /// Borrow the shared outbound client. Use this to expose the
+    /// same `Arc<RaftGrpcClient>` to a
+    /// [`ConnectionPool`](../../xraft_client/pool/struct.ConnectionPool.html)
+    /// or any other peer-RPC consumer.
+    pub fn client(&self) -> Arc<RaftGrpcClient> {
+        self.client.clone()
     }
 
     /// Trigger a graceful shutdown of any running `start_server` future.
@@ -258,35 +299,77 @@ impl<H: RaftMessageHandler> Transport for GrpcTransport<H> {
                     self.config.listen_addr
                 ))
             })?;
-
-            let adapter = RaftGrpcServer::new(self.handler.clone());
-            let svc = adapter
-                .into_service()
-                .max_decoding_message_size(self.config.max_message_size)
-                .max_encoding_message_size(self.config.max_message_size);
-
-            let mut builder = Server::builder();
-            if let Some(tls) = &self.config.tls {
-                let identity = Identity::from_pem(&tls.server_cert_pem, &tls.server_key_pem);
-                let tls_config = ServerTlsConfig::new().identity(identity);
-                builder = builder
-                    .tls_config(tls_config)
-                    .map_err(|e| XRaftError::Transport(format!("server tls_config: {e}")))?;
-            }
-
-            info!(target: "xraft_transport", addr = %addr, tls = self.config.tls.is_some(), "starting gRPC server");
-
-            let shutdown = self.shutdown.clone();
-            builder
-                .add_service(svc)
-                .serve_with_shutdown(addr, async move {
-                    shutdown.notified().await;
-                })
-                .await
-                .map_err(|e| XRaftError::Transport(format!("gRPC server: {e}")))?;
-
-            info!(target: "xraft_transport", addr = %addr, "gRPC server stopped");
-            Ok(())
+            // Pre-bind synchronously so port conflicts surface
+            // before any caller observes the spawned task as "running".
+            // This also unifies the bind path with
+            // `start_server_with_listener` below.
+            let std_listener = std::net::TcpListener::bind(addr)
+                .map_err(|e| XRaftError::Transport(format!("bind gRPC listener {addr}: {e}")))?;
+            std_listener.set_nonblocking(true).map_err(|e| {
+                XRaftError::Transport(format!("set_nonblocking on gRPC listener: {e}"))
+            })?;
+            let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
+                .map_err(|e| XRaftError::Transport(format!("tokio TcpListener::from_std: {e}")))?;
+            self.serve_inner(tokio_listener).await
         }
+    }
+}
+
+impl<H: RaftMessageHandler> GrpcTransport<H> {
+    /// Serve gRPC over a caller-supplied, **already-bound**
+    /// [`tokio::net::TcpListener`].
+    ///
+    /// Lets the caller (e.g. Stage 6.1 `Server::start`) bind the
+    /// listener **synchronously** so port conflicts and DNS
+    /// resolution failures surface BEFORE the gRPC task is
+    /// spawned, AND so the actual listening port (when the config
+    /// specified ephemeral `:0`) can be inspected via
+    /// `listener.local_addr()` before serving begins.
+    ///
+    /// The TLS path is unchanged: when `self.config.tls` is set,
+    /// tonic terminates TLS for each accepted connection inside
+    /// its service stack. The caller's listener stays plaintext
+    /// TCP.
+    pub async fn start_server_with_listener(
+        self: Arc<Self>,
+        listener: tokio::net::TcpListener,
+    ) -> XResult<()> {
+        self.serve_inner(listener).await
+    }
+
+    async fn serve_inner(self: Arc<Self>, listener: tokio::net::TcpListener) -> XResult<()> {
+        let addr = listener
+            .local_addr()
+            .map_err(|e| XRaftError::Transport(format!("listener local_addr: {e}")))?;
+        let adapter = RaftGrpcServer::new(self.handler.clone());
+        let svc = adapter
+            .into_service()
+            .max_decoding_message_size(self.config.max_message_size)
+            .max_encoding_message_size(self.config.max_message_size);
+
+        let mut builder = Server::builder();
+        if let Some(tls) = &self.config.tls {
+            let identity = Identity::from_pem(&tls.server_cert_pem, &tls.server_key_pem);
+            let tls_config = ServerTlsConfig::new().identity(identity);
+            builder = builder
+                .tls_config(tls_config)
+                .map_err(|e| XRaftError::Transport(format!("server tls_config: {e}")))?;
+        }
+
+        info!(target: "xraft_transport", addr = %addr, tls = self.config.tls.is_some(), "starting gRPC server (pre-bound listener)");
+
+        let shutdown = self.shutdown.clone();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+        builder
+            .add_service(svc)
+            .serve_with_incoming_shutdown(incoming, async move {
+                shutdown.notified().await;
+            })
+            .await
+            .map_err(|e| XRaftError::Transport(format!("gRPC server: {e}")))?;
+
+        info!(target: "xraft_transport", addr = %addr, "gRPC server stopped");
+        Ok(())
     }
 }

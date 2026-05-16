@@ -382,6 +382,18 @@ impl RaftNode {
                 }
             }
         }
+        // Stage 6.1: seed the local node's initial role as Observer
+        // when its `node_id` appears in `config.observers`. Otherwise
+        // every node starts as Follower per the Raft baseline (it may
+        // become Candidate/PreCandidate/Leader after the first election
+        // timeout). Observer nodes never time out into an election —
+        // see the `tick()` arm in this file which skips
+        // `become_pre_candidate` for `NodeRole::Observer`.
+        let initial_role = if config.observers.contains(&config.node_id.0) {
+            NodeRole::Observer
+        } else {
+            NodeRole::Follower
+        };
         // We seed the timer's RNG from the same source so the entire engine is
         // deterministic when constructed via `new_with_seed`.
         let mut timer_rng = StdRng::seed_from_u64(rng.next_u64());
@@ -394,7 +406,7 @@ impl RaftNode {
 
         Ok(Self {
             id: config.node_id,
-            role: NodeRole::Follower,
+            role: initial_role,
             hard_state: HardState {
                 current_term: Term(0),
                 voted_for: None,
@@ -2326,6 +2338,68 @@ port = 6000
         assert!(node.leader_id.is_none());
     }
 
+    // Stage 6.1 acceptance (iter-3 evaluator finding #3):
+    // `ClusterConfig.observers` containing this node's id must seed
+    // `NodeRole::Observer` at construction. The reverse — node not in
+    // observers — still starts as `Follower`.
+    #[test]
+    fn new_node_starts_as_observer_when_listed_in_observers_field() {
+        let toml = format!(
+            r#"
+node_id = 5
+cluster_id = "test"
+listen_addr = "0.0.0.0:6000"
+tick_interval_ms = 10
+election_timeout_min_ms = 100
+election_timeout_max_ms = 200
+observers = [5]
+
+[[voters]]
+node_id = 1
+directory_id = "{}"
+host = "node1"
+port = 6000
+"#,
+            Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).unwrap();
+        let node = RaftNode::new_with_seed(cfg, 1).unwrap();
+        assert_eq!(
+            node.role,
+            NodeRole::Observer,
+            "node listed in `observers` must construct as Observer"
+        );
+    }
+
+    #[test]
+    fn new_node_with_unrelated_observer_list_still_starts_as_follower() {
+        let toml = format!(
+            r#"
+node_id = 1
+cluster_id = "test"
+listen_addr = "0.0.0.0:6000"
+tick_interval_ms = 10
+election_timeout_min_ms = 100
+election_timeout_max_ms = 200
+observers = [7, 8]
+
+[[voters]]
+node_id = 1
+directory_id = "{}"
+host = "node1"
+port = 6000
+"#,
+            Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).unwrap();
+        let node = RaftNode::new_with_seed(cfg, 1).unwrap();
+        assert_eq!(
+            node.role,
+            NodeRole::Follower,
+            "node NOT listed in `observers` must construct as Follower"
+        );
+    }
+
     #[test]
     fn new_node_has_correct_id() {
         let node = RaftNode::new_with_seed(test_config(), 1).unwrap();
@@ -3001,6 +3075,7 @@ port = 6000
             retry_initial_backoff_ms: 100,
             retry_max_backoff_ms: 5_000,
             max_message_size: 64 * 1024 * 1024,
+            observers: vec![],
         };
         let err = RaftNode::new_with_seed(cfg, 1).expect_err(
             "RaftNode::new_with_seed must propagate invalid voter config as Err, \

@@ -449,6 +449,7 @@ async fn tls_transport() {
         retry_initial_backoff_ms: 50,
         retry_max_backoff_ms: 400,
         max_message_size: 64 * 1024 * 1024,
+        observers: vec![],
     };
 
     // Build the server transport (it owns the TLS config + handler).
@@ -547,6 +548,7 @@ async fn tls_transport_cert_and_key_only() {
         retry_initial_backoff_ms: 50,
         retry_max_backoff_ms: 400,
         max_message_size: 64 * 1024 * 1024,
+        observers: vec![],
     };
 
     let handler = StubHandler::new();

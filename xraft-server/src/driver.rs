@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_core::Stream;
@@ -55,6 +55,8 @@ use xraft_core::state_machine::StateMachine;
 use xraft_core::storage::{HardStateStore, LogStore, SnapshotMeta, SnapshotStore};
 use xraft_core::transport::{RaftMessageHandler, SnapshotChunkStream, Transport};
 use xraft_core::types::{LogIndex, NodeId, NodeRole, Term};
+
+use crate::status::NodeStatus;
 
 // ---------------------------------------------------------------------------
 // Public events / handles
@@ -217,6 +219,14 @@ struct ClientCommand {
 enum DriverEvent {
     Inbound(InboundRpc),
     Client(ClientCommand),
+    /// Hot-reload the driver's tick interval.
+    ///
+    /// Sent by [`DriverHandle::reload_tick_interval`] when SIGHUP-driven
+    /// config reload changes the `tick_interval_ms` field. The driver
+    /// rebuilds its `tokio::time::interval` in-place so the next tick
+    /// honours the new cadence — no restart required (per Stage 6.1
+    /// brief: "SIGHUP reloads configuration").
+    ReloadTickInterval(Duration),
 }
 
 /// Clone-able handle exposing the driver's public API.
@@ -229,6 +239,68 @@ enum DriverEvent {
 pub struct DriverHandle {
     events: mpsc::Sender<DriverEvent>,
     shutdown: Arc<tokio::sync::Notify>,
+}
+
+/// Pre-allocated event channel + shutdown signal that can be supplied
+/// to [`Driver::with_channels`] so the caller can build a
+/// [`DriverInboundHandler`] **before** the [`Driver`] itself is
+/// constructed.
+///
+/// Stage 6.1 server-assembly uses this to break the chicken-and-egg
+/// between the gRPC transport (which needs the inbound handler) and
+/// the driver (which traditionally constructs its own channels
+/// internally):
+///
+/// ```ignore
+/// let channels = DriverChannels::new();
+/// let handler = channels.inbound_handler();
+/// let transport = Arc::new(GrpcTransport::new(cfg, Arc::new(handler)));
+/// let driver = Driver::with_channels(channels, node, ..., transport, driver_cfg);
+/// ```
+pub struct DriverChannels {
+    events_tx: mpsc::Sender<DriverEvent>,
+    events_rx: mpsc::Receiver<DriverEvent>,
+    shutdown: Arc<tokio::sync::Notify>,
+}
+
+impl DriverChannels {
+    /// Allocate fresh event / shutdown channels sized identically to
+    /// `Driver::new`'s defaults.
+    pub fn new() -> Self {
+        let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        Self {
+            events_tx,
+            events_rx,
+            shutdown,
+        }
+    }
+
+    /// Build an inbound handler that targets the event channel
+    /// embedded in these channels. Cheap clone; safe to call
+    /// multiple times.
+    pub fn inbound_handler(&self) -> DriverInboundHandler {
+        DriverInboundHandler {
+            events: self.events_tx.clone(),
+        }
+    }
+
+    /// Build a [`DriverHandle`] over these channels — used by the
+    /// server-assembly layer to obtain the propose / shutdown surface
+    /// **before** the driver itself is constructed (e.g. so admin
+    /// HTTP signals can wire up against a known handle).
+    pub fn driver_handle(&self) -> DriverHandle {
+        DriverHandle {
+            events: self.events_tx.clone(),
+            shutdown: self.shutdown.clone(),
+        }
+    }
+}
+
+impl Default for DriverChannels {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DriverHandle {
@@ -263,6 +335,23 @@ impl DriverHandle {
         // the loop awaits `notified()` still wakes the loop on its
         // first poll.
         self.shutdown.notify_one();
+    }
+
+    /// Apply a new tick interval to the running driver.
+    ///
+    /// Sent from the SIGHUP reload path in `main.rs`. The driver
+    /// rebuilds its `tokio::time::interval` so the next tick fires
+    /// at the new cadence; if the driver has shut down, this returns
+    /// silently (the channel send fails, but a closed channel during
+    /// shutdown is expected — not an error to propagate).
+    ///
+    /// Returns `Ok(())` if the event was queued, `Err(XRaftError::Transport)`
+    /// if the driver has shut down.
+    pub async fn reload_tick_interval(&self, new: Duration) -> XResult<()> {
+        self.events
+            .send(DriverEvent::ReloadTickInterval(new))
+            .await
+            .map_err(|_| XRaftError::Transport(PROPOSE_CHANNEL_CLOSED.to_string()))
     }
 
     /// Build an inbound RPC handler for the gRPC server. The handler
@@ -1004,6 +1093,61 @@ where
     /// is unsafe). When set, `run()` exits via `fail_stop_shutdown` and
     /// returns `Err(XRaftError::Storage(reason))`.
     halt_reason: Option<String>,
+    /// Optional observer hook invoked after every event-loop iteration
+    /// and on every `Action::AppendEntries` success. Stage 6.1 wires
+    /// the Prometheus metrics + status publisher through this
+    /// extension point. The driver itself is decoupled from the
+    /// specific observer implementation so unit tests can plug in a
+    /// no-op or counting observer without dragging in the
+    /// `prometheus-client` Registry.
+    observer: Option<Arc<dyn DriverObserver>>,
+    /// `Instant::now()` at the moment this node entered the
+    /// `Candidate` role; cleared on every other role transition. Used
+    /// by [`Self::record_role_transition_observations`] to compute
+    /// the `xraft_election_latency_seconds` histogram sample at the
+    /// `Candidate → Leader` hop.
+    candidate_entered_at: Option<Instant>,
+    /// Mirror of `self.node.role` captured at the *previous*
+    /// post-event observation. Drives the role-transition detection
+    /// inside [`Self::record_role_transition_observations`] so a
+    /// single re-entrant Candidate→Leader transition emits exactly
+    /// one histogram sample.
+    prev_role: NodeRole,
+}
+
+/// Observer hook the driver invokes after every event-loop iteration
+/// and on every successful log append. Stage 6.1's
+/// [`XRaftMetrics`](crate::metrics::XRaftMetrics) is the production
+/// implementation; tests can supply a no-op or counting observer.
+///
+/// All methods take `&self` so a single `Arc<dyn DriverObserver>` can
+/// be shared across the driver loop, the admin HTTP server, and any
+/// future RPC surface without locking. Implementations are expected
+/// to use interior mutability (atomic counters, async-safe locks)
+/// rather than mutating through `&self`.
+pub trait DriverObserver: Send + Sync + std::fmt::Debug {
+    /// Called once after every Driver event-loop iteration with a
+    /// fresh [`NodeStatus`] snapshot. Production impls publish the
+    /// snapshot to a [`StatusPublisher`](crate::status::StatusPublisher)
+    /// and refresh the corresponding Prometheus gauges
+    /// (`xraft_current_term`, `xraft_commit_index`,
+    /// `xraft_current_leader`, `xraft_role`).
+    fn on_status<'a>(
+        &'a self,
+        status: NodeStatus,
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+    /// Called from the driver's `Action::AppendEntries` arm after a
+    /// successful flush, with the number of entries that just landed
+    /// on disk. Production impls bump the
+    /// `xraft_append_records_total` counter.
+    fn on_append(&self, n: u64);
+
+    /// Called once at the `Candidate → Leader` transition with the
+    /// elapsed wall-clock duration since the node entered the
+    /// `Candidate` role. Production impls observe the histogram
+    /// `xraft_election_latency_seconds`.
+    fn on_election_won(&self, elapsed: Duration);
 }
 
 impl<T, L, HS, SS, SM> Driver<T, L, HS, SS, SM>
@@ -1024,9 +1168,41 @@ where
         transport: Arc<T>,
         config: DriverConfig,
     ) -> Self {
-        let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        Self::with_channels(
+            DriverChannels::new(),
+            node,
+            log_store,
+            hs_store,
+            snapshot_store,
+            state_machine,
+            transport,
+            config,
+        )
+    }
+
+    /// Construct a driver using externally-supplied [`DriverChannels`].
+    ///
+    /// Used by the server-assembly path (Stage 6.1) to build the
+    /// gRPC transport's inbound handler **before** the driver itself
+    /// exists, breaking the chicken-and-egg between
+    /// `Transport` and `DriverInboundHandler`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_channels(
+        channels: DriverChannels,
+        node: RaftNode,
+        log_store: L,
+        hs_store: HS,
+        snapshot_store: SS,
+        state_machine: SM,
+        transport: Arc<T>,
+        config: DriverConfig,
+    ) -> Self {
+        let DriverChannels {
+            events_tx,
+            events_rx,
+            shutdown,
+        } = channels;
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
-        let shutdown = Arc::new(tokio::sync::Notify::new());
         let router = MessageRouter::new_with_fetch_snapshot_deadline(
             transport,
             outbound_tx,
@@ -1040,6 +1216,7 @@ where
         // Skip missed ticks rather than burst-firing them — under load
         // we never want a 100ms stall to spawn 10 catch-up Tick events.
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let prev_role = node.role;
         Self {
             node,
             log_store,
@@ -1055,6 +1232,97 @@ where
             tick,
             handle,
             halt_reason: None,
+            observer: None,
+            candidate_entered_at: None,
+            prev_role,
+        }
+    }
+
+    /// Builder-style setter: attach an [`DriverObserver`] (typically
+    /// [`XRaftMetrics`](crate::metrics::XRaftMetrics)) so the driver
+    /// can publish status snapshots and record metrics during the
+    /// event loop.
+    pub fn with_observer(mut self, observer: Arc<dyn DriverObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Snapshot the engine's observable state for the
+    /// [`DriverObserver::on_status`] callback.
+    fn snapshot_node_status(&self) -> NodeStatus {
+        NodeStatus::from_engine(&self.node)
+    }
+
+    /// Detect role transitions since the last observation and feed
+    /// the appropriate observer callbacks. Called from inside the
+    /// event-loop right after a `select!` arm completes.
+    ///
+    /// Single-voter cascade: `tick()` can transition the engine
+    /// Follower → PreCandidate → Candidate → Leader within a single
+    /// action-list (because each step's `has_*_quorum` is satisfied
+    /// by the self-vote). In that case `prev_role` was Follower at
+    /// the previous observation and `now_role` is Leader, with no
+    /// intermediate observation to stamp `candidate_entered_at` —
+    /// we still emit a zero-duration sample so operators see the
+    /// election happened (the histogram's count is the truthful
+    /// "elections per second" signal even when wall-clock is 0).
+    async fn record_role_transition_observations(&mut self) {
+        let now_role = self.node.role;
+
+        // Entering an election-seeking role (Pre-Vote precedes Vote)
+        // from a non-election role: stamp the candidacy clock.
+        let entering_election = matches!(now_role, NodeRole::PreCandidate | NodeRole::Candidate);
+        let was_election = matches!(self.prev_role, NodeRole::PreCandidate | NodeRole::Candidate);
+        if entering_election && !was_election {
+            self.candidate_entered_at = Some(Instant::now());
+        }
+
+        // Won the election: emit a histogram sample.
+        if now_role == NodeRole::Leader && self.prev_role != NodeRole::Leader {
+            let elapsed = match self.candidate_entered_at.take() {
+                // Normal path: stamp was set on PreCandidate / Candidate
+                // entry, we observe an elapsed delta.
+                Some(start) => start.elapsed(),
+                // Single-voter cascade: the engine collapsed
+                // Follower → PreCandidate → Candidate → Leader into
+                // one action-list, so no intermediate observation
+                // stamped the clock. Wall-clock is 0; emit a
+                // 0-duration sample so the histogram count still
+                // reflects that an election occurred. Only treat
+                // this as expected when prev_role is non-election;
+                // a missing stamp from PreCandidate / Candidate is
+                // a bug — warn so it surfaces in operator logs.
+                None => {
+                    if matches!(self.prev_role, NodeRole::Follower | NodeRole::Observer) {
+                        Duration::from_secs(0)
+                    } else {
+                        warn!(
+                            target: "xraft_server::driver",
+                            prev_role = ?self.prev_role,
+                            "Leader transition with no candidacy stamp from \
+                             election-seeking prev_role — emitting 0s sample but \
+                             this indicates a missed stamping path"
+                        );
+                        Duration::from_secs(0)
+                    }
+                }
+            };
+            if let Some(obs) = &self.observer {
+                obs.on_election_won(elapsed);
+            }
+        }
+
+        // Step-down to Follower / Observer (e.g. observed higher
+        // term) → drop the clock so a future win doesn't double-
+        // count from a stale stamp.
+        if matches!(now_role, NodeRole::Follower | NodeRole::Observer) {
+            self.candidate_entered_at = None;
+        }
+        self.prev_role = now_role;
+
+        if let Some(obs) = &self.observer {
+            let status = self.snapshot_node_status();
+            obs.on_status(status).await;
         }
     }
 
@@ -1088,6 +1356,11 @@ where
         // Prime the tick interval — the first .tick() resolves immediately.
         let _ = self.tick.tick().await;
 
+        // Publish the initial NodeStatus before the first event so
+        // `/health` and `/metrics` reflect the recovered durable
+        // state immediately, not just after the first tick/RPC.
+        self.record_role_transition_observations().await;
+
         loop {
             tokio::select! {
                 biased;
@@ -1101,6 +1374,26 @@ where
                     match event {
                         DriverEvent::Inbound(rpc) => self.handle_inbound(rpc).await,
                         DriverEvent::Client(cmd) => self.handle_client_command(cmd).await,
+                        DriverEvent::ReloadTickInterval(new) => {
+                            // Live-apply SIGHUP-triggered tick-interval change.
+                            // Rebuild `self.tick` so the next select! arm
+                            // honours the new cadence. Also update the cached
+                            // `self.config.tick_interval` so subsequent
+                            // observations see consistent state.
+                            info!(
+                                target: "xraft_server::driver",
+                                node_id = %self.node.id,
+                                old_ms = self.config.tick_interval.as_millis(),
+                                new_ms = new.as_millis(),
+                                "applying SIGHUP-reloaded tick interval"
+                            );
+                            self.config.tick_interval = new;
+                            self.tick = interval(new);
+                            self.tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                            // Consume the immediate-fire so the new cadence
+                            // takes effect on the *next* real interval.
+                            let _ = self.tick.tick().await;
+                        }
                     }
                 }
 
@@ -1117,6 +1410,11 @@ where
                     // was already forwarded via `outbound_rx`.
                 }
             }
+
+            // Refresh the metrics / status publisher AFTER the event
+            // has been processed but BEFORE the halt-reason check so a
+            // fail-stop still publishes the final pre-halt state.
+            self.record_role_transition_observations().await;
 
             // Honour the fail-stop contract immediately, before another
             // tick or RPC can advance the in-memory node past durable
@@ -1592,6 +1890,14 @@ where
                         captured.error = Some(XRaftError::Storage(msg.clone()));
                         self.halt_reason.get_or_insert(msg);
                         break;
+                    }
+                    // Stage 6.1: observe `xraft_append_records_total`
+                    // after the durable flush succeeds. We never
+                    // count entries that failed to land on disk —
+                    // the halting `break` paths above intentionally
+                    // skip this call.
+                    if let Some(obs) = &self.observer {
+                        obs.on_append(entries.len() as u64);
                     }
                 }
                 Action::TruncateLog(LogTruncation::SuffixFromInclusive {
@@ -2571,6 +2877,14 @@ where
                         // a node about to exit cannot satisfy.
                         let _ = cmd.reply.send(Err(XRaftError::Shutdown));
                     }
+                    Some(DriverEvent::ReloadTickInterval(_)) => {
+                        // Hot-reload during graceful drain is a no-op:
+                        // the loop is exiting, no future tick will fire.
+                        debug!(
+                            target: "xraft_server::driver",
+                            "ignoring reload during graceful drain"
+                        );
+                    }
                     None => break,
                 },
 
@@ -2625,6 +2939,10 @@ where
                 DriverEvent::Inbound(rpc) => self.reply_halt_to_inbound(rpc, &reason),
                 DriverEvent::Client(cmd) => {
                     let _ = cmd.reply.send(Err(XRaftError::Storage(reason.clone())));
+                }
+                DriverEvent::ReloadTickInterval(_) => {
+                    // Halt path drops reload events — the driver is
+                    // not coming back from a persistence fail-stop.
                 }
             }
         }
@@ -7673,5 +7991,94 @@ port = 6012
         assert_eq!(follower.node.commit_index, LogIndex(80));
         assert_eq!(follower.node.last_log_index, LogIndex(80));
         assert_eq!(follower.node.last_log_term, Term(5));
+    }
+
+    /// Counting `DriverObserver` used by election-latency tests.
+    /// Captures the elapsed durations passed to `on_election_won`
+    /// and the count of status snapshots so cascade detection can
+    /// assert exactly-one-sample-per-election.
+    #[derive(Default, Debug)]
+    struct CountingObserver {
+        elections: Mutex<Vec<Duration>>,
+        statuses: std::sync::atomic::AtomicUsize,
+        appends: std::sync::atomic::AtomicU64,
+    }
+
+    impl DriverObserver for CountingObserver {
+        fn on_status<'a>(
+            &'a self,
+            _status: NodeStatus,
+        ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            self.statuses
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {})
+        }
+        fn on_append(&self, n: u64) {
+            self.appends
+                .fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn on_election_won(&self, elapsed: Duration) {
+            self.elections.lock().unwrap().push(elapsed);
+        }
+    }
+
+    /// Iter-3 evaluator finding #4: a single-voter cluster cascades
+    /// `Follower → PreCandidate → Candidate → Leader` inside one
+    /// `tick()` action-list; the observer must still emit exactly
+    /// one election-latency sample (a 0-duration sample is the
+    /// truthful signal — wall-clock IS zero in the cascade case).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_voter_cascade_emits_election_latency_sample() {
+        let cfg = single_voter_config(2);
+        let (mut driver, handle, _applied) = build_driver(cfg);
+        let obs = Arc::new(CountingObserver::default());
+        driver.observer = Some(obs.clone() as Arc<dyn DriverObserver>);
+        let driver_join = tokio::spawn(driver.run());
+
+        // Wait for the self-election: the observer's elections vec
+        // should grow to at least 1 within the election timeout
+        // (election_timeout_max_ms = tick_ms*3 = 6ms in this config).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if !obs.elections.lock().unwrap().is_empty() {
+                break;
+            }
+            if Instant::now() > deadline {
+                handle.shutdown();
+                let _ = driver_join.await;
+                panic!(
+                    "single-voter driver did not record an election within 2s — \
+                     statuses observed: {}",
+                    obs.statuses.load(std::sync::atomic::Ordering::SeqCst)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        handle.shutdown();
+        let join_result = tokio::time::timeout(Duration::from_secs(5), driver_join)
+            .await
+            .expect("driver shutdown must complete within 5s");
+        join_result.expect("driver join").expect("driver Ok(())");
+
+        // Exactly one election should have been recorded for the
+        // single-voter happy path (no step-down, no re-election).
+        let elections = obs.elections.lock().unwrap().clone();
+        assert_eq!(
+            elections.len(),
+            1,
+            "single-voter cascade should emit exactly 1 election sample, got {elections:?}"
+        );
+        // Wall-clock 0 is the expected cascade case (Follower →
+        // PreCandidate → Candidate → Leader inside one action-list).
+        // Don't assert == ZERO because the runtime's scheduler may
+        // interleave a status observation between role hops, leading
+        // to a tiny non-zero elapsed; we only need to ensure the
+        // sample is observed AND finite (well below the 2s timeout).
+        assert!(
+            elections[0] < Duration::from_secs(1),
+            "election latency must be sub-second on the local single-voter path, got {:?}",
+            elections[0]
+        );
     }
 }

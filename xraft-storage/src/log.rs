@@ -164,8 +164,7 @@ impl LogStore for MemoryLogStore {
         // Volatile store: dropping in-memory entries is the entire
         // purge. Idempotent — entries.retain on an already-purged
         // store is a cheap no-op walk.
-        self.entries
-            .retain(|e| e.index > through_index_inclusive);
+        self.entries.retain(|e| e.index > through_index_inclusive);
         Ok(())
     }
 }
@@ -201,7 +200,6 @@ const ENTRY_HEADER_LEN: usize = 21;
 /// Metadata for a single WAL segment file.
 #[derive(Debug)]
 struct SegmentInfo {
-    #[expect(dead_code)]
     base_index: LogIndex,
     path: PathBuf,
 }
@@ -1203,7 +1201,10 @@ mod tests {
 
         let mut log = MemoryLogStore::new();
         let result = log.append(&[entry]);
-        assert!(result.is_err(), "Snapshot entries must be rejected by MemoryLogStore");
+        assert!(
+            result.is_err(),
+            "Snapshot entries must be rejected by MemoryLogStore"
+        );
     }
 
     // ---- purge_prefix --------------------------------------------------
