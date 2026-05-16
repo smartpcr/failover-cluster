@@ -41,7 +41,7 @@ use xraft_core::error::XRaftError;
 
 use crate::driver::DriverHandle;
 use crate::metrics::XRaftMetrics;
-use crate::status::StatusPublisher;
+use crate::status::{NodeStatus, StatusPublisher, role_to_str};
 
 /// Cluster-level metadata surfaced via `GET /admin/status`.
 ///
@@ -68,6 +68,57 @@ impl ClusterInfo {
         Self {
             cluster_id: cluster.cluster_id.clone(),
             voters: cluster.voters.iter().map(|v| v.node_id).collect(),
+        }
+    }
+}
+
+/// Wire-shape returned by `GET /admin/status`.
+///
+/// Composes the [`NodeStatus`] projection with the cluster-level
+/// metadata from [`ClusterInfo`] (`cluster_id`, `voters`) as
+/// **explicit struct fields**. This deliberately replaces the
+/// earlier "serialize `NodeStatus` to a JSON map, then `obj.insert`
+/// the cluster fields" pattern: if a future revision of
+/// [`NodeStatus`] grows a `cluster_id` or `voters` field, the
+/// collision now surfaces here as a compile error (duplicate struct
+/// member) instead of silently overwriting the engine field at
+/// runtime.
+///
+/// The wire field set MUST stay byte-compatible with
+/// `xraft_client::admin::ClusterStatusResponse`, which is the
+/// canonical operator-tooling decoder. Any new field belongs on
+/// both sides in lock-step.
+///
+/// Field order matches the historical wire layout (status fields
+/// first, then cluster fields) so a snapshot of an actual response
+/// captured before this refactor still hashes identically.
+#[derive(Debug, Serialize)]
+struct AdminStatusResponse<'a> {
+    node_id: u64,
+    role: &'static str,
+    term: u64,
+    commit_index: u64,
+    last_applied: u64,
+    leader_id: Option<u64>,
+    last_log_index: u64,
+    cluster_id: &'a str,
+    voters: &'a [u64],
+}
+
+impl<'a> AdminStatusResponse<'a> {
+    /// Build the response from a freshly-published [`NodeStatus`]
+    /// and the bootstrap-time [`ClusterInfo`] snapshot.
+    fn from_parts(status: &NodeStatus, cluster: &'a ClusterInfo) -> Self {
+        Self {
+            node_id: status.node_id,
+            role: role_to_str(status.role),
+            term: status.term,
+            commit_index: status.commit_index,
+            last_applied: status.last_applied,
+            leader_id: status.leader_id,
+            last_log_index: status.last_log_index,
+            cluster_id: &cluster.cluster_id,
+            voters: &cluster.voters,
         }
     }
 }
@@ -180,18 +231,7 @@ async fn health_handler(State(state): State<AdminState>) -> Response {
 /// the leader without iterating every voter.
 async fn admin_status_handler(State(state): State<AdminState>) -> Response {
     let snapshot = state.status.current().await;
-    let mut body = serde_json::to_value(snapshot).unwrap_or_else(|_| serde_json::json!({}));
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert(
-            "cluster_id".to_string(),
-            serde_json::Value::from(state.cluster_info.cluster_id.clone()),
-        );
-        obj.insert(
-            "voters".to_string(),
-            serde_json::to_value(&state.cluster_info.voters)
-                .unwrap_or_else(|_| serde_json::json!([])),
-        );
-    }
+    let body = AdminStatusResponse::from_parts(&snapshot, &state.cluster_info);
     Json(body).into_response()
 }
 

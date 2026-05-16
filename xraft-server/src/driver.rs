@@ -1816,7 +1816,28 @@ where
                 // worklist plumbing the engine-driven path uses. We
                 // forward them via process_actions so prefix
                 // compaction lands transparently.
-                self.process_actions(follow_ups, None).await;
+                //
+                // Evaluator iter-2 item 1: a follow-up
+                // TruncateLog/flush failure inside `process_actions`
+                // sets `captured.error` AND `self.halt_reason` so the
+                // driver fail-stops on the next loop iteration. We
+                // MUST surface that error to the admin caller too —
+                // returning Ok(TriggeredSnapshotInfo) while the
+                // driver is about to halt would lie to the operator
+                // and hide the storage failure behind a successful
+                // HTTP response.
+                let captured = self.process_actions(follow_ups, None).await;
+                if let Some(err) = captured.error {
+                    error!(
+                        target: "xraft_server::driver",
+                        node_id = %self.node.id,
+                        last_included_index = %meta.last_included_index,
+                        error = %err,
+                        "operator-triggered snapshot persisted but a follow-up action failed; reporting failure to the admin caller"
+                    );
+                    let _ = reply.send(Err(err));
+                    return;
+                }
                 let info = TriggeredSnapshotInfo {
                     last_included_index: meta.last_included_index.0,
                     last_included_term: meta.last_included_term.0,
@@ -3515,6 +3536,13 @@ mod tests {
         /// When set, the next `truncate_from` call returns a storage
         /// error. Used to verify install-snapshot wipe halts on error.
         fail_next_truncate: Arc<std::sync::atomic::AtomicBool>,
+        /// When set, the next `purge_prefix` call returns a storage
+        /// error. Used by Stage 6.2 (evaluator iter-2 item 1) to verify
+        /// that an operator-triggered snapshot whose follow-up
+        /// `Action::TruncateLog(PrefixThroughInclusive)` fails surfaces
+        /// the failure to the admin caller (and halts the driver)
+        /// rather than silently returning `Ok(TriggeredSnapshotInfo)`.
+        fail_next_purge_prefix: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl LogStore for TestLogStore {
@@ -3568,6 +3596,14 @@ mod tests {
             Ok(())
         }
         fn purge_prefix(&mut self, through_index_inclusive: LogIndex) -> XResult<()> {
+            if self
+                .fail_next_purge_prefix
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(XRaftError::Storage(format!(
+                    "injected purge_prefix failure at {through_index_inclusive}"
+                )));
+            }
             // Stage 5.3 prefix compaction: drop entries `<= through`.
             // Idempotent — retain is a single-pass walk that no-ops when
             // the prefix is already gone.
@@ -3988,6 +4024,12 @@ port = 6000
         /// call return an error. Used by Stage 5.2 fail-stop tests for
         /// the install-snapshot wipe path.
         fail_next_truncate: Arc<std::sync::atomic::AtomicBool>,
+        /// Flip to `true` to make the NEXT `log_store.purge_prefix()`
+        /// call return an error. Used by Stage 6.2 (evaluator iter-2
+        /// item 1) to verify operator-triggered snapshots surface a
+        /// follow-up purge failure to the admin caller rather than
+        /// silently returning `Ok`.
+        fail_next_purge_prefix: Arc<std::sync::atomic::AtomicBool>,
     }
 
     /// Build a driver pre-wired with capture-aware test doubles for the
@@ -4001,6 +4043,7 @@ port = 6000
         let log = TestLogStore::default();
         let fail_next_get_range = log.fail_next_get_range.clone();
         let fail_next_truncate = log.fail_next_truncate.clone();
+        let fail_next_purge_prefix = log.fail_next_purge_prefix.clone();
         let hs = TestHardStateStore::default();
         let ss = TestSnapshotStore::default();
         let saved_snapshots = ss.saved.clone();
@@ -4038,6 +4081,7 @@ port = 6000
                 fail_next_apply,
                 fail_next_get_range,
                 fail_next_truncate,
+                fail_next_purge_prefix,
             },
         )
     }
@@ -7421,6 +7465,101 @@ port = 6012
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].0.last_included_index, LogIndex(150));
         assert_eq!(saved[0].1, snapshot_payload);
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 6.2 evaluator iter-2 item 1 — operator-triggered snapshot
+    // surfaces a follow-up purge_prefix failure to the admin caller
+    // instead of returning Ok and silently halting the driver.
+    //
+    // Scenario: a leader receives a `DriverEvent::TriggerSnapshot`
+    // (the admin HTTP `POST /admin/trigger-snapshot` path). The
+    // state-machine snapshot + SnapshotStore.save_snapshot succeed,
+    // so `take_snapshot_with_meta` returns Ok with follow-up
+    // `Action::TruncateLog(PrefixThroughInclusive(...))`. The
+    // follow-up's `purge_prefix` call then fails (e.g. disk error
+    // on segment-file deletion). The fix: the admin caller MUST
+    // receive `Err(Storage(...))` so the operator's dashboard does
+    // not show "snapshot ok" while the driver halts on its next
+    // tick. Previously the captured response was discarded and the
+    // caller was told `Ok(TriggeredSnapshotInfo)`.
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn trigger_snapshot_followup_purge_failure_surfaces_error_to_caller() {
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
+
+        // Promote to Leader explicitly so `handle_trigger_snapshot`
+        // does not short-circuit with `NotLeader`. The default
+        // post-construction role is Follower.
+        driver.node.role = NodeRole::Leader;
+        driver.node.leader_id = Some(driver.node.id);
+        driver.node.hard_state.current_term = Term(4);
+
+        // Seed a small log so the engine has prefix work to do when
+        // it processes `Input::SnapshotComplete`.
+        let entries: Vec<Entry> = (1..=10)
+            .map(|i| Entry {
+                index: LogIndex(i),
+                term: Term(4),
+                payload: EntryPayload::Command(Bytes::from(format!("cmd-{i}").into_bytes())),
+            })
+            .collect();
+        driver
+            .log_store
+            .append(&entries)
+            .expect("seed entries into the log store");
+        driver.node.set_last_log(LogIndex(10), Term(4));
+        driver.node.commit_index = LogIndex(10);
+        driver.node.last_applied = LogIndex(10);
+
+        // Pre-seed snapshot bytes so save_snapshot is deterministic.
+        *h.snapshot_payload.lock().unwrap() = b"trigger-snapshot-payload".to_vec();
+
+        // Arm the failure injection: the FOLLOW-UP TruncateLog(
+        // PrefixThroughInclusive(10)) that the engine emits after
+        // `Input::SnapshotComplete` will hit `purge_prefix` and
+        // return Storage(...). This is the path the fix exercises.
+        h.fail_next_purge_prefix
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        driver.handle_trigger_snapshot(reply_tx).await;
+
+        let result = reply_rx.await.expect("reply channel closed unexpectedly");
+        match result {
+            Err(XRaftError::Storage(msg)) => {
+                assert!(
+                    msg.contains("purge_prefix"),
+                    "error must propagate the underlying purge_prefix failure, got: {msg}",
+                );
+            }
+            other => panic!(
+                "expected Storage error from follow-up purge failure, got {other:?}; the admin caller must NOT receive Ok when the post-snapshot truncation fails",
+            ),
+        }
+
+        // The fail-stop contract: process_actions also sets
+        // `halt_reason`, so the driver's main loop would shut down
+        // on the next iteration. We don't run the loop here, but the
+        // halt_reason MUST be set so a follow-up tick triggers
+        // fail_stop_shutdown.
+        assert!(
+            driver.halt_reason.is_some(),
+            "follow-up purge failure must arm the driver's halt_reason for fail-stop on the next tick",
+        );
+
+        // The snapshot itself DID land in the store before the
+        // follow-up failed — we report failure to the caller but the
+        // partial state is preserved so the operator can inspect it.
+        let saved = h.saved_snapshots.lock().unwrap().clone();
+        assert_eq!(
+            saved.len(),
+            1,
+            "snapshot bytes should have been saved BEFORE the follow-up purge failed",
+        );
+        assert_eq!(saved[0].0.last_included_index, LogIndex(10));
     }
 
     // -----------------------------------------------------------------
