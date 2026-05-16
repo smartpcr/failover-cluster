@@ -6740,4 +6740,128 @@ port = 6000
             "term did not advance on a higher-term FetchRequest"
         );
     }
+
+    /// Five-voter Check-Quorum config (this node = 1; peers = 2, 3, 4, 5).
+    /// Builds on `five_voter_config` and toggles the Stage 7.1 flags on.
+    fn five_voter_check_quorum_config() -> ClusterConfig {
+        let mut cfg = five_voter_config();
+        cfg.enable_check_quorum = true;
+        cfg.enable_leader_lease = true;
+        cfg
+    }
+
+    /// Drive a 5-voter node directly to Leader by synthesising votes
+    /// from two peers (self + 2 = 3 = quorum of 5). Mirrors
+    /// `force_leader` but for the 5-voter cluster shape.
+    fn force_leader_5voter(node: &mut RaftNode) {
+        let _ = node.become_pre_candidate();
+        let _ = node.become_candidate();
+        node.votes_received.insert(NodeId(2));
+        node.votes_received.insert(NodeId(3));
+        let _ = node.become_leader();
+        assert_eq!(
+            node.role,
+            NodeRole::Leader,
+            "force_leader_5voter did not promote"
+        );
+    }
+
+    /// Work-item scenario validation — 5-voter Check-Quorum step-down.
+    /// Per the work item: "in a 5-node cluster, the leader needs at
+    /// least 2 of the 4 other voters to have responded within the
+    /// check quorum interval (since leader + 2 = 3 = majority of 5)".
+    /// With only ONE peer fetching, the leader counts itself + 1 = 2
+    /// reachable voters, which is < 3 (quorum of 5), so it must step
+    /// down at the next Check-Quorum tick.
+    #[test]
+    fn check_quorum_steps_down_5voter_when_only_one_peer_reachable() {
+        let mut node = RaftNode::new_with_seed(five_voter_check_quorum_config(), 41).unwrap();
+        force_leader_5voter(&mut node);
+        let interval = node.check_quorum_interval_ticks;
+        // Tick `interval - 1` ticks (just under the window). Refresh
+        // only ONE peer's `last_fetch_time` via a synthetic fetch; the
+        // other three peers stay at their `become_leader` baseline
+        // and will age out past the window after the next `interval`
+        // ticks.
+        run_ticks(&mut node, interval - 1);
+        let fetch_req = fetch_at(&node, NodeId(2), None);
+        let _ = node.handle_fetch_request(fetch_req);
+        // Now run another full `interval` ticks. Peer 2's fetch is
+        // recent (still inside the window) but peers 3/4/5 are now
+        // outside the window. The leader counts self (1) + peer2 (1)
+        // = 2 < 3 = quorum, so Check-Quorum trips a step-down.
+        let actions = run_ticks(&mut node, interval);
+        // After step-down the post-Check-Quorum follower may have
+        // ticked past its (fresh) election timer and transitioned to
+        // PreCandidate by the end of the loop. The Stage 7.1
+        // invariant is "leader yields its role on quorum loss", so we
+        // assert the role is no longer Leader and that a `StepDown`
+        // action was emitted at some point during the run.
+        assert_ne!(
+            node.role,
+            NodeRole::Leader,
+            "5-voter leader with only one reachable peer did not step down \
+             (expected: 1+1=2 < 3 quorum); role is still {:?}",
+            node.role
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::StepDown)),
+            "actions did not contain a StepDown: {actions:?}"
+        );
+    }
+
+    /// Work-item scenario validation — 5-voter Check-Quorum healthy.
+    /// With TWO peers fetching the leader counts itself + 2 = 3 = quorum
+    /// of 5, satisfying the work item's reachability threshold. The
+    /// leader must remain in role indefinitely.
+    #[test]
+    fn check_quorum_keeps_leader_5voter_when_two_peers_reachable() {
+        let mut node = RaftNode::new_with_seed(five_voter_check_quorum_config(), 43).unwrap();
+        force_leader_5voter(&mut node);
+        let interval = node.check_quorum_interval_ticks;
+        // Tick `interval - 1`, refresh TWO peers (2 and 3) via real
+        // FetchRequests, then tick another full `interval`. Self (1)
+        // + peer2 (1) + peer3 (1) = 3 = quorum of 5; Check-Quorum
+        // must not step the leader down.
+        run_ticks(&mut node, interval - 1);
+        let _ = node.handle_fetch_request(fetch_at(&node, NodeId(2), None));
+        let _ = node.handle_fetch_request(fetch_at(&node, NodeId(3), None));
+        run_ticks(&mut node, interval);
+        assert_eq!(
+            node.role,
+            NodeRole::Leader,
+            "5-voter leader with two reachable peers stepped down (expected: 1+2=3 = quorum, stays leader)"
+        );
+    }
+
+    /// Work-item scenario validation — 5-voter Leader-Lease activates
+    /// once a majority of voters (self + 2 peers in a 5-node cluster)
+    /// have sent a post-election Fetch within the Check-Quorum window.
+    /// Mirrors the existing 3-voter lease test but exercises the
+    /// 5-voter quorum arithmetic the work item calls out explicitly.
+    #[test]
+    fn leader_lease_active_5voter_after_two_peer_post_election_fetches() {
+        let mut node = RaftNode::new_with_seed(five_voter_check_quorum_config(), 47).unwrap();
+        force_leader_5voter(&mut node);
+        // Advance the logical clock so post-election fetch stamps are
+        // strictly greater than `leader_started_tick` (the lease
+        // baseline).
+        let _ = node.step(Input::Tick);
+        // A single peer fetch is NOT enough on a 5-voter cluster:
+        // self (1) + peer2 (1) = 2 < 3 = quorum of 5.
+        let _ = node.handle_fetch_request(fetch_at(&node, NodeId(2), None));
+        assert!(
+            !node.has_active_lease(),
+            "lease must not be active with only one post-election peer fetch on a 5-voter cluster \
+             (expected: 1+1=2 < 3 quorum)"
+        );
+        // Second peer fetch crosses the threshold: self (1) + peer2 (1)
+        // + peer3 (1) = 3 = quorum. Lease is now active.
+        let _ = node.handle_fetch_request(fetch_at(&node, NodeId(3), None));
+        assert!(
+            node.has_active_lease(),
+            "lease must be active after two post-election peer fetches on a 5-voter cluster \
+             (expected: 1+2=3 = quorum, lease active)"
+        );
+    }
 }
