@@ -499,9 +499,10 @@ These were open questions in earlier iterations and are now resolved:
 4. **Backup artefacts are out of contract.** Backup and snapshot
    artefacts (`*.review-backup`, `*.iter-snapshot.bak`) are not part
    of the Stage 3.1 design contract. The repository's `.gitignore`
-   covers both patterns, so any such files that appear in a working
-   tree are untracked by design. The operator's answer to the
-   `stage-3-1-leftover-backup-files-cleanup` question explicitly
-   delegated removal of any remaining `*.review-backup` file to a
-   future workstream (`delete-via-future-workstream`); Stage 3.1
-   must not model that cleanup as a deliverable.
+   covers both patterns, so any such files appearing in a working
+   tree are untracked by design and any physical cleanup is a future
+   operational workstream — Stage 3.1 must not model it as a
+   deliverable. The planning-track contract is therefore decoupled
+   from the implementation-track cleanup question: this plan owns
+   only the engine's source contract under `xraft-core/src/`, not
+   the disposition of any backup file under the repo root.
