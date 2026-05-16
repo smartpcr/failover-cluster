@@ -245,16 +245,10 @@ impl FileHardStateStore {
         #[cfg(unix)]
         {
             let dir = fs::File::open(&self.dir).map_err(|e| {
-                XRaftError::Storage(format!(
-                    "open dir for fsync '{}': {e}",
-                    self.dir.display()
-                ))
+                XRaftError::Storage(format!("open dir for fsync '{}': {e}", self.dir.display()))
             })?;
             dir.sync_all().map_err(|e| {
-                XRaftError::Storage(format!(
-                    "fsync dir '{}': {e}",
-                    self.dir.display()
-                ))
+                XRaftError::Storage(format!("fsync dir '{}': {e}", self.dir.display()))
             })?;
         }
 

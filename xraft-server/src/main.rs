@@ -235,8 +235,14 @@ fn init_tracing() -> Option<LogFilterReloadHandle> {
 ///   - `tick_interval_ms` → driver `tokio::time::interval` rebuilt;
 ///     the next tick fires at the new cadence (no restart).
 ///   - The full NodeConfig is re-parsed + cached in shared state.
-///   - `config_revision` counter is bumped on every successful
-///     reload — operators can confirm via `/health`.
+///   - `config_revision` counter is bumped ONLY when every
+///     engine-critical hot-reload step succeeds (currently:
+///     the driver tick-interval refresh). If the driver send
+///     fails — e.g. the driver task has already shut down —
+///     `reload_config` returns early without bumping, so
+///     operators watching `/health` can distinguish a partial
+///     apply (cached snapshot updated, but tick cadence still
+///     stale) from a fully-successful reload.
 /// - NOT HOT-RELOADABLE: `listen_addr`, `voters`, `data_dir`,
 ///   `node_id`, `cluster_id`, `admin_listen_addr`. Changing these
 ///   requires a restart; the reload handler logs which fields differ
@@ -330,23 +336,36 @@ async fn reload_config(
     // restart. The driver enqueues an internal `DriverEvent` and
     // rebuilds `self.tick = interval(new)` inside its select!.
     //
-    // If the send fails the driver has already shut down — log
-    // and continue; the bumped revision below still records the
-    // operator-visible reload attempt.
+    // If the send fails the driver has already shut down. We
+    // suppress the `config_revision` bump in that case (early
+    // return below) so operators watching `/health` do NOT
+    // mistake a partial apply — cached `NodeConfig` snapshot
+    // updated, but tick cadence still stale — for a fully-
+    // successful reload.
     let driver = server.driver_handle();
     if let Err(e) = driver.reload_tick_interval(new_tick_interval).await {
         warn!(
             target: "xraft_server::main",
             error = %e,
-            "SIGHUP reload: driver tick-interval refresh failed (driver shutting down?)"
+            "SIGHUP reload: driver tick-interval refresh failed (driver shutting down?); \
+             config_revision NOT bumped — /health continues reporting the previous revision \
+             so operators can distinguish a partial apply from a full one"
         );
-    } else {
-        info!(
-            target: "xraft_server::main",
-            tick_ms = new_tick_interval.as_millis(),
-            "SIGHUP reload: driver tick interval refreshed live"
-        );
+        // Engine-critical step failed: skip the
+        // `config_revision` bump (and the log-filter refresh
+        // below) so the operator-visible "fully applied"
+        // signal stays in sync with reality. The cached
+        // `NodeConfig` snapshot swapped in above is left
+        // alone; no engine code reads it outside this reload
+        // path in Stage 6.1, and the next successful SIGHUP
+        // will overwrite it.
+        return;
     }
+    info!(
+        target: "xraft_server::main",
+        tick_ms = new_tick_interval.as_millis(),
+        "SIGHUP reload: driver tick interval refreshed live"
+    );
 
     // Refresh log filter from the current `RUST_LOG`. This is
     // the most operationally useful hot-reload because it lets
