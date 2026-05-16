@@ -679,6 +679,28 @@ election_timeout_max_ms = 300
 fetch_interval_ms = 50
 tick_interval_ms = 10
 
+# Check Quorum and Leader Lease (Stage 7.1)
+# - `enable_check_quorum` (bool, default true): the leader steps down
+#   if a majority of the full voter set (self + reachable voter peers)
+#   has not sent a Fetch RPC within `check_quorum_interval_ms`.
+#   Disable only to exercise the "no Check Quorum" baseline.
+# - `enable_leader_lease` (bool, default false): when true the leader
+#   MAY skip the extra commit-index confirmation round-trip on
+#   internal read queries (admin status, StateMachine lookups) while
+#   it holds an active lease (a quorum of voters have sent a fresh
+#   Fetch within the current check-quorum window). With the flag off
+#   (or with the lease inactive), every read takes the slow path and
+#   waits for fresh quorum confirmation. This is a leader-internal
+#   optimisation; XRAFT v1 does not expose an external client read API.
+# - `check_quorum_interval_ms` (u64, optional): wall-clock window for
+#   both Check-Quorum and Leader-Lease. When omitted, defaults to
+#   `2 * election_timeout_max_ms` per architecture.md §2.1 — a
+#   transient stall in fetch traffic must not spuriously step the
+#   leader down.
+enable_check_quorum = true
+enable_leader_lease = false
+# check_quorum_interval_ms = 600
+
 # Snapshots
 snapshot_interval = 10000
 max_log_entries_before_compaction = 100000
@@ -724,6 +746,9 @@ Environment variable overrides (applied after TOML parsing, before validation):
 | `XRAFT_SNAPSHOT_INTERVAL` | `snapshot_interval` |
 | `XRAFT_MAX_LOG_ENTRIES` | `max_log_entries_before_compaction` |
 | `XRAFT_DATA_DIR` | `data_dir` |
+| `XRAFT_ENABLE_CHECK_QUORUM` | `enable_check_quorum` — bool (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`, case-insensitive) |
+| `XRAFT_ENABLE_LEADER_LEASE` | `enable_leader_lease` — bool (same parser as `XRAFT_ENABLE_CHECK_QUORUM`) |
+| `XRAFT_CHECK_QUORUM_INTERVAL_MS` | `check_quorum_interval_ms` — `u64` milliseconds; omit (or leave unset) to use the derived default `2 * election_timeout_max_ms` |
 
 ---
 

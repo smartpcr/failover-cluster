@@ -7011,8 +7011,7 @@ port = 6000
                 "leader must remain in role after cycle {cycle} boundary tick (1+2=3 quorum)"
             );
             assert_eq!(
-                node.check_quorum_elapsed_ticks,
-                0,
+                node.check_quorum_elapsed_ticks, 0,
                 "elapsed counter must reset to 0 after a successful Check-Quorum on cycle {cycle}"
             );
         }
