@@ -52,7 +52,6 @@ use xraft_core::message::{
     FetchSnapshotRequest, Input, LogTruncation, OutboundMessage, PreVoteRequest, PreVoteResponse,
     SnapshotRedirect, VoteRequest, VoteResponse,
 };
-use xraft_core::node::PeerState;
 use xraft_core::state_machine::StateMachine;
 use xraft_core::storage::{HardStateStore, LogStore, SnapshotMeta, SnapshotStore};
 use xraft_core::transport::{RaftMessageHandler, SnapshotChunkStream, Transport};
@@ -2919,43 +2918,35 @@ where
                     let (eff_index, eff_term) = self.effective_log_tip();
                     self.node.set_last_log(eff_index, eff_term);
                 }
-                Action::ApplyToStateMachine { from, to } => {
-                    if let Err(reason) = self.apply_committed(from, to) {
-                        // Mirror the persistence-failure branches above:
-                        // a fail-stopping driver must surface the error
-                        // to any in-flight inbound RPC (Vote/PreVote/
-                        // Fetch/FetchSnapshot) whose handler reads
-                        // `captured.error` before any captured success
-                        // payload. Without this, the RPC reply can
-                        // return Ok with a captured response while the
-                        // driver is about to halt — clients then act on
-                        // a "successful" reply from a dying node.
-                        captured.error = Some(XRaftError::Storage(reason.clone()));
-                        self.halt_reason.get_or_insert(reason);
+                Action::TruncateLog(LogTruncation::PrefixThroughInclusive {
+                    through_index_inclusive,
+                }) => {
+                    // Stage 5.3 snapshot coordination: the engine has
+                    // recorded a snapshot at `through_index_inclusive`
+                    // (via `Input::SnapshotComplete`) and now instructs
+                    // the driver to reclaim every log entry at or below
+                    // that index. `LogStore::purge_prefix` is the
+                    // contract method: implementations purge in-memory
+                    // state and (durably) ensure restart-replay does
+                    // not resurrect compacted entries. We flush after
+                    // the purge so that any sidecar marker /
+                    // segment-deletion ordering becomes visible on
+                    // disk before the driver continues.
+                    if let Err(e) = self.log_store.purge_prefix(through_index_inclusive) {
+                        let msg =
+                            format!("log purge_prefix({through_index_inclusive}) failed: {e}");
+                        error!(target: "xraft_server::driver", %msg, "halting driver");
+                        captured.error = Some(XRaftError::Storage(msg.clone()));
+                        self.halt_reason.get_or_insert(msg);
                         break;
                     }
-                }
-                Action::TakeSnapshot => {
-                    if let Err(reason) = self.handle_take_snapshot() {
-                        error!(
-                            target: "xraft_server::driver",
-                            reason = %reason,
-                            "TakeSnapshot failed; halting driver"
+                    if let Err(e) = self.log_store.flush() {
+                        let msg = format!(
+                            "log flush after purge_prefix({through_index_inclusive}) failed: {e}"
                         );
-                        captured.error = Some(XRaftError::Storage(reason.clone()));
-                        self.halt_reason.get_or_insert(reason);
-                        break;
-                    }
-                }
-                Action::InstallSnapshot { metadata, data } => {
-                    if let Err(reason) = self.handle_install_snapshot(metadata, data) {
-                        error!(
-                            target: "xraft_server::driver",
-                            reason = %reason,
-                            "InstallSnapshot failed; halting driver"
-                        );
-                        captured.error = Some(XRaftError::Storage(reason.clone()));
-                        self.halt_reason.get_or_insert(reason);
+                        error!(target: "xraft_server::driver", %msg, "halting driver");
+                        captured.error = Some(XRaftError::Storage(msg.clone()));
+                        self.halt_reason.get_or_insert(msg);
                         break;
                     }
                     debug!(
@@ -2963,15 +2954,6 @@ where
                         through_index = %through_index_inclusive,
                         "TruncateLog (prefix compaction) purged"
                     );
-                    // Stage 7.3 — fire the log-compaction observer so
-                    // prometheus impls bump
-                    // `xraft_log_compaction_events_total`. Done here
-                    // (not in `purge_prefix`) so the observer reflects
-                    // the engine-driven compaction event, not internal
-                    // store maintenance.
-                    if let Some(obs) = &self.observer {
-                        obs.on_log_compaction(through_index_inclusive);
-                    }
                 }
                 Action::ApplyToStateMachine { from, to } => {
                     if let Err(e) = self.apply_committed(from, to) {
@@ -3260,9 +3242,14 @@ where
                             last_included_index: snapshot_metadata.last_included_index,
                             last_included_term: snapshot_metadata.last_included_term,
                         }),
-                        // RedirectToSnapshot is leader-emitted from
-                        // the leader role: the engine only schedules
-                        // this when serving fetch as the leader.
+                        // The redirect is served from the engine's
+                        // leader-role `handle_fetch_request` path — by
+                        // construction this response carries
+                        // authoritative leader state, so the
+                        // Stage 6.2 leader-hint integrity flag is
+                        // `true` (the follower may safely cache the
+                        // returned `(leader_id, leader_epoch)` tuple
+                        // as a routing hint).
                         is_leader: true,
                     };
 
@@ -3478,43 +3465,22 @@ where
     /// resolve any pending client waiters whose index falls within the
     /// range.
     ///
-    /// Returns `Ok(())` when every entry in the range was applied
-    /// successfully (or was a non-application payload). Returns
-    /// `Err(reason)` on the first failure — the caller MUST set
-    /// `halt_reason` and stop processing further input. Per the
-    /// `Action::ApplyToStateMachine` contract (engine has already
-    /// advanced `last_applied = to` before emitting the action), the
-    /// driver cannot safely continue past a failed apply because the
-    /// in-memory `last_applied` would diverge from what the state
-    /// machine actually applied.
+    /// Stage 5.2 fail-stop contract (evaluator feedback iter-2 item 2):
+    /// any failure to apply a committed entry (log read error, missing
+    /// entry, state-machine apply error) returns `Err`. The caller
+    /// (`Action::ApplyToStateMachine` arm in `process_actions`) sets
+    /// `halt_reason` so the driver halts and the operator restarts the
+    /// node — committed entries must apply or the node must halt /
+    /// recover. Partial application of a committed batch is unsafe.
     ///
-    /// Any waiter associated with the failing index receives the error
-    /// via its oneshot so `propose()` returns rather than hanging;
-    /// remaining waiters are failed by `fail_stop_shutdown()` on the
-    /// halt path.
-    fn apply_committed(&mut self, from: LogIndex, to: LogIndex) -> std::result::Result<(), String> {
-        // Defensive guards: the engine's `Action::ApplyToStateMachine`
-        // contract states `from <= to`, but `apply_committed` is also
-        // reachable from direct dispatch in tests and a future engine
-        // change could regress this. Halt instead of panicking on
-        // either an inverted range or a `to + 1` overflow.
-        if from > to {
-            let msg = format!("apply: invalid range {from}..={to} (from > to)");
-            error!(target: "xraft_server::driver", %msg, "halting driver");
-            return Err(msg);
-        }
-        let end = match to.0.checked_add(1) {
-            Some(v) => LogIndex(v),
-            None => {
-                let msg = format!("apply: range end overflow for to={to}");
-                error!(target: "xraft_server::driver", %msg, "halting driver");
-                return Err(msg);
-            }
-        };
-        let entries = match self.log_store.get_range(from, end) {
+    /// All waiters in `[from, to]` that have not been resolved with
+    /// success are failed with the same `Err` so `propose()` reports
+    /// failure rather than hanging when the driver shuts down.
+    fn apply_committed(&mut self, from: LogIndex, to: LogIndex) -> XResult<()> {
+        let expected_count = to.0.saturating_sub(from.0).saturating_add(1) as usize;
+        let entries = match self.log_store.get_range(from, LogIndex(to.0 + 1)) {
             Ok(e) => e,
             Err(e) => {
-                let msg = format!("apply: read range {from}..={to} failed: {e}");
                 error!(
                     target: "xraft_server::driver",
                     error = %e,
@@ -3522,86 +3488,57 @@ where
                     to = %to,
                     "apply: failed to read log range"
                 );
-                // Fail every waiter in [from, to] so propose() doesn't
-                // hang forever when log read fails post-commit.
-                let indices: Vec<LogIndex> =
-                    self.pending.range(from..=to).map(|(k, _)| *k).collect();
-                for idx in indices {
-                    self.resolve_waiters_at(idx, Err(XRaftError::Storage(msg.clone())));
-                }
-                return Err(msg);
+                let err_msg = format!("apply: read range {from}..={to} failed: {e}");
+                self.fail_waiters_in_range(from, to, &err_msg);
+                return Err(XRaftError::Storage(err_msg));
             }
         };
-        // Validate the range is complete and contiguous. The
-        // `Action::ApplyToStateMachine` contract is that the engine has
-        // ALREADY advanced `last_applied = to` before emitting the
-        // action, so any gap or short read here means the SM will not
-        // see entries that the engine believes are applied — a silent
-        // divergence that would corrupt every subsequent linearizable
-        // read. Halt the driver rather than skipping silently.
-        let expected_len = (to.0 - from.0 + 1) as usize;
-        if entries.len() != expected_len {
-            let msg = format!(
-                "apply: log_store.get_range({from}..={to}) returned {} entries, expected {}",
-                entries.len(),
-                expected_len
+
+        // Validate the returned entries fully cover [from, to] without
+        // gaps. `LogStore::get_range` is half-open `[start, end)` but
+        // its contract does not guarantee contiguity — a malformed or
+        // partially-corrupted store could return fewer entries. The
+        // engine has already committed these indices, so any missing
+        // entry violates the apply contract and must fail-stop.
+        if entries.len() != expected_count {
+            let err_msg = format!(
+                "apply: log_store returned {got} entries for committed range \
+                 {from}..={to} (expected {expected_count}); committed entries missing — \
+                 cannot recover without restart",
+                got = entries.len(),
             );
-            error!(
-                target: "xraft_server::driver",
-                returned = entries.len(),
-                expected = expected_len,
-                from = %from,
-                to = %to,
-                "apply: log range short read; halting driver"
-            );
-            let indices: Vec<LogIndex> =
-                self.pending.range(from..=to).map(|(k, _)| *k).collect();
-            for idx in indices {
-                self.resolve_waiters_at(idx, Err(XRaftError::Storage(msg.clone())));
-            }
-            return Err(msg);
+            error!(target: "xraft_server::driver", %err_msg, "halting driver");
+            self.fail_waiters_in_range(from, to, &err_msg);
+            return Err(XRaftError::Storage(err_msg));
         }
-        for (offset, entry) in entries.iter().enumerate() {
-            let expected_idx = LogIndex(from.0 + offset as u64);
+        // Indices must be contiguous starting at `from`.
+        for (i, entry) in entries.iter().enumerate() {
+            let expected_idx = LogIndex(from.0 + i as u64);
             if entry.index != expected_idx {
-                let msg = format!(
-                    "apply: log_store.get_range({from}..={to}) returned entry at {} at position {}, expected {}",
-                    entry.index, offset, expected_idx
+                let err_msg = format!(
+                    "apply: log_store returned entry at {actual} where {expected} \
+                     was required (committed range {from}..={to}) — \
+                     cannot recover without restart",
+                    actual = entry.index,
+                    expected = expected_idx,
                 );
-                error!(
-                    target: "xraft_server::driver",
-                    got = %entry.index,
-                    expected = %expected_idx,
-                    "apply: log range index gap; halting driver"
-                );
-                let indices: Vec<LogIndex> =
-                    self.pending.range(from..=to).map(|(k, _)| *k).collect();
-                for idx in indices {
-                    self.resolve_waiters_at(idx, Err(XRaftError::Storage(msg.clone())));
-                }
-                return Err(msg);
+                error!(target: "xraft_server::driver", %err_msg, "halting driver");
+                self.fail_waiters_in_range(from, to, &err_msg);
+                return Err(XRaftError::Storage(err_msg));
             }
         }
+
         for entry in entries {
             match &entry.payload {
                 EntryPayload::Command(bytes) => {
                     // The `StateMachine::apply` contract returns the
-                    // serialised command result. Stage 5.1 does not yet
-                    // pipe that result back to the proposing client —
+                    // serialised command result (see `xraft-core`
+                    // `state_machine.rs` doc-comment). Stage 5.1 does not
+                    // yet pipe that result back to the proposing client —
                     // that wiring belongs to the embedded-read / propose-
                     // result work in a later stage — so we discard the
                     // bytes here while still honouring the error path.
-                    //
-                    // Stage 7.3: scope the mutex guard to a separate
-                    // statement so the `MutexGuard` is dropped before
-                    // `self.resolve_waiters_at` / `fail_waiters_in_range`
-                    // re-borrow `self` mutably.
-                    let apply_result = self
-                        .state_machine
-                        .lock()
-                        .expect("state_machine mutex poisoned")
-                        .apply(entry.index, bytes);
-                    match apply_result {
+                    match self.state_machine.apply(entry.index, bytes) {
                         Ok(_result) => {
                             self.resolve_waiters_at(entry.index, Ok(entry.index));
                         }
@@ -3629,24 +3566,18 @@ where
                     self.resolve_waiters_at(entry.index, Ok(entry.index));
                 }
             }
-            self.resolve_waiters_at(entry.index, Ok(entry.index));
         }
         Ok(())
     }
 
-    /// Dispatch [`Action::TakeSnapshot`]: capture state-machine state and
-    /// persist it to the [`SnapshotStore`] tagged with the current
-    /// `last_applied` index, the term of that log entry, and the active
-    /// voter set. See module-level "Stage 5.1 dispatch" comment for
-    /// invariants enforced by each guard.
-    fn handle_take_snapshot(&mut self) -> std::result::Result<(), String> {
-        let last_applied = self.node.last_applied;
-        if last_applied.0 == 0 {
-            debug!(
-                target: "xraft_server::driver",
-                "TakeSnapshot skipped: last_applied=0 (no committed state)"
-            );
-            return Ok(());
+    /// Resolve every pending waiter in `[from, to]` with the same
+    /// `XRaftError::Storage(msg)`. Used on fail-stop paths so clients
+    /// receive a clear error rather than a channel-closed error when
+    /// the driver shuts down.
+    fn fail_waiters_in_range(&mut self, from: LogIndex, to: LogIndex, msg: &str) {
+        let indices: Vec<LogIndex> = self.pending.range(from..=to).map(|(k, _)| *k).collect();
+        for idx in indices {
+            self.resolve_waiters_at(idx, Err(XRaftError::Storage(msg.to_string())));
         }
     }
 
@@ -3672,538 +3603,196 @@ where
         }
     }
 
-    /// Stage 7.3 (iter 8/9) — two-phase async dispatcher for the
-    /// background snapshot worker. Resolves the snapshot's metadata,
-    /// then AWAITS a `tokio::task::spawn_blocking` worker that locks
-    /// the SM and calls `begin_snapshot()` to capture the snapshot
-    /// view. After the await, spawns a background `tokio::spawn`
-    /// task whose interior runs `SnapshotSerializer::serialize()` +
-    /// `SnapshotStore::save_snapshot()` on `spawn_blocking` (no SM
-    /// lock). Completion is delivered later via
-    /// [`SnapshotCompletion`] on `self.snapshot_done_rx` and handled
-    /// by [`Self::handle_snapshot_completed`].
+    /// Handle [`Action::TakeSnapshot`]: ask the state machine for a
+    /// serialised snapshot of its current state, persist it to the
+    /// [`SnapshotStore`], and feed [`Input::SnapshotComplete`] back
+    /// into the engine. The engine in turn emits the post-snapshot
+    /// [`Action::TruncateLog`] (prefix compaction) which the caller
+    /// adds to the worklist.
     ///
-    /// **Non-blocking contract (iter 8)**: heavy work runs on the
-    /// blocking pool — the tokio runtime's worker threads (i.e. the
-    /// "event loop") stay free for other tasks (inbound RPCs,
-    /// replication, admin) during the capture await and during the
-    /// background serialize/save. The DRIVER TASK itself is parked
-    /// for the capture-phase await so that no concurrent
-    /// `Action::ApplyToStateMachine` can be processed by the driver
-    /// between metadata resolution and view capture (atomicity
-    /// invariant from iter-7).
-    ///
-    /// **Client-latency SLA scoping (iter 9)**: the awaited capture
-    /// phase parks the driver task for the duration of
-    /// `begin_snapshot()`. For state machines whose
-    /// [`SnapshotCaptureMode`](xraft_core::state_machine::SnapshotCaptureMode)
-    /// is
-    /// [`NonBlockingCapture`](xraft_core::state_machine::SnapshotCaptureMode::NonBlockingCapture)
-    /// (CoW override) the await is `O(1)` — propose latency stays
-    /// within the 2× SLA from `architecture.md` §7 / `e2e-scenarios.md`
-    /// Feature 15. For state machines on the trait default
-    /// ([`EagerMayStallDriver`](xraft_core::state_machine::SnapshotCaptureMode::EagerMayStallDriver))
-    /// the await is `O(state-bytes)` (the default impl eagerly
-    /// serializes under the SM lock) — the reactor stays free but
-    /// the driver task is parked and concurrent `propose`
-    /// responses are deferred. These SMs are EXPLICITLY OUT OF
-    /// SCOPE for the 2× SLA — see the
-    /// [`SnapshotCaptureMode`](xraft_core::state_machine::SnapshotCaptureMode)
-    /// doc and the regression test
-    /// `scenario_default_eager_begin_snapshot_stalls_driver_loop_documented_limitation`,
-    /// which uses a deterministic barrier to prove (and document)
-    /// that the SM-lock-holding capture phase serialises `propose`
-    /// → `apply` against the snapshot worker.
-    ///
-    /// `reply` is `Some` only for the operator-triggered path
-    /// ([`DriverEvent::TriggerSnapshot`]); the eventual completion
-    /// resolves the oneshot with the
-    /// [`TriggeredSnapshotInfo`]/`Err`. For engine-emitted
-    /// `Action::TakeSnapshot` the reply is `None` and the engine
-    /// learns of completion only through `Input::SnapshotComplete`.
-    ///
-    /// Returns `Err` (after awaiting the capture phase) when:
+    /// All work runs on the driver task; the state machine and store
+    /// implementations are responsible for their own internal locking.
+    /// Returns the follow-on actions emitted by the engine on success;
+    /// returns `Err` when:
     /// - `LogStore::term_at(through_index)` cannot resolve a term
-    ///   for `through_index > 0` (the engine emitted `TakeSnapshot`
-    ///   for an index outside the durable log — a programming bug);
-    /// - the driver-level `snapshot_worker_in_flight` guard is
-    ///   already set (a previous worker has not yet been processed);
-    /// - the awaited `spawn_blocking(begin_snapshot)` worker panics
-    ///   or `begin_snapshot()` itself returns an error.
+    ///   (the entry is missing — the engine emitted `TakeSnapshot`
+    ///   for an index outside the durable log),
+    /// - `StateMachine::snapshot()` returns an error,
+    /// - `SnapshotStore::save_snapshot()` returns an error.
     ///
-    /// All surface as `Storage` errors so the caller fail-stops.
-    /// Serialize/save errors arrive later via
-    /// `SnapshotCompletion.result` and are fail-stopped in
-    /// `handle_snapshot_completed`.
-    async fn dispatch_snapshot_worker(
+    /// On error the caller fails the driver fail-stop contract.
+    fn handle_take_snapshot(&mut self, through_index: LogIndex) -> XResult<Vec<Action>> {
+        let (_meta, follow_ups) = self.take_snapshot_with_meta(through_index)?;
+        Ok(follow_ups)
+    }
+
+    /// Internal helper shared by the engine-emitted
+    /// `Action::TakeSnapshot` path and the operator-triggered
+    /// [`DriverEvent::TriggerSnapshot`] path. Returns both the
+    /// canonical [`SnapshotMeta`] (so operator tooling can echo
+    /// `(last_included_index, last_included_term, size_bytes)` back
+    /// over the admin wire) and the engine's follow-on actions
+    /// (e.g. `Action::TruncateLog`).
+    fn take_snapshot_with_meta(
         &mut self,
         through_index: LogIndex,
-        reply: Option<oneshot::Sender<XResult<TriggeredSnapshotInfo>>>,
-    ) -> XResult<()> {
-        // Defensive guard — a previous worker has not yet completed.
-        // For the engine-emitted path this should never trip
-        // (`engine.snapshot_in_flight` gates further emissions); for
-        // the operator path the caller checks both flags before
-        // calling. If it does trip, surface as Storage so the driver
-        // fail-stops and the operator notices the regression.
-        if self.snapshot_worker_in_flight {
-            return Err(XRaftError::Storage(
-                "dispatch_snapshot_worker: another worker still in flight; \
-                 engine/operator gating is broken"
-                    .to_string(),
-            ));
-        }
-
+    ) -> XResult<(SnapshotMeta, Vec<Action>)> {
         // Resolve the term at `through_index` — required for the
         // SnapshotMeta. The engine cannot supply this itself because it
         // does not hold log entries (only the index/term mirror tail).
         let through_term = match self.log_store.term_at(through_index)? {
             Some(t) => t,
             None => {
-                return Err(
-                    "TakeSnapshot: cannot snapshot without a configured voter_set".to_string(),
-                );
+                // Snapshotting at index 0 is the "empty snapshot before
+                // any entries" case — accept term(0). Otherwise this is
+                // a programming error in the engine's snapshot-trigger
+                // logic and we surface it as a storage error.
+                if through_index.0 == 0 {
+                    Term(0)
+                } else {
+                    return Err(XRaftError::Storage(format!(
+                        "snapshot: no entry at through_index {through_index} to anchor SnapshotMeta term",
+                    )));
+                }
             }
         };
 
-        // Build the canonical metadata up-front. The size_bytes is
-        // patched in by the worker once the SM finishes serializing.
-        // The store will normalise `id` to
-        // `snapshot-{term:010}-{index:020}` so we hand it an empty
+        let data = self.state_machine.snapshot().map_err(|e| {
+            XRaftError::Storage(format!(
+                "state machine snapshot at {through_index} failed: {e}"
+            ))
+        })?;
+
+        // Build the canonical metadata. The store will normalise `id`
+        // to `snapshot-{term:010}-{index:020}` so we hand it an empty
         // placeholder — see `SnapshotStore::save_snapshot` doc.
         let voter_set = self.node.voter_set.clone();
-        let metadata_initial = SnapshotMeta {
+        let mut metadata = SnapshotMeta {
             id: String::new(),
             last_included_index: through_index,
             last_included_term: through_term,
             voter_set,
-            size_bytes: None,
+            size_bytes: Some(data.len() as u64),
             checksum: None,
         };
 
-        // Stage 7.3 (iter 8) — STRUCTURAL FIX for iter-7 evaluator
-        // item 1: capture the snapshot view on a `spawn_blocking`
-        // worker thread (so the default `begin_snapshot` impl, which
-        // calls `self.snapshot()` eagerly, does NOT run on the reactor
-        // thread) BUT `.await` the capture before returning, so it
-        // remains atomic with the just-resolved metadata.
-        //
-        // Atomicity rationale: this fn is called from a single
-        // `select!` arm body in `Self::run()`. Only ONE branch's body
-        // executes at a time, so while we await the capture worker no
-        // subsequent `Action::ApplyToStateMachine` can be processed
-        // by the driver (nor any other inbound RPC / tick handler).
-        // The captured serializer is therefore guaranteed to reflect
-        // SM state at exactly `last_included_index = through_index`,
-        // closing the iter-6 metadata/payload race.
-        //
-        // Stage 7.3 requirement satisfied: heavy `begin_snapshot()`
-        // work (e.g. the default impl's `self.snapshot()` call, or a
-        // CoW deep-clone) runs in `tokio::task::spawn_blocking` — the
-        // reactor stays free to poll other tokio tasks (e.g. inbound
-        // RPC handlers, replication tasks, the admin endpoint) during
-        // the await. Override impls (CoW SMs) make this near-free;
-        // default impls take O(state-bytes) but still off-reactor.
-        let sm = Arc::clone(&self.state_machine);
-        let serializer = tokio::task::spawn_blocking(
-            move || -> XResult<Box<dyn xraft_core::state_machine::SnapshotSerializer>> {
-                let guard = sm.lock().expect("state_machine mutex poisoned");
-                guard.begin_snapshot().map_err(|e| {
-                    XRaftError::Storage(format!(
-                        "state machine begin_snapshot at {through_index} failed: {e}"
-                    ))
-                })
-            },
-        )
-        .await
-        .map_err(|join_err| {
-            XRaftError::Storage(format!(
-                "begin_snapshot worker panicked or was cancelled: {join_err}"
-            ))
-        })??;
-
-        let ss = Arc::clone(&self.snapshot_store);
-        let done_tx = self.snapshot_done_tx.clone();
-        let meta_for_worker = metadata_initial.clone();
-        let final_metadata = SnapshotMeta {
-            id: format!("snapshot-{:010}-{:020}", through_term.0, through_index.0),
-            last_included_index: through_index,
-            last_included_term: through_term,
-            voter_set: metadata_initial.voter_set.clone(),
-            // `size_bytes` is patched into the canonical metadata
-            // emitted by the worker (post-serialisation); here we
-            // pre-populate `None` so a worker failure still produces
-            // a structurally valid `SnapshotMeta` in the completion
-            // message.
-            size_bytes: None,
-            checksum: None,
-        };
-
-        self.snapshot_worker_in_flight = true;
-
-        tokio::spawn(async move {
-            // Stage 7.3 (iter 8) — the SM serializer was captured by
-            // an awaited `spawn_blocking` worker BEFORE this task was
-            // spawned (see comment above). The capture phase is
-            // atomic with metadata resolution (the awaiting
-            // `select!` arm body cannot process any further actions
-            // during the await). This background task now only runs
-            // `SnapshotSerializer::serialize()` (no SM lock) and
-            // `SnapshotStore::save_snapshot()`, both on the blocking
-            // pool — concurrent applies advance the live SM without
-            // interference.
-            //
-            // Earlier iterations:
-            //   - iter-6 ran begin_snapshot inside this task → race
-            //     with applies between dispatch and capture.
-            //   - iter-7 ran begin_snapshot on the driver thread →
-            //     atomic but blocked the reactor for the default
-            //     eager impl's `self.snapshot()`.
-            //   - iter-8 awaits spawn_blocking(begin_snapshot)
-            //     before this task is spawned → atomic AND off the
-            //     reactor.
-            let work =
-                tokio::task::spawn_blocking(move || -> XResult<(SnapshotOutcome, SnapshotMeta)> {
-                    let started_at = Instant::now();
-                    // No SM lock here. The serializer owns its
-                    // captured view (immutable wrt subsequent
-                    // applies, per the `SnapshotSerializer`
-                    // contract in `xraft-core::state_machine`).
-                    let data = serializer.serialize().map_err(|e| {
-                        XRaftError::Storage(format!(
-                            "state machine snapshot serialize at {through_index} failed: {e}"
-                        ))
-                    })?;
-                    let data_size = data.len();
-                    let mut meta = meta_for_worker;
-                    meta.size_bytes = Some(data_size as u64);
-                    {
-                        let mut guard = ss.lock().expect("snapshot_store mutex poisoned");
-                        guard.save_snapshot(meta.clone(), &data).map_err(|e| {
-                            XRaftError::Storage(format!(
-                                "save_snapshot at (term={}, index={}) failed: {e}",
-                                through_term.0, through_index.0,
-                            ))
-                        })?;
-                    }
-                    // The worker returns the canonical metadata
-                    // (with `size_bytes` set + id stamped by the
-                    // store) so the driver doesn't have to recompute
-                    // it on completion.
-                    let canonical_meta = SnapshotMeta {
-                        id: format!("snapshot-{:010}-{:020}", through_term.0, through_index.0),
-                        last_included_index: through_index,
-                        last_included_term: through_term,
-                        voter_set: meta.voter_set,
-                        size_bytes: Some(data_size as u64),
-                        checksum: None,
-                    };
-                    Ok((
-                        SnapshotOutcome {
-                            duration: started_at.elapsed(),
-                            data_size,
-                        },
-                        canonical_meta,
-                    ))
-                })
-                .await;
-
-            // Fold spawn_blocking JoinError + worker result into a
-            // single `XResult<SnapshotOutcome>` + canonical metadata.
-            let (result, metadata) = match work {
-                Ok(Ok((outcome, meta))) => (Ok(outcome), meta),
-                Ok(Err(e)) => (Err(e), final_metadata),
-                Err(join_err) => (
-                    Err(XRaftError::Storage(format!(
-                        "snapshot worker panicked or was cancelled: {join_err}",
-                    ))),
-                    final_metadata,
-                ),
-            };
-
-            let completion = SnapshotCompletion {
-                through_index,
-                through_term,
-                metadata,
-                result,
-                reply,
-            };
-
-            // Best-effort delivery. If the driver has shut down the
-            // receiver is dropped; the operator's reply oneshot (if
-            // attached) is also dropped, which the operator's client
-            // surfaces as a channel-closed error. The lost completion
-            // means the snapshot worker's bytes are durable but the
-            // engine never recorded `last_snapshot_meta` — the next
-            // snapshot cycle (after restart) will re-compute the
-            // anchor from the SnapshotStore's latest entry.
-            if let Err(e) = done_tx.send(completion).await {
-                warn!(
-                    target: "xraft_server::driver",
-                    error = %e,
-                    "snapshot completion dropped — driver receiver closed"
-                );
-            }
-        });
-
-        Ok(())
-    }
-
-    /// Stage 7.3 (iter 2) — process a [`SnapshotCompletion`] received
-    /// on `self.snapshot_done_rx`. This is the back-half of the
-    /// non-blocking snapshot pipeline: the worker delivered its
-    /// metadata + result, and the driver now:
-    ///
-    /// 1. On `Ok`: updates the log-store snapshot anchor, fires the
-    ///    `on_snapshot_taken` observer hook, feeds
-    ///    `Input::SnapshotComplete` into the engine, and dispatches
-    ///    any follow-up actions (chiefly
-    ///    `Action::TruncateLog(PrefixThroughInclusive)`).
-    /// 2. On `Err`: marks `halt_reason` so the driver fail-stops on
-    ///    the next loop iteration.
-    /// 3. Always: clears `snapshot_worker_in_flight` and resolves any
-    ///    operator-triggered reply oneshot with the outcome.
-    ///
-    /// Follow-up `TruncateLog`-style failures surface through the
-    /// `CapturedOutbound` machinery into `halt_reason` (preserving
-    /// the existing fail-stop semantics). If an operator reply is
-    /// attached and the follow-ups fail, the operator receives the
-    /// follow-up failure (NOT a synthetic Ok), matching the iter-2
-    /// item 1 evaluator finding for the synchronous code path.
-    async fn handle_snapshot_completed(&mut self, completion: SnapshotCompletion) {
-        let SnapshotCompletion {
-            through_index,
-            through_term,
-            metadata,
-            result,
-            reply,
-        } = completion;
-
-        // Always clear the in-flight flag — failure or success, the
-        // worker is done. We must NOT leave this set or future
-        // TakeSnapshot dispatches will be rejected by the dispatch
-        // guard.
-        self.snapshot_worker_in_flight = false;
-
-        let outcome = match result {
-            Ok(o) => o,
-            Err(e) => {
-                let msg = format!(
-                    "background snapshot at (term={}, index={}) failed: {e}",
+        self.snapshot_store
+            .save_snapshot(metadata.clone(), &data)
+            .map_err(|e| {
+                XRaftError::Storage(format!(
+                    "save_snapshot at (term={}, index={}) failed: {e}",
                     through_term.0, through_index.0,
-                );
-                error!(target: "xraft_server::driver", %msg, "halting driver");
-                if let Some(r) = reply {
-                    let _ = r.send(Err(XRaftError::Storage(msg.clone())));
-                }
-                self.halt_reason.get_or_insert(msg);
-                return;
-            }
-        };
+                ))
+            })?;
+
+        // After save_snapshot, the store has normalised `metadata.id`.
+        // We re-build the canonical id locally to keep the feedback
+        // self-contained — `save_snapshot`'s contract is normalisation
+        // by value, so the in-memory `metadata` still carries the
+        // empty id we gave it. Mirror the store's normalisation here.
+        metadata.id = format!("snapshot-{:010}-{:020}", through_term.0, through_index.0,);
 
         info!(
             target: "xraft_server::driver",
             through_index = %through_index,
             through_term = %through_term,
-            bytes = outcome.data_size,
-            duration_ms = outcome.duration.as_millis() as u64,
-            "snapshot completed; feeding SnapshotComplete to engine"
+            bytes = data.len(),
+            "snapshot saved; feeding SnapshotComplete to engine"
         );
 
-        // Stage 7.3 (iter 4) — publish the snapshot anchor to the log
-        // store so its `end_offset_for_epoch` lookup has a floor for
-        // epochs whose entries have been compacted out. Anchor
-        // persistence failures FAIL-STOP the driver: a missing or
-        // stale checkpoint can mis-direct followers below the
-        // compacted floor, which is unsafe. The in-flight flag is
-        // already cleared above so a restart can re-attempt the
-        // anchor write on the next snapshot cycle.
-        if let Err(e) = self
-            .log_store
-            .update_snapshot_anchor(through_term, through_index)
-        {
-            let msg = format!(
-                "log_store.update_snapshot_anchor at (term={}, index={}) failed: {e}",
-                through_term.0, through_index.0,
-            );
-            error!(
-                target: "xraft_server::driver",
-                error = %e,
-                "snapshot anchor persistence failed — halting driver to prevent stale-checkpoint divergence"
-            );
-            if let Some(r) = reply {
-                let _ = r.send(Err(XRaftError::Storage(msg.clone())));
-            }
-            self.halt_reason.get_or_insert(msg);
-            return;
-        }
-
-        // Stage 7.3 — fire the snapshot-taken observer with the
-        // measured duration + size.
-        if let Some(obs) = &self.observer {
-            obs.on_snapshot_taken(outcome.duration, outcome.data_size as u64);
-        }
-
-        // Feed the canonical metadata into the engine. Engine clears
-        // `snapshot_in_flight`, records `last_snapshot_meta`, and
-        // emits `Action::TruncateLog(PrefixThroughInclusive)` for
-        // the prefix that the snapshot now supersedes.
         let follow_ups = self.node.step(Input::SnapshotComplete {
             metadata: metadata.clone(),
         });
-
-        // Drive follow-ups through the standard `process_actions`
-        // pipeline so prefix truncation / log compaction observer
-        // hook fire exactly as in the legacy synchronous path.
-        let captured = self.process_actions(follow_ups, None).await;
-
-        // Resolve the operator's reply oneshot last so the admin
-        // caller does not observe success while a follow-up failure
-        // is about to fail-stop the driver — matches iter-2 item 1.
-        if let Some(r) = reply {
-            let reply_result = match captured.error {
-                Some(err) => {
-                    error!(
-                        target: "xraft_server::driver",
-                        node_id = %self.node.id,
-                        last_included_index = %metadata.last_included_index,
-                        error = %err,
-                        "operator-triggered snapshot persisted but a follow-up action failed; reporting failure to the admin caller"
-                    );
-                    Err(err)
-                }
-                None => Ok(TriggeredSnapshotInfo {
-                    last_included_index: metadata.last_included_index.0,
-                    last_included_term: metadata.last_included_term.0,
-                    size_bytes: metadata.size_bytes.unwrap_or(0),
-                }),
-            };
-            let _ = r.send(reply_result);
-        }
+        Ok((metadata, follow_ups))
     }
 
-    /// Stage 7.3 (iter 2) — test-only helper that synchronously
-    /// awaits the next [`SnapshotCompletion`] delivered on
-    /// `self.snapshot_done_rx` and processes it via
-    /// [`Self::handle_snapshot_completed`]. Production code does
-    /// NOT use this — the `run()` `select!` loop receives the
-    /// message naturally as part of its event-pump. Tests that
-    /// drive `process_actions(vec![Action::TakeSnapshot])` directly
-    /// (bypassing `run()`) need this helper to deterministically
-    /// observe completion before asserting on engine/observer state.
+    /// Handle [`Action::InstallSnapshot`]: restore the state machine
+    /// from the leader-supplied snapshot bytes, persist a local copy
+    /// via the [`SnapshotStore`], coordinate the durable log boundary,
+    /// and feed [`Input::SnapshotInstalled`] back into the engine so it
+    /// advances `last_applied` / `commit_index` / `last_log_index` to
+    /// the snapshot's coverage.
     ///
-    /// NOTE: this helper deliberately does NOT use
-    /// `tokio::time::timeout` because some snapshot tests run with
-    /// `#[tokio::test(start_paused = true)]`, where paused-time
-    /// auto-advance would fire the timeout before the
-    /// blocking-pool worker (which runs on real wall-clock time)
-    /// has a chance to deliver. A hung worker will surface as a
-    /// hung test instead — which is still loud enough to catch.
-    #[cfg(test)]
-    async fn await_pending_snapshot(&mut self) {
-        if !self.snapshot_worker_in_flight {
-            return;
-        }
-        let completion = self
-            .snapshot_done_rx
-            .recv()
-            .await
-            .expect("snapshot_done channel closed unexpectedly");
-        self.handle_snapshot_completed(completion).await;
-    }
-
-    /// Dispatch [`Action::InstallSnapshot`]: persist a snapshot received
-    /// from the leader, restore the state machine to the captured state,
-    /// and advance the local node's bookkeeping (`last_applied`,
-    /// `commit_index`, log tip, voter set, peer table) to reflect the
-    /// snapshot.
+    /// Stage 5.2 durable-log coordination (evaluator feedback iter-2
+    /// item 3): the snapshot's `last_included_index` supersedes the
+    /// follower's log prefix up to that index. Standard Raft §7 retain
+    /// rule:
+    /// - If the existing entry at `last_included_index` has the same
+    ///   term as the snapshot, the log entries strictly past
+    ///   `last_included_index` are consistent with the snapshot's view
+    ///   of history and MAY be retained. (Prefix purge of entries
+    ///   `<= last_included_index` is deferred to Stage 6.2's segmented-
+    ///   log GC; those entries remain physically present but become
+    ///   dead weight that fetch / apply paths never expose because the
+    ///   engine's `commit_index` and `last_applied` have advanced past
+    ///   them.)
+    /// - Otherwise (no entry at `last_included_index`, or term
+    ///   mismatch) the local log is from stale leadership the snapshot
+    ///   supersedes; the driver discards every entry via
+    ///   `truncate_from(LogIndex(1))` to prevent future appends from
+    ///   colliding with a divergent history.
     ///
-    /// Ordering rationale — persist BEFORE restore: a crash between
-    /// persist and restore can be recovered from the durable snapshot
-    /// on restart. The reverse ordering would leave the SM with state
-    /// that has no on-disk counterpart, breaking recovery.
-    ///
-    /// Operation order (safety-critical, iter-5 reorder for evaluator
-    /// items 2 & 4 of iter-4):
+    /// Operation order (safety-critical):
     /// 0. Reject stale snapshots whose `last_included_index` does not
     ///    advance `node.last_applied` (evaluator iter-8 item 1). Stale
     ///    installs are silently ignored — no save, no restore, no log
     ///    mutation, no `Input::SnapshotInstalled`.
     /// 1. `snapshot_store.save_snapshot` — durable copy first; if this
     ///    fails neither state machine nor log are mutated.
-    /// 2. `log_store.update_snapshot_anchor` — persist the epoch
-    ///    floor BEFORE any log mutation (iter-5 fix for iter-4 item
-    ///    2). If this fails, the log is still pristine; the leader
-    ///    will re-send on restart.
-    /// 3. `state_machine.restore` — in-memory restore from the same
+    /// 2. `state_machine.restore` — in-memory restore from the same
     ///    bytes we just durably saved.
-    /// 4. `log_store.truncate_from(LogIndex(1))` (wipe) OR
-    ///    `log_store.purge_prefix(last_included_index)` (retain) + `flush()`.
-    ///    `truncate_from` is itself restart-safe via the
-    ///    suffix-truncation marker (iter-5 item 3).
-    /// 5. `node.step(Input::SnapshotInstalled)` to advance the engine's
+    /// 3. Optional `log_store.truncate_from(LogIndex(1))` + `flush()`
+    ///    if the local log diverges from the snapshot at
+    ///    `last_included_index`.
+    /// 4. `node.step(Input::SnapshotInstalled)` to advance the engine's
     ///    `last_applied` / `commit_index` / `last_log_index`.
-    /// 6. `set_last_log(effective_log_tip)` — driver-authoritative
-    ///    reconciliation of `last_log_*` (Stage 5.2 fix).
-    /// 7. Observer hooks fire LAST, after every durable + in-memory
-    ///    step succeeds (iter-5 fix for iter-4 item 4):
-    ///    `on_log_compaction` + `on_snapshot_installed`. A failure in
-    ///    any earlier step short-circuits and the metrics never bump
-    ///    for a failed-install pipeline.
     ///
     /// Returns the follow-on actions emitted by the engine on success.
     /// Returns `Err` when `StateMachine::restore()`,
-    /// `SnapshotStore::save_snapshot()`, `update_snapshot_anchor()`,
-    /// or the log-wipe truncate/flush fails; the caller halts the
-    /// driver per the fail-stop contract.
+    /// `SnapshotStore::save_snapshot()`, or the log-wipe truncate/flush
+    /// fails; the caller fails the driver fail-stop contract.
     fn handle_install_snapshot(
         &mut self,
         metadata: SnapshotMeta,
         data: Vec<u8>,
-    ) -> std::result::Result<(), String> {
-        // Order matters: the stale-snapshot guard MUST run before any
-        // metadata validation (e.g. voter_set extraction). Per the
-        // InstallSnapshot contract, a snapshot at or behind
-        // `last_applied` is a benign no-op (a delayed install for a
-        // snapshot the leader already superseded). Halting on a
-        // malformed *stale* payload would turn a harmless race into a
-        // fail-stop, contradicting the no-op semantics. Forward-going
-        // snapshots still require a voter_set — that check is below.
-        let snap_idx = metadata.last_included_index;
-        let snap_term = metadata.last_included_term;
-        if snap_idx <= self.node.last_applied {
-            // Reject stale snapshots BEFORE touching persistent state
-            // or the state machine. If `snap_idx <= last_applied`,
-            // the local state machine has already applied every entry
-            // the snapshot covers. Calling `state_machine.restore(&data)`
-            // here would roll the SM back to the older (snapshot)
-            // state while `last_applied` still reflects the newer
-            // applied tip — a silent rollback that corrupts every
-            // subsequent read. The `<=` is intentional: at equality
-            // the SM is already at that state, so the restore is at
-            // best wasteful and at worst (if the snapshot bytes
-            // differ from the deterministic apply result) corrupting.
-            // Treat as a no-op success — the driver does NOT halt
-            // because a stale snapshot is a benign race, not a
-            // correctness fault. We deliberately do NOT validate
-            // `voter_set` for stale installs: a malformed payload we
-            // are about to discard must not promote a race into a
-            // fail-stop.
-            debug!(
+    ) -> XResult<Vec<Action>> {
+        // 0. Stale-snapshot guard (evaluator feedback iter-8 item 1):
+        //    reject snapshots whose coverage is at or behind the state
+        //    machine's apply point BEFORE touching `save_snapshot` /
+        //    `restore` / log truncate. Restoring such a snapshot would
+        //    roll the in-memory state machine backwards while the engine
+        //    refuses to regress `last_applied` / `commit_index` (see
+        //    `xraft_core::node::RaftNode::handle_snapshot_installed`,
+        //    which is raise-only on those indices). The two pointers
+        //    would then diverge: state machine at an older view,
+        //    engine claiming a newer applied position. We compare
+        //    against `last_applied` (not `commit_index`) so that
+        //    snapshots covering committed-but-not-yet-applied entries
+        //    are still installed — they legitimately fast-forward the
+        //    state machine past pending applies. Equal-index snapshots
+        //    are also rejected: at best they are a wasteful no-op
+        //    restore, at worst they overwrite `last_snapshot_meta` with
+        //    a different leader's metadata for the same index. The
+        //    early return skips the `set_last_log(effective_log_tip)`
+        //    reconciliation below as well, which is correct because
+        //    no durable state changed.
+        if metadata.last_included_index <= self.node.last_applied {
+            warn!(
                 target: "xraft_server::driver",
-                snap_index = %snap_idx,
-                last_applied = %self.node.last_applied,
-                "InstallSnapshot: snapshot at or behind last_applied; no-op (no persist, no restore, no validation)"
+                stale_index = %metadata.last_included_index,
+                stale_term = %metadata.last_included_term,
+                current_last_applied = %self.node.last_applied,
+                current_commit = %self.node.commit_index,
+                current_last_log_index = %self.node.last_log_index,
+                "stale Action::InstallSnapshot ignored: last_included_index does not advance last_applied"
             );
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // 1. Persist the snapshot first. If this fails the state
         //    machine and log remain unchanged and the caller halts;
         //    the leader will re-send on restart.
         self.snapshot_store
-            .lock()
-            .expect("snapshot_store mutex poisoned")
             .save_snapshot(metadata.clone(), &data)
             .map_err(|e| {
                 XRaftError::Storage(format!(
@@ -4212,42 +3801,15 @@ where
                 ))
             })?;
 
-        // 2. Stage 7.3 (iter 5) — persist the snapshot anchor
-        //    BEFORE any log mutation (iter-4 evaluator item 2). The
-        //    anchor records the durable epoch floor `(term, index)`
-        //    of the just-saved snapshot. If this write fails the log
-        //    is still pristine — the operator-visible state on
-        //    restart is: snapshot bytes durable, log unchanged, no
-        //    compaction applied. The driver halts and the next open
-        //    re-runs InstallSnapshot from the leader. Putting this
-        //    BEFORE the log mutation closes the iter-4 window where
-        //    a successful truncate would have been "remembered" by
-        //    the log but the anchor was missing — `end_offset_for_epoch`
-        //    queries for compacted epochs would have returned None
-        //    in that window.
-        if let Err(e) = self
-            .log_store
-            .update_snapshot_anchor(metadata.last_included_term, metadata.last_included_index)
-        {
-            return Err(XRaftError::Storage(format!(
-                "log_store.update_snapshot_anchor (install) at (term={}, index={}) failed BEFORE log mutation: {e}",
+        // 2. Restore the state machine from the just-durable bytes.
+        self.state_machine.restore(&data).map_err(|e| {
+            XRaftError::Storage(format!(
+                "state machine restore at (term={}, index={}) failed: {e}",
                 metadata.last_included_term.0, metadata.last_included_index.0,
-            )));
-        }
+            ))
+        })?;
 
-        // 3. Restore the state machine from the just-durable bytes.
-        self.state_machine
-            .lock()
-            .expect("state_machine mutex poisoned")
-            .restore(&data)
-            .map_err(|e| {
-                XRaftError::Storage(format!(
-                    "state machine restore at (term={}, index={}) failed: {e}",
-                    metadata.last_included_term.0, metadata.last_included_index.0,
-                ))
-            })?;
-
-        // 4. Coordinate the durable log boundary (Stage 5.2 fix +
+        // 3. Coordinate the durable log boundary (Stage 5.2 fix +
         //    Stage 5.3 prefix purge on retain).
         //    Raft §7 retain rule: keep entries past last_included_index
         //    iff the existing entry at last_included_index has matching
@@ -4271,10 +3833,6 @@ where
             // We use `truncate_from(LogIndex(1))` because `purge_prefix`
             // would only reclaim entries `<= last_included_index`,
             // leaving divergent suffix entries in place.
-            //
-            // Stage 7.3 (iter 5) — truncate_from is itself
-            // restart-safe via the suffix-truncation marker; a crash
-            // mid-wipe is replayed idempotently on next open.
             if let Err(e) = self.log_store.truncate_from(LogIndex(1)) {
                 return Err(XRaftError::Storage(format!(
                     "log truncate (install-snapshot wipe) at (term={}, index={}) failed: {e}",
@@ -4308,12 +3866,13 @@ where
             }
         }
 
-        debug!(
+        info!(
             target: "xraft_server::driver",
-            index = %snap_idx,
-            term = %snap_term,
-            payload_bytes = data.len(),
-            "InstallSnapshot: persisted, restored, and rebuilt membership"
+            last_included_index = %metadata.last_included_index,
+            last_included_term = %metadata.last_included_term,
+            bytes = data.len(),
+            wiped_log = must_wipe,
+            "snapshot installed; feeding SnapshotInstalled to engine"
         );
 
         // Re-build canonical id (mirror the store normalisation).
@@ -4322,8 +3881,6 @@ where
             "snapshot-{:010}-{:020}",
             feedback.last_included_term.0, feedback.last_included_index.0,
         );
-        let installed_index = feedback.last_included_index;
-
         let follow_ups = self
             .node
             .step(Input::SnapshotInstalled { metadata: feedback });
@@ -4350,18 +3907,6 @@ where
         // than the engine's raise-only logic could see.
         let (eff_index, eff_term) = self.effective_log_tip();
         self.node.set_last_log(eff_index, eff_term);
-
-        // Stage 7.3 (iter 5) — fire observability hooks ONLY after
-        // every durable + in-memory step has succeeded (iter-4
-        // evaluator item 4). Order: save_snapshot → anchor persist
-        // → restore → log mutate + flush → engine.step → set_last_log
-        // → metrics. If ANY earlier step failed we returned Err and
-        // never reach here, so the counters cannot bump on a failed
-        // pipeline.
-        if let Some(obs) = &self.observer {
-            obs.on_log_compaction(installed_index);
-            obs.on_snapshot_installed(installed_index);
-        }
 
         Ok(follow_ups)
     }
@@ -4818,24 +4363,13 @@ where
 /// the matching `Action::SendMessage` / `Action::ServeFetch` while
 /// processing inbound-RPC actions.
 ///
-/// `error` is set when ANY action processed during the inbound RPC's
-/// batch fails in a way that makes a captured success reply unsafe.
-/// Inbound handlers MUST surface that error to the caller rather than
-/// returning a captured-but-unsafe response — most importantly, a
-/// granted `VoteResponse` whose backing `PersistHardState` failed
-/// would violate the Raft single-vote-per-term safety invariant on
-/// crash + restart.
-///
-/// Sources of `error` (kept in sync with `process_actions`):
-/// - `PersistHardState` failure
-/// - `AppendEntries` / `TruncateLog` failure
-/// - `ServeFetch` log-read failure
-/// - `ApplyToStateMachine` failure (state_machine.apply or the
-///   range-validation halt in `apply_committed`)
-/// - `TakeSnapshot` failure (state_machine.snapshot or
-///   snapshot_store.save_snapshot)
-/// - `InstallSnapshot` failure (save_snapshot or state_machine.restore;
-///   stale-snapshot no-ops do NOT populate this field)
+/// `error` is set when an action that the inbound reply DEPENDS ON
+/// (`PersistHardState`, `AppendEntries`, `TruncateLog`, log read for
+/// `ServeFetch`) fails. Inbound handlers MUST surface that error to
+/// the caller rather than returning a captured-but-unsafe response —
+/// most importantly, a granted `VoteResponse` whose backing
+/// `PersistHardState` failed would violate the Raft single-vote-per-
+/// term safety invariant on crash + restart.
 #[derive(Default)]
 struct CapturedResponse {
     vote: Option<VoteResponse>,
@@ -4922,11 +4456,6 @@ fn _entry_type_marker(_e: &Entry) {}
 
 #[cfg(test)]
 mod tests {
-    // Test helpers below scaffold negative-path coverage (failure injection,
-    // snapshot bytes capture, etc.) that not every test consumes today.
-    // Silenced rather than deleted so additional tests can wire them up
-    // without re-introducing the helpers.
-    #![allow(dead_code, clippy::type_complexity)]
     use super::*;
     use std::sync::Mutex;
     use uuid::Uuid;
@@ -4943,9 +4472,9 @@ mod tests {
     #[derive(Default)]
     struct TestLogStore {
         entries: Vec<Entry>,
-        /// When set true, the next call to `get_range` returns an error.
-        /// Auto-clears after firing once so subsequent calls succeed.
-        /// Used by `apply_committed` failure-path tests.
+        /// When set, the next `get_range` call returns a storage error.
+        /// Used by Stage 5.2 fail-stop tests to verify the driver halts
+        /// when committed entries cannot be read.
         fail_next_get_range: Arc<std::sync::atomic::AtomicBool>,
         /// When set, the next `truncate_from` call returns a storage
         /// error. Used to verify install-snapshot wipe halts on error.
@@ -4957,16 +4486,6 @@ mod tests {
         /// the failure to the admin caller (and halts the driver)
         /// rather than silently returning `Ok(TriggeredSnapshotInfo)`.
         fail_next_purge_prefix: Arc<std::sync::atomic::AtomicBool>,
-        /// Stage 7.3 (iter 4) — when set, the next
-        /// `update_snapshot_anchor` call returns a storage error.
-        /// Used to verify that anchor-persistence failures
-        /// fail-stop the driver (iter-3 evaluator item #2: silent
-        /// warn-and-continue is unsafe).
-        fail_next_update_snapshot_anchor: Arc<std::sync::atomic::AtomicBool>,
-        /// Stage 7.3 — anchor recorded via `update_snapshot_anchor` so
-        /// `end_offset_for_epoch` can report the compacted floor for
-        /// epochs older than every retained entry.
-        snapshot_anchor: Option<(Term, LogIndex)>,
     }
 
     impl LogStore for TestLogStore {
@@ -4984,23 +4503,13 @@ mod tests {
                 .fail_next_get_range
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
-                return Err(XRaftError::Storage(format!(
-                    "injected get_range failure for {start}..{end}"
-                )));
+                return Err(XRaftError::Storage("injected get_range failure".into()));
             }
-            let drop = self.drop_indices_in_get_range.lock().unwrap().clone();
-            let overrides = self.override_indices_in_get_range.lock().unwrap().clone();
             Ok(self
                 .entries
                 .iter()
-                .filter(|e| e.index >= start && e.index < end && !drop.contains(&e.index))
+                .filter(|e| e.index >= start && e.index < end)
                 .cloned()
-                .map(|mut e| {
-                    if let Some(&new_idx) = overrides.get(&e.index) {
-                        e.index = new_idx;
-                    }
-                    e
-                })
                 .collect())
         }
         fn last_index(&self) -> LogIndex {
@@ -5020,20 +4529,6 @@ mod tests {
             Ok(())
         }
         fn term_at(&self, index: LogIndex) -> XResult<Option<Term>> {
-            if self
-                .fail_next_term_at
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(XRaftError::Storage(format!(
-                    "injected term_at failure for {index}"
-                )));
-            }
-            if self
-                .missing_next_term_at
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Ok(None);
-            }
             Ok(self
                 .entries
                 .iter()
@@ -5044,14 +4539,6 @@ mod tests {
             Ok(())
         }
         fn purge_prefix(&mut self, through_index_inclusive: LogIndex) -> XResult<()> {
-            if self
-                .fail_next_purge_prefix
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(XRaftError::Storage(format!(
-                    "injected purge_prefix failure at {through_index_inclusive}"
-                )));
-            }
             // Stage 5.3 prefix compaction: drop entries `<= through`.
             // Idempotent — retain is a single-pass walk that no-ops when
             // the prefix is already gone.
@@ -5137,39 +4624,15 @@ mod tests {
         }
     }
 
+    type SavedSnapshots = Arc<Mutex<Vec<(SnapshotMeta, Vec<u8>)>>>;
+
     #[derive(Default, Clone)]
     struct TestSnapshotStore {
         saved: SavedSnapshots,
-        /// Stage 7.3 (iter 2) — when non-zero, `save_snapshot` calls
-        /// `std::thread::sleep` for this many milliseconds BEFORE
-        /// recording the data. Used by the `client-latency-within-
-        /// 2x-baseline` scenario to simulate a slow durable
-        /// snapshot write without blocking the state-machine mutex
-        /// (which gates `apply`). The driver dispatches
-        /// `save_snapshot` from a `spawn_blocking` worker, so this
-        /// sleep should NOT block other reactor tasks or new
-        /// proposes.
-        save_snapshot_delay_ms: Arc<std::sync::atomic::AtomicU64>,
-    }
-
-    impl TestSnapshotStore {
-        fn save_snapshot_delay_ms_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
-            self.save_snapshot_delay_ms.clone()
-        }
     }
 
     impl SnapshotStore for TestSnapshotStore {
         fn save_snapshot(&mut self, mut metadata: SnapshotMeta, data: &[u8]) -> XResult<()> {
-            // Stage 7.3 (iter 2) — optional simulated slow durable
-            // write. Runs on whatever thread invokes save_snapshot;
-            // when the driver dispatches via spawn_blocking this is
-            // a blocking-pool thread and the reactor stays free.
-            let delay_ms = self
-                .save_snapshot_delay_ms
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if delay_ms > 0 {
-                std::thread::sleep(Duration::from_millis(delay_ms));
-            }
             // Mirror the production `FileSnapshotStore::save_snapshot`
             // contract: normalise the caller-supplied id to the
             // canonical `snapshot-{term:010}-{index:020}` form so
@@ -5184,16 +4647,47 @@ mod tests {
             Ok(())
         }
         fn load_latest_snapshot(&self) -> XResult<Option<(SnapshotMeta, Vec<u8>)>> {
-            Ok(self.saved.lock().unwrap().last().cloned())
-        }
-        fn list_snapshots(&self) -> XResult<Vec<SnapshotMeta>> {
+            // Newest = highest last_included_index, ties broken by term.
             Ok(self
                 .saved
                 .lock()
                 .unwrap()
                 .iter()
+                .max_by(|a, b| {
+                    a.0.last_included_index
+                        .cmp(&b.0.last_included_index)
+                        .then(a.0.last_included_term.cmp(&b.0.last_included_term))
+                })
+                .cloned())
+        }
+        fn load_snapshot(
+            &self,
+            index: LogIndex,
+            term: Term,
+        ) -> XResult<Option<(SnapshotMeta, Vec<u8>)>> {
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(m, _)| m.last_included_index == index && m.last_included_term == term)
+                .cloned())
+        }
+        fn list_snapshots(&self) -> XResult<Vec<SnapshotMeta>> {
+            // Newest first (highest index, term).
+            let mut metas: Vec<SnapshotMeta> = self
+                .saved
+                .lock()
+                .unwrap()
+                .iter()
                 .map(|(m, _)| m.clone())
-                .collect())
+                .collect();
+            metas.sort_by(|a, b| {
+                b.last_included_index
+                    .cmp(&a.last_included_index)
+                    .then(b.last_included_term.cmp(&a.last_included_term))
+            });
+            Ok(metas)
         }
         fn delete_snapshot(&mut self, id: &str) -> XResult<()> {
             self.saved.lock().unwrap().retain(|(m, _)| m.id != id);
@@ -5219,7 +4713,7 @@ mod tests {
         TestStateMachine,
     >;
 
-    #[derive(Default, Clone)]
+    #[derive(Default)]
     struct TestStateMachine {
         applied: Applied,
         snapshots_taken: SnapshotCalls,
@@ -5232,103 +4726,23 @@ mod tests {
         /// Used by Stage 5.2 fail-stop tests to verify the driver halts
         /// when a committed entry cannot be applied.
         fail_next_apply: Arc<std::sync::atomic::AtomicBool>,
-        /// Stage 7.3 — when non-zero, `snapshot()` calls
-        /// `std::thread::sleep` for this many milliseconds BEFORE
-        /// returning the payload. Used by the
-        /// `background-snapshot-nonblocking` scenario to simulate a
-        /// slow state-machine serialiser and prove the tokio reactor
-        /// is NOT blocked by the snapshot worker (because the driver
-        /// runs it via `tokio::task::spawn_blocking`, so the blocking
-        /// `std::thread::sleep` runs on a blocking-pool thread, NOT
-        /// the reactor).
-        snapshot_delay_ms: Arc<std::sync::atomic::AtomicU64>,
-        /// Stage 7.3 (iter 4) — separate delay applied INSIDE the
-        /// `SnapshotSerializer::serialize` step, i.e. AFTER the SM
-        /// mutex has been dropped. Used by the iter-4 latency test
-        /// `scenario_background_snapshot_serialize_keeps_propose_latency_within_2x_baseline`
-        /// to prove that even a slow serialize phase does NOT block
-        /// committed-entry apply (which needs the SM mutex). When
-        /// non-zero, the test SM overrides `begin_snapshot()` to
-        /// return a serializer that sleeps for this many ms BEFORE
-        /// producing the snapshot bytes.
-        snapshot_serialize_delay_ms: Arc<std::sync::atomic::AtomicU64>,
-        /// Stage 7.3 (iter 7) — delay applied INSIDE `begin_snapshot`
-        /// itself, BEFORE the payload is cloned. Used by the iter-7
-        /// atomic-capture regression test
-        /// `scenario_snapshot_payload_capture_is_atomic_with_metadata`
-        /// to prove that `begin_snapshot` runs SYNCHRONOUSLY on the
-        /// driver thread during `dispatch_snapshot_worker` — i.e.
-        /// any mutation to `snapshot_payload` that happens after
-        /// `dispatch_snapshot_worker` returns CANNOT be reflected in
-        /// the serialized snapshot bytes. Under the iter-6 bug shape
-        /// (begin_snapshot in spawn_blocking), dispatch would
-        /// return quickly and a post-dispatch payload mutation
-        /// would race begin_snapshot.
-        begin_snapshot_delay_ms: Arc<std::sync::atomic::AtomicU64>,
-        /// Stage 7.3 (iter 8) — when `true`, `TestStateMachine::
-        /// begin_snapshot` mimics the trait's DEFAULT implementation
-        /// (calls `self.snapshot()` eagerly and wraps the bytes in
-        /// `EagerSerializer`) instead of taking the iter-7 fast
-        /// CoW-style capture path. Used by the iter-8 regression
-        /// test
-        /// `scenario_default_begin_snapshot_runs_off_reactor_thread`
-        /// to prove that the iter-8 dispatch routes the default
-        /// impl's heavy `snapshot()` call onto `tokio::task::
-        /// spawn_blocking` so the reactor stays free even for
-        /// state machines that don't override `begin_snapshot()`.
-        use_eager_begin_snapshot: Arc<std::sync::atomic::AtomicBool>,
-        /// Stage 7.3 (iter 9) — barrier for deterministic
-        /// documented-limitation testing. When `engaged = true`,
-        /// `snapshot()` enters a busy-wait loop and does not return
-        /// until the test flips it back to `false`. The companion
-        /// `snapshot_entered` flag is set by `snapshot()` as soon
-        /// as it enters the busy-wait, so the test thread can
-        /// confirm the SM lock is being held BEFORE issuing the
-        /// concurrent `propose` whose progress (or lack thereof) is
-        /// the subject of the assertion. Used by
-        /// `scenario_default_eager_begin_snapshot_stalls_driver_loop_documented_limitation`
-        /// to prove (without flaky wall-clock thresholds) that the
-        /// default eager capture path stalls `propose` -> `apply`
-        /// completion for as long as the SM lock is held — i.e.
-        /// that the
-        /// [`xraft_core::state_machine::SnapshotCaptureMode::EagerMayStallDriver`]
-        /// contract is observed in the real driver loop.
-        snapshot_capture_barrier_engaged: Arc<std::sync::atomic::AtomicBool>,
-        /// Stage 7.3 (iter 9) — companion signal for the capture
-        /// barrier. `snapshot()` sets this to `true` immediately
-        /// upon entry; the test thread spin-waits for this signal
-        /// before issuing the concurrent `propose` so the
-        /// "snapshot is holding the SM lock" precondition is
-        /// observed deterministically rather than via a
-        /// `tokio::time::sleep` heuristic.
-        snapshot_entered: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl TestStateMachine {
         fn snapshot_handle(&self) -> Applied {
             self.applied.clone()
         }
-
-        fn restored_snapshots(&self) -> Vec<Vec<u8>> {
-            self.restored.lock().unwrap().clone()
+        fn snapshots_taken_handle(&self) -> SnapshotCalls {
+            self.snapshots_taken.clone()
         }
-
-        fn set_snapshot_bytes(&self, bytes: Vec<u8>) {
-            *self.snapshot_bytes.lock().unwrap() = bytes;
+        fn restores_received_handle(&self) -> RestoreCalls {
+            self.restores_received.clone()
         }
-
-        fn arm_fail_apply_at(&self, index: LogIndex) {
-            *self.fail_apply_at.lock().unwrap() = Some(index);
+        fn snapshot_payload_handle(&self) -> Arc<Mutex<Vec<u8>>> {
+            self.snapshot_payload.clone()
         }
-
-        fn arm_fail_next_snapshot(&self) {
-            self.fail_next_snapshot
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        fn arm_fail_next_restore(&self) {
-            self.fail_next_restore
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+        fn fail_next_apply_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+            self.fail_next_apply.clone()
         }
         fn snapshot_delay_ms_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
             self.snapshot_delay_ms.clone()
@@ -5388,8 +4802,9 @@ mod tests {
 
     impl StateMachine for TestStateMachine {
         fn apply(&mut self, index: LogIndex, command: &[u8]) -> XResult<Vec<u8>> {
-            if let Some(fail_idx) = *self.fail_apply_at.lock().unwrap()
-                && fail_idx == index
+            if self
+                .fail_next_apply
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
                 return Err(XRaftError::Storage(format!(
                     "injected apply failure at {index}"
@@ -5402,119 +4817,15 @@ mod tests {
             Ok(Vec::new())
         }
         fn snapshot(&self) -> XResult<Vec<u8>> {
-            // Stage 7.3 — proves `tokio::task::spawn_blocking` is doing
-            // its job. When `snapshot_delay_ms` is set, this call (which
-            // the driver runs on the blocking pool) holds the blocking
-            // thread for the requested duration. Other tokio tasks must
-            // be unaffected; the
-            // `scenario_background_snapshot_does_not_block_tokio_reactor`
-            // test asserts that property directly.
-            let delay_ms = self
-                .snapshot_delay_ms
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if delay_ms > 0 {
-                std::thread::sleep(Duration::from_millis(delay_ms));
-            }
-            // Stage 7.3 (iter 9) — deterministic barrier for the
-            // documented-limitation test. When engaged, we signal
-            // entry and busy-wait until the test releases us. The
-            // SM mutex IS held throughout the wait (the call site
-            // in `dispatch_snapshot_worker` locks the SM, calls
-            // `begin_snapshot()` which calls us, and only drops
-            // the lock after we return). This is exactly the
-            // `EagerMayStallDriver` shape we want to prove
-            // observable in the real driver loop.
-            if self
-                .snapshot_capture_barrier_engaged
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                self.snapshot_entered
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                while self
-                    .snapshot_capture_barrier_engaged
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
             let payload = self.snapshot_payload.lock().unwrap().clone();
             self.snapshots_taken.lock().unwrap().push(payload.clone());
             Ok(payload)
         }
-        fn begin_snapshot(
-            &self,
-        ) -> XResult<Box<dyn xraft_core::state_machine::SnapshotSerializer>> {
-            // Stage 7.3 (iter 8) — DEFAULT-PATH MIMIC. When the
-            // `use_eager_begin_snapshot` knob is set, replicate the
-            // trait's default `begin_snapshot` impl exactly: call
-            // `self.snapshot()` eagerly (which honours
-            // `snapshot_delay_ms` and therefore can be slow) and
-            // wrap the bytes in `EagerSerializer`. The iter-8
-            // regression test uses this branch to prove that the
-            // default eager path also runs off the reactor thread
-            // (it must, because `dispatch_snapshot_worker` now
-            // routes the capture through an awaited
-            // `spawn_blocking` worker).
-            if self
-                .use_eager_begin_snapshot
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                let bytes = self.snapshot()?;
-                return Ok(Box::new(xraft_core::state_machine::EagerSerializer(bytes)));
-            }
-
-            // Stage 7.3 (iter 7/8) — TWO-PHASE CAPTURE. The driver
-            // dispatches this call onto an awaited
-            // `tokio::task::spawn_blocking` worker (iter 8) so it
-            // does not block the reactor thread, but the await keeps
-            // the driver task parked in its `select!` arm body so
-            // metadata at `last_included_index` is atomic with the
-            // captured payload (iter 7 invariant preserved).
-            //
-            // Two deliberate timing knobs:
-            //   - `begin_snapshot_delay_ms` (iter 7): when set, this
-            //     method blocks the spawn_blocking worker here. Used
-            //     by the iter-7 atomic-capture regression test to
-            //     prove that dispatch returns ONLY after capture
-            //     completes — with the iter-6 bug it would run on
-            //     a fire-and-forget worker, dispatch would return
-            //     promptly, and a post-dispatch payload mutation
-            //     could race into the captured bytes.
-            //   - `snapshot_delay_ms` (formerly the "in-lock"
-            //     delay): moved into `TestSnapshotSerializer::
-            //     serialize()` so it runs on the blocking pool with
-            //     NO SM lock. This preserves the existing
-            //     `does_not_block_tokio_reactor` test's "snapshot
-            //     is slow but reactor stays free" semantics under
-            //     the iter-7/8 contract.
-            let begin_delay = self
-                .begin_snapshot_delay_ms
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if begin_delay > 0 {
-                std::thread::sleep(Duration::from_millis(begin_delay));
-            }
-            let payload = self.snapshot_payload.lock().unwrap().clone();
-            let serialize_delay_ms = self
-                .snapshot_serialize_delay_ms
-                .load(std::sync::atomic::Ordering::SeqCst);
-            let legacy_snapshot_delay_ms = self
-                .snapshot_delay_ms
-                .load(std::sync::atomic::Ordering::SeqCst);
-            Ok(Box::new(TestSnapshotSerializer {
-                payload,
-                snapshots_taken: self.snapshots_taken.clone(),
-                serialize_delay_ms,
-                legacy_snapshot_delay_ms,
-            }))
-        }
         fn restore(&mut self, snapshot: &[u8]) -> XResult<()> {
-            if self
-                .fail_next_restore
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(XRaftError::Storage("injected restore failure".into()));
-            }
-            self.restored.lock().unwrap().push(snapshot.to_vec());
+            self.restores_received
+                .lock()
+                .unwrap()
+                .push(snapshot.to_vec());
             Ok(())
         }
         fn snapshot_capture_mode(&self) -> xraft_core::state_machine::SnapshotCaptureMode {
@@ -5784,6 +5095,7 @@ port = 6000
         /// item 1) to verify operator-triggered snapshots surface a
         /// follow-up purge failure to the admin caller rather than
         /// silently returning `Ok`.
+        #[allow(dead_code)]
         fail_next_purge_prefix: Arc<std::sync::atomic::AtomicBool>,
         /// Stage 7.3 — set non-zero to make `state_machine.snapshot()`
         /// `std::thread::sleep` for this many milliseconds on the
@@ -8585,874 +7897,743 @@ port = 6012
         }
     }
 
-    // -----------------------------------------------------------------
-    // Stage 5.1 — driver-level Action dispatch tests
+    // =====================================================================
+    // Stage 5.2 fail-stop tests for `apply_committed`
+    // (evaluator feedback iter-2 item 2)
     //
-    // These exercise `Driver::process_actions` directly with synthetic
-    // actions so we can verify, in isolation:
-    //   * `Action::ApplyToStateMachine` halt-on-failure and waiter-
-    //     failure semantics.
-    //   * `Action::TakeSnapshot` happy path plus every halt-worthy
-    //     failure mode (missing voter_set, missing term, SM error,
-    //     store error, last_applied == 0).
-    //   * `Action::InstallSnapshot` persist-before-restore ordering,
-    //     post-install bookkeeping, halt-on-failure for both backing
-    //     calls, missing-voter-set guard, and no-regress invariant.
-    //
-    // The engine does not currently emit `TakeSnapshot`/`InstallSnapshot`
-    // anywhere, so feeding actions directly into `process_actions` is the
-    // only way to exercise the dispatch code paths in isolation.
-    // -----------------------------------------------------------------
+    // Contract: any failure to apply a committed entry (log read error,
+    // missing entry, state-machine apply error) MUST cause the driver to
+    // halt — committed entries must apply or the node must halt / recover.
+    // =====================================================================
 
-    fn build_dispatch_driver() -> (TestDriver, TestStateMachine, TestSnapshotStore) {
+    /// `apply_committed` halts the driver when `LogStore::get_range`
+    /// fails. The waiters in the range are resolved with the storage
+    /// error so `propose()` returns a clear failure rather than a
+    /// channel-closed error when the driver shuts down.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn apply_committed_log_read_failure_halts_driver() {
         let cfg = single_voter_config(2);
-        let node = RaftNode::new_with_seed(cfg, 1234).expect("RaftNode ctor");
-        let log = TestLogStore::default();
-        let hs = TestHardStateStore::default();
-        let ss = TestSnapshotStore::default();
-        let sm = TestStateMachine::default();
-        let sm_handle = sm.clone();
-        let ss_handle = ss.clone();
-        let transport = Arc::new(NoopTransport::default());
-        let driver = Driver::new(
-            node,
-            log,
-            hs,
-            ss,
-            sm,
-            transport,
-            DriverConfig {
-                tick_interval: Duration::from_millis(2),
-                max_fetch_batch: 8,
-                shutdown_drain_deadline: Duration::from_secs(2),
-                fetch_snapshot_deadline: Duration::from_secs(2),
-            },
-        );
-        (driver, sm_handle, ss_handle)
-    }
+        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
 
-    fn seed_committed_entries(driver: &mut TestDriver, n: u64) {
-        let mut entries = Vec::with_capacity(n as usize);
-        for i in 1..=n {
-            entries.push(Entry {
-                index: LogIndex(i),
+        // Pre-populate the log so `get_range` would normally succeed.
+        driver
+            .log_store
+            .append(&[Entry {
+                index: LogIndex(1),
                 term: Term(1),
-                payload: EntryPayload::Command(Bytes::from(format!("cmd-{i}").into_bytes())),
-            });
-        }
-        driver.log_store.append(&entries).expect("seed log append");
-        driver.node.commit_index = LogIndex(n);
-        driver.node.last_applied = LogIndex(n);
-        driver.node.set_last_log(LogIndex(n), Term(1));
-    }
+                payload: EntryPayload::Command(Bytes::from_static(b"alpha")),
+            }])
+            .expect("seed log");
 
-    fn make_voter_set_for(ids: &[u64]) -> xraft_core::types::VoterSet {
-        use xraft_core::types::{DirectoryId, Endpoint, VoterRecord, VoterSet};
-        let records: Vec<VoterRecord> = ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| VoterRecord {
-                node_id: NodeId(*id),
-                directory_id: DirectoryId::new_random(),
-                endpoints: vec![Endpoint::new("127.0.0.1", 9000 + i as u16)],
-            })
-            .collect();
-        VoterSet::try_new(records).expect("voter set construction")
-    }
+        // Register a pending waiter at index 1 so we can assert the
+        // driver resolves it with an error rather than dropping it.
+        let (tx, rx) = oneshot::channel::<XResult<LogIndex>>();
+        driver.pending.entry(LogIndex(1)).or_default().push(tx);
 
-    fn snapshot_meta_for(idx: u64, term: u64, voter_ids: &[u64]) -> SnapshotMeta {
-        SnapshotMeta {
-            last_included_index: LogIndex(idx),
-            last_included_term: Term(term),
-            id: String::new(),
-            voter_set: Some(make_voter_set_for(voter_ids)),
-            size_bytes: None,
-            checksum: None,
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn apply_to_state_machine_halts_when_state_machine_apply_fails() {
-        let (mut driver, sm, _ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 4);
-        sm.arm_fail_apply_at(LogIndex(3));
-
-        let _ = driver
-            .process_actions(
-                vec![Action::ApplyToStateMachine {
-                    from: LogIndex(1),
-                    to: LogIndex(4),
-                }],
-                None,
-            )
-            .await;
-
-        let halt = driver
-            .halt_reason
-            .as_ref()
-            .expect("halt_reason should be set after apply failure");
-        assert!(
-            halt.contains("state machine apply at LogIndex(3)"),
-            "halt reason should name the failing index, got: {halt}"
-        );
-        let applied = sm.snapshot_handle().lock().unwrap().clone();
-        let indices: Vec<u64> = applied.iter().map(|(idx, _)| idx.0).collect();
-        assert_eq!(
-            indices,
-            vec![1, 2],
-            "must apply 1,2 then halt at 3 (no apply of 4)"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn apply_to_state_machine_halts_when_log_read_fails() {
-        let (mut driver, sm, _ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 2);
-        driver
-            .log_store
-            .fail_next_get_range
+        // Arm the injected failure on the NEXT get_range call.
+        h.fail_next_get_range
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        let _ = driver
-            .process_actions(
-                vec![Action::ApplyToStateMachine {
-                    from: LogIndex(1),
-                    to: LogIndex(2),
-                }],
-                None,
-            )
-            .await;
-
-        let halt = driver
-            .halt_reason
-            .as_ref()
-            .expect("halt_reason should be set after log read failure");
-        assert!(
-            halt.contains("apply: read range"),
-            "halt reason should reference log read range, got: {halt}"
-        );
-        assert!(sm.snapshot_handle().lock().unwrap().is_empty());
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn take_snapshot_persists_state_machine_bytes_with_correct_metadata() {
-        let (mut driver, sm, ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 3);
-        let payload = b"sm-snapshot-payload-v1".to_vec();
-        sm.set_snapshot_bytes(payload.clone());
-
-        let _ = driver
-            .process_actions(vec![Action::TakeSnapshot], None)
-            .await;
-
-        assert!(
-            driver.halt_reason.is_none(),
-            "TakeSnapshot happy path must not halt: {:?}",
-            driver.halt_reason
-        );
-        let saved = ss.saved_snapshots();
-        assert_eq!(saved.len(), 1, "exactly one snapshot should be persisted");
-        let (meta, data) = &saved[0];
-        assert_eq!(meta.last_included_index, LogIndex(3));
-        assert_eq!(meta.last_included_term, Term(1));
-        assert_eq!(
-            meta.voter_set.as_ref().map(|vs| vs.voters().len()),
-            Some(1),
-            "snapshot must carry the active voter set"
-        );
-        assert_eq!(data, &payload, "persisted bytes must equal SM snapshot");
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn take_snapshot_with_last_applied_zero_is_noop() {
-        let (mut driver, _sm, ss) = build_dispatch_driver();
-        assert_eq!(driver.node.last_applied, LogIndex(0));
-
-        let _ = driver
-            .process_actions(vec![Action::TakeSnapshot], None)
-            .await;
-
-        assert!(
-            driver.halt_reason.is_none(),
-            "TakeSnapshot at index 0 must NOT halt the driver"
-        );
-        assert!(
-            ss.saved_snapshots().is_empty(),
-            "no snapshot should be persisted when last_applied == 0"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn take_snapshot_halts_when_state_machine_snapshot_fails() {
-        let (mut driver, sm, ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 1);
-        sm.arm_fail_next_snapshot();
-
-        let _ = driver
-            .process_actions(vec![Action::TakeSnapshot], None)
-            .await;
-
-        let halt = driver
-            .halt_reason
-            .as_ref()
-            .expect("must halt when state_machine.snapshot fails");
-        assert!(
-            halt.contains("state machine snapshot failed"),
-            "halt reason should reference SM snapshot failure, got: {halt}"
-        );
-        assert!(
-            ss.saved_snapshots().is_empty(),
-            "no snapshot should be persisted when SM.snapshot() errored"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn take_snapshot_halts_when_snapshot_store_save_fails() {
-        let (mut driver, _sm, ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 1);
-        ss.fail_next_save
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        let _ = driver
-            .process_actions(vec![Action::TakeSnapshot], None)
-            .await;
-
-        let halt = driver
-            .halt_reason
-            .as_ref()
-            .expect("must halt when snapshot_store.save_snapshot fails");
-        assert!(
-            halt.contains("snapshot_store.save_snapshot failed"),
-            "halt reason should reference snapshot store save failure, got: {halt}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn take_snapshot_halts_when_term_at_last_applied_missing() {
-        let (mut driver, _sm, ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 1);
-        driver
-            .log_store
-            .missing_next_term_at
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        let _ = driver
-            .process_actions(vec![Action::TakeSnapshot], None)
-            .await;
-
-        let halt = driver
-            .halt_reason
-            .as_ref()
-            .expect("must halt when term_at returns None for last_applied");
-        assert!(
-            halt.contains("term_at(last_applied="),
-            "halt reason should name the missing term lookup, got: {halt}"
-        );
-        assert!(ss.saved_snapshots().is_empty());
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn take_snapshot_halts_when_voter_set_unset() {
-        let (mut driver, _sm, ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 1);
-        driver.node.voter_set = None;
-
-        let _ = driver
-            .process_actions(vec![Action::TakeSnapshot], None)
-            .await;
-
-        let halt = driver
-            .halt_reason
-            .as_ref()
-            .expect("must halt when voter_set is None");
-        assert!(
-            halt.contains("voter_set"),
-            "halt reason should reference voter_set, got: {halt}"
-        );
-        assert!(ss.saved_snapshots().is_empty());
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn install_snapshot_persists_then_restores_and_advances_bookkeeping() {
-        let (mut driver, sm, ss) = build_dispatch_driver();
-        let snap_data = b"leader-snapshot-v42".to_vec();
-        let meta = snapshot_meta_for(50, 7, &[1, 2]);
-
-        let _ = driver
-            .process_actions(
-                vec![Action::InstallSnapshot {
-                    metadata: meta,
-                    data: snap_data.clone(),
-                }],
-                None,
-            )
-            .await;
-
-        assert!(
-            driver.halt_reason.is_none(),
-            "InstallSnapshot happy path must not halt: {:?}",
-            driver.halt_reason
-        );
-        let saved = ss.saved_snapshots();
-        assert_eq!(saved.len(), 1);
-        assert_eq!(saved[0].1, snap_data);
-        assert_eq!(saved[0].0.last_included_index, LogIndex(50));
-
-        let restored = sm.restored_snapshots();
-        assert_eq!(restored, vec![snap_data.clone()]);
-
-        assert_eq!(driver.node.last_applied, LogIndex(50));
-        assert_eq!(driver.node.commit_index, LogIndex(50));
-        assert_eq!(driver.node.last_log_index, LogIndex(50));
-        assert_eq!(driver.node.last_log_term, Term(7));
-
-        let vs = driver
-            .node
-            .voter_set
-            .as_ref()
-            .expect("voter_set should be set after InstallSnapshot");
-        let voter_ids: Vec<u64> = vs.voters().iter().map(|v| v.node_id.0).collect();
-        assert!(voter_ids.contains(&1) && voter_ids.contains(&2));
-        assert!(
-            driver.node.peers.contains_key(&NodeId(2)),
-            "peer table must be rebuilt to include the new peer"
-        );
-        assert!(
-            !driver.node.peers.contains_key(&NodeId(1)),
-            "peer table must exclude self"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn install_snapshot_halts_when_snapshot_store_save_fails() {
-        let (mut driver, sm, ss) = build_dispatch_driver();
-        ss.fail_next_save
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let meta = snapshot_meta_for(10, 2, &[1]);
-
-        let _ = driver
-            .process_actions(
-                vec![Action::InstallSnapshot {
-                    metadata: meta,
-                    data: b"x".to_vec(),
-                }],
-                None,
-            )
-            .await;
-
-        let halt = driver
-            .halt_reason
-            .as_ref()
-            .expect("must halt when SnapshotStore.save_snapshot fails");
-        assert!(
-            halt.contains("snapshot_store.save_snapshot failed"),
-            "halt reason should reference snapshot store save failure, got: {halt}"
-        );
-        assert!(
-            sm.restored_snapshots().is_empty(),
-            "restore must NOT be called when persist fails (persist-first ordering)"
-        );
-        assert_eq!(driver.node.last_applied, LogIndex(0));
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn install_snapshot_halts_when_state_machine_restore_fails() {
-        let (mut driver, sm, ss) = build_dispatch_driver();
-        sm.arm_fail_next_restore();
-        let meta = snapshot_meta_for(10, 2, &[1]);
-
-        let _ = driver
-            .process_actions(
-                vec![Action::InstallSnapshot {
-                    metadata: meta,
-                    data: b"x".to_vec(),
-                }],
-                None,
-            )
-            .await;
-
-        let halt = driver
-            .halt_reason
-            .as_ref()
-            .expect("must halt when state_machine.restore fails");
-        assert!(
-            halt.contains("state_machine.restore failed"),
-            "halt reason should reference SM restore failure, got: {halt}"
-        );
-        assert_eq!(
-            ss.saved_snapshots().len(),
-            1,
-            "snapshot must be persisted before restore is attempted"
-        );
-        assert_eq!(driver.node.last_applied, LogIndex(0));
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn install_snapshot_rejects_metadata_missing_voter_set() {
-        let (mut driver, sm, ss) = build_dispatch_driver();
-        let meta = SnapshotMeta {
-            last_included_index: LogIndex(10),
-            last_included_term: Term(2),
-            id: "synthetic".to_string(),
-            voter_set: None,
-            size_bytes: None,
-            checksum: None,
-        };
-
-        let _ = driver
-            .process_actions(
-                vec![Action::InstallSnapshot {
-                    metadata: meta,
-                    data: b"x".to_vec(),
-                }],
-                None,
-            )
-            .await;
-
-        let halt = driver
-            .halt_reason
-            .as_ref()
-            .expect("must halt on metadata without voter_set");
-        assert!(
-            halt.contains("missing required voter_set"),
-            "halt reason should reference missing voter_set, got: {halt}"
-        );
-        assert!(ss.saved_snapshots().is_empty());
-        assert!(sm.restored_snapshots().is_empty());
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn install_snapshot_does_not_regress_bookkeeping_when_behind() {
-        // Stale-snapshot guard: a snapshot at or behind `last_applied`
-        // must be a NO-OP — no SnapshotStore.save_snapshot, no
-        // state_machine.restore, no bookkeeping mutation, and the
-        // driver must NOT halt (stale installs are a benign race, not
-        // a correctness fault). The earlier iteration only checked
-        // index no-regress, which silently allowed the SM to be rolled
-        // back to the older snapshot bytes while indices stayed
-        // forward — that is exactly the corruption this test now
-        // pins down.
-        let (mut driver, sm, ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 100);
-        let pre_last_applied = driver.node.last_applied;
-        let pre_commit = driver.node.commit_index;
-        let pre_last_log_index = driver.node.last_log_index;
-        let pre_voter_set = driver.node.voter_set.clone();
-        let pre_peers: Vec<NodeId> = driver.node.peers.keys().copied().collect();
-
-        let meta = snapshot_meta_for(50, 3, &[1, 2, 3]);
-        let _ = driver
-            .process_actions(
-                vec![Action::InstallSnapshot {
-                    metadata: meta,
-                    data: b"behind".to_vec(),
-                }],
-                None,
-            )
-            .await;
-
-        assert!(
-            driver.halt_reason.is_none(),
-            "install behind local tip should not halt: {:?}",
-            driver.halt_reason
-        );
-        // Indices unchanged.
-        assert_eq!(driver.node.last_applied, pre_last_applied);
-        assert_eq!(driver.node.commit_index, pre_commit);
-        assert_eq!(driver.node.last_log_index, pre_last_log_index);
-        // Critical: no persist and no restore. The previous
-        // implementation called both BEFORE the no-regress guards,
-        // rolling the SM back to old data with stale indices intact.
-        assert!(
-            ss.saved_snapshots().is_empty(),
-            "stale snapshot must NOT be persisted"
-        );
-        assert!(
-            sm.restored_snapshots().is_empty(),
-            "stale snapshot must NOT trigger state_machine.restore"
-        );
-        // Membership unchanged: a stale install's voter_set must not
-        // overwrite the current (newer) configuration.
-        assert_eq!(driver.node.voter_set, pre_voter_set);
-        let post_peers: Vec<NodeId> = driver.node.peers.keys().copied().collect();
-        assert_eq!(post_peers, pre_peers);
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn install_snapshot_at_equal_last_applied_is_noop() {
-        // Boundary case of the stale-snapshot guard: `snap_idx ==
-        // last_applied`. The SM is already at that state, so the
-        // restore is at best wasteful (same bytes) and at worst
-        // corrupting (different bytes from a divergent leader). The
-        // `<=` in the guard intentionally covers equality — pin it
-        // here so a future change to `<` is caught by tests.
-        let (mut driver, sm, ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 7);
-        assert_eq!(driver.node.last_applied, LogIndex(7));
-
-        let meta = snapshot_meta_for(7, 1, &[1]);
-        let _ = driver
-            .process_actions(
-                vec![Action::InstallSnapshot {
-                    metadata: meta,
-                    data: b"equal".to_vec(),
-                }],
-                None,
-            )
-            .await;
-
-        assert!(driver.halt_reason.is_none());
-        assert!(ss.saved_snapshots().is_empty());
-        assert!(sm.restored_snapshots().is_empty());
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn install_snapshot_stale_with_missing_voter_set_is_noop() {
-        // Iteration 5 fix: the stale-snapshot guard MUST run BEFORE
-        // any metadata validation. A stale install (snap_idx <=
-        // last_applied) is a benign race — even if its metadata is
-        // malformed (e.g. missing voter_set) the driver must treat
-        // it as a no-op. The prior iteration validated voter_set
-        // first, which fail-stopped the driver on a payload we were
-        // about to discard anyway — a real edge-case contradiction
-        // of the new no-op semantics.
-        //
-        // Companion test:
-        // `install_snapshot_rejects_metadata_missing_voter_set`
-        // still asserts that a FORWARD-going install with missing
-        // voter_set halts. The reorder narrows the halt condition;
-        // it does not remove it.
-        let (mut driver, sm, ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 100);
-        let pre_last_applied = driver.node.last_applied;
-        let pre_commit = driver.node.commit_index;
-        let pre_last_log_index = driver.node.last_log_index;
-        let pre_voter_set = driver.node.voter_set.clone();
-
-        let meta = SnapshotMeta {
-            last_included_index: LogIndex(50),
-            last_included_term: Term(2),
-            id: "stale-no-voters".to_string(),
-            voter_set: None,
-            size_bytes: None,
-            checksum: None,
-        };
-        let _ = driver
-            .process_actions(
-                vec![Action::InstallSnapshot {
-                    metadata: meta,
-                    data: b"stale".to_vec(),
-                }],
-                None,
-            )
-            .await;
-
-        assert!(
-            driver.halt_reason.is_none(),
-            "stale install with missing voter_set must be a no-op, not a halt: {:?}",
-            driver.halt_reason
-        );
-        assert!(
-            ss.saved_snapshots().is_empty(),
-            "stale install must not persist"
-        );
-        assert!(
-            sm.restored_snapshots().is_empty(),
-            "stale install must not call state_machine.restore"
-        );
-        assert_eq!(driver.node.last_applied, pre_last_applied);
-        assert_eq!(driver.node.commit_index, pre_commit);
-        assert_eq!(driver.node.last_log_index, pre_last_log_index);
-        assert_eq!(driver.node.voter_set, pre_voter_set);
-    }
-
-    // -----------------------------------------------------------------
-    // Iteration 4 — additional fix coverage:
-    //   * `apply_committed` halt-on-incomplete-range (gap or short
-    //     read) — engine has already advanced last_applied, so
-    //     skipping silently would corrupt the SM/engine alignment.
-    //   * `process_actions` populates `captured.error` (not just
-    //     `halt_reason`) for ApplyToStateMachine / TakeSnapshot /
-    //     InstallSnapshot failures, mirroring the persistence
-    //     failure branches. Without this, an inbound RPC handler
-    //     can return a captured success response while the driver
-    //     is fail-stopping.
-    // -----------------------------------------------------------------
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn apply_committed_halts_when_log_range_is_short() {
-        // Seed 4 entries, ask `apply_committed` for [1..=4], but make
-        // the log store drop entry 3 from the response. The driver
-        // must halt — the engine has already advanced last_applied to
-        // 4, so silently applying only 1,2,4 would leave the SM
-        // missing entry 3 forever.
-        let (mut driver, sm, _ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 4);
-        driver
-            .log_store
-            .drop_indices_in_get_range
-            .lock()
-            .unwrap()
-            .insert(LogIndex(3));
-
         let captured = driver
             .process_actions(
                 vec![Action::ApplyToStateMachine {
                     from: LogIndex(1),
-                    to: LogIndex(4),
-                }],
-                None,
-            )
-            .await;
-
-        let halt = driver
-            .halt_reason
-            .as_ref()
-            .expect("must halt when log_store returns short/gapped range");
-        assert!(
-            halt.contains("returned 3 entries, expected 4")
-                || halt.contains("returned entry at LogIndex(4) at position 2"),
-            "halt reason should name the short-range/gap, got: {halt}"
-        );
-        // captured.error must mirror the halt_reason for symmetry
-        // with the persistence-failure branches (Fix 3).
-        assert!(
-            captured.error.is_some(),
-            "captured.error must be set so inbound RPC handlers return Err"
-        );
-        // Critical: validation happens BEFORE the apply loop, so the
-        // state machine sees zero applies — the alternative (applying
-        // 1,2 then halting at 3) would let the engine and SM diverge
-        // by exactly the entries before the gap.
-        assert!(
-            sm.snapshot_handle().lock().unwrap().is_empty(),
-            "no apply must happen when range validation fails"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn apply_committed_halts_when_log_range_drops_middle_entry() {
-        // Length-check coverage. Drop entry 2 so the store returns
-        // 3 entries when 4 are expected. With ONLY this injector the
-        // length check fires first — see
-        // `apply_committed_halts_when_log_range_has_misaligned_index`
-        // below for the test that actually exercises the per-position
-        // index-continuity branch.
-        let (mut driver, _sm, _ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 4);
-        driver
-            .log_store
-            .drop_indices_in_get_range
-            .lock()
-            .unwrap()
-            .insert(LogIndex(2));
-
-        let captured = driver
-            .process_actions(
-                vec![Action::ApplyToStateMachine {
-                    from: LogIndex(1),
-                    to: LogIndex(4),
-                }],
-                None,
-            )
-            .await;
-
-        let halt = driver
-            .halt_reason
-            .as_ref()
-            .expect("must halt on log range short read");
-        assert!(
-            halt.contains("returned 3 entries, expected 4"),
-            "length check should fire first when an entry is dropped, got: {halt}"
-        );
-        assert!(captured.error.is_some());
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn apply_committed_halts_when_log_range_has_misaligned_index() {
-        // Index-continuity branch coverage (the prior iteration only
-        // covered the length check). Construct a same-length response
-        // where one entry's `index` is wrong relative to its position
-        // in the returned slice — defeats the length check (4 entries
-        // requested, 4 returned) and forces the per-position check at
-        // `apply_committed`'s index-equality loop to halt.
-        //
-        // Without the `override_indices_in_get_range` injector this
-        // branch is unreachable from unit tests: every other failure
-        // mode (drop / short read / inverted range) trips the length
-        // check first. The reordering decision matters because a
-        // future store implementation could in principle return the
-        // right COUNT of entries but with one out-of-order index
-        // (e.g. a corrupted on-disk log or a bug in segment
-        // stitching) — that must halt rather than silently apply the
-        // wrong entry under the engine's `last_applied` advancement.
-        let (mut driver, sm, _ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 4);
-        // Rewrite entry 3's index to a far-away value. Result of
-        // `get_range(1, 5)` becomes (index, position) pairs of
-        // (1,0), (2,1), (99,2), (4,3) — same length 4, but the
-        // entry at position 2 has index 99, not the expected 3.
-        driver
-            .log_store
-            .override_indices_in_get_range
-            .lock()
-            .unwrap()
-            .insert(LogIndex(3), LogIndex(99));
-
-        let captured = driver
-            .process_actions(
-                vec![Action::ApplyToStateMachine {
-                    from: LogIndex(1),
-                    to: LogIndex(4),
-                }],
-                None,
-            )
-            .await;
-
-        let halt = driver
-            .halt_reason
-            .as_ref()
-            .expect("must halt on log range index misalignment");
-        assert!(
-            halt.contains("at position 2")
-                && halt.contains("LogIndex(99)")
-                && halt.contains("expected LogIndex(3)"),
-            "halt reason should name the misaligned index/position, got: {halt}"
-        );
-        assert!(
-            !halt.contains("returned 4 entries, expected"),
-            "length check must NOT fire — this test covers the index-continuity branch, got: {halt}"
-        );
-        assert!(
-            captured.error.is_some(),
-            "captured.error must be set for inbound RPC handlers"
-        );
-        // Validation runs before the apply loop, so the SM sees zero
-        // applies — proves the index-continuity check halts BEFORE
-        // any (potentially wrong-index) entry reaches the state
-        // machine.
-        assert!(
-            sm.snapshot_handle().lock().unwrap().is_empty(),
-            "no apply must happen when index-continuity validation fails"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn apply_to_state_machine_populates_captured_error_on_failure() {
-        // Fix 3: when state_machine.apply() fails, `process_actions`
-        // must populate `captured.error` AND `halt_reason`. The
-        // returned CapturedResponse is what inbound RPC handlers
-        // (Vote/PreVote/Fetch/FetchSnapshot) inspect before sending
-        // any captured success payload — without captured.error,
-        // those handlers will reply Ok while the driver is dying.
-        let (mut driver, sm, _ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 2);
-        sm.arm_fail_apply_at(LogIndex(1));
-
-        let captured = driver
-            .process_actions(
-                vec![Action::ApplyToStateMachine {
-                    from: LogIndex(1),
-                    to: LogIndex(2),
-                }],
-                None,
-            )
-            .await;
-
-        assert!(driver.halt_reason.is_some());
-        let err = captured
-            .error
-            .expect("captured.error must be set so inbound RPCs return Err");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("state machine apply at LogIndex(1)"),
-            "captured.error should describe the apply failure, got: {msg}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn take_snapshot_populates_captured_error_on_failure() {
-        // Fix 3 for the TakeSnapshot dispatch branch.
-        let (mut driver, sm, _ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 1);
-        sm.arm_fail_next_snapshot();
-
-        let captured = driver.process_actions(vec![Action::TakeSnapshot], None).await;
-
-        assert!(driver.halt_reason.is_some());
-        let err = captured
-            .error
-            .expect("captured.error must be set for TakeSnapshot failure");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("state machine snapshot failed"),
-            "captured.error should describe the snapshot failure, got: {msg}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn install_snapshot_populates_captured_error_on_failure() {
-        // Fix 3 for the InstallSnapshot dispatch branch. Use the
-        // missing-voter-set halt path because it doesn't require any
-        // injector wiring.
-        let (mut driver, _sm, _ss) = build_dispatch_driver();
-        let meta = SnapshotMeta {
-            last_included_index: LogIndex(10),
-            last_included_term: Term(2),
-            id: "no-voters".to_string(),
-            voter_set: None,
-            size_bytes: None,
-            checksum: None,
-        };
-
-        let captured = driver
-            .process_actions(
-                vec![Action::InstallSnapshot {
-                    metadata: meta,
-                    data: b"x".to_vec(),
-                }],
-                None,
-            )
-            .await;
-
-        assert!(driver.halt_reason.is_some());
-        let err = captured
-            .error
-            .expect("captured.error must be set for InstallSnapshot failure");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("missing required voter_set"),
-            "captured.error should describe the install failure, got: {msg}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn apply_committed_halts_on_inverted_range() {
-        // Defensive guard against an inverted range arriving at the
-        // dispatch helper. The engine's contract is from <= to, but
-        // `apply_committed` is reachable from direct test dispatch
-        // and any future engine bug would otherwise panic on the
-        // subtraction in `expected_len`. Halting is the safe choice.
-        let (mut driver, sm, _ss) = build_dispatch_driver();
-        seed_committed_entries(&mut driver, 4);
-
-        let captured = driver
-            .process_actions(
-                vec![Action::ApplyToStateMachine {
-                    from: LogIndex(3),
                     to: LogIndex(1),
                 }],
                 None,
             )
             .await;
 
-        let halt = driver
-            .halt_reason
-            .as_ref()
-            .expect("must halt on inverted range");
         assert!(
-            halt.contains("invalid range"),
-            "halt reason should call out invalid range, got: {halt}"
+            captured.error.is_some(),
+            "ApplyToStateMachine must surface error to caller on log read failure"
+        );
+        assert!(
+            driver.halt_reason.is_some(),
+            "apply_committed log read failure must halt the driver (committed entries must apply)"
+        );
+        let reason = driver.halt_reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("apply") && reason.contains("read range"),
+            "halt_reason must describe the failure, got: {reason}"
+        );
+
+        // Waiter at index 1 must have been resolved with the error.
+        let waiter_outcome = rx
+            .await
+            .expect("waiter must be resolved (not dropped) on apply failure");
+        assert!(
+            matches!(waiter_outcome, Err(XRaftError::Storage(_))),
+            "pending waiter must receive Storage error, got {waiter_outcome:?}"
+        );
+
+        // state_machine.apply must NOT have been called — the failure
+        // was upstream at the log read.
+        assert_eq!(
+            h.applied.lock().unwrap().len(),
+            0,
+            "apply() must not be called when log read fails",
+        );
+    }
+
+    /// `apply_committed` halts the driver when `StateMachine::apply`
+    /// returns an error on a committed entry.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn apply_committed_state_machine_apply_failure_halts_driver() {
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
+
+        driver
+            .log_store
+            .append(&[
+                Entry {
+                    index: LogIndex(1),
+                    term: Term(1),
+                    payload: EntryPayload::Command(Bytes::from_static(b"a")),
+                },
+                Entry {
+                    index: LogIndex(2),
+                    term: Term(1),
+                    payload: EntryPayload::Command(Bytes::from_static(b"b")),
+                },
+            ])
+            .expect("seed log");
+
+        // Waiters at indices 1 and 2: the failure happens at 1, so
+        // BOTH waiters should be resolved with an error (the contract
+        // is "waiters in [failed_index, to]").
+        let (tx1, rx1) = oneshot::channel::<XResult<LogIndex>>();
+        let (tx2, rx2) = oneshot::channel::<XResult<LogIndex>>();
+        driver.pending.entry(LogIndex(1)).or_default().push(tx1);
+        driver.pending.entry(LogIndex(2)).or_default().push(tx2);
+
+        h.fail_next_apply
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let captured = driver
+            .process_actions(
+                vec![Action::ApplyToStateMachine {
+                    from: LogIndex(1),
+                    to: LogIndex(2),
+                }],
+                None,
+            )
+            .await;
+
+        assert!(
+            captured.error.is_some(),
+            "state-machine apply failure must produce a captured error"
+        );
+        assert!(
+            driver.halt_reason.is_some(),
+            "state-machine apply failure must halt the driver"
+        );
+        let reason = driver.halt_reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("state machine apply") || reason.contains("apply to state machine"),
+            "halt_reason must describe the apply failure, got: {reason}"
+        );
+
+        let r1 = rx1.await.expect("waiter at index 1 must be resolved");
+        let r2 = rx2.await.expect("waiter at index 2 must be resolved");
+        assert!(
+            matches!(r1, Err(XRaftError::Storage(_))),
+            "waiter at failing index must receive Storage error, got {r1:?}"
+        );
+        assert!(
+            matches!(r2, Err(XRaftError::Storage(_))),
+            "waiter at trailing index must also fail (driver halts before reaching it), got {r2:?}"
+        );
+    }
+
+    /// `apply_committed` halts when the log store returns fewer entries
+    /// than the committed range requires. This guards against silent
+    /// data loss / partial application when an entry that the engine
+    /// has committed is no longer in the durable log.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn apply_committed_missing_entry_halts_driver() {
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
+
+        // Seed only entries 1 and 3 — entry 2 is "missing" (the engine
+        // believes [1..=3] are committed but the durable log has a gap).
+        driver
+            .log_store
+            .append(&[
+                Entry {
+                    index: LogIndex(1),
+                    term: Term(1),
+                    payload: EntryPayload::Command(Bytes::from_static(b"a")),
+                },
+                Entry {
+                    index: LogIndex(3),
+                    term: Term(1),
+                    payload: EntryPayload::Command(Bytes::from_static(b"c")),
+                },
+            ])
+            .expect("seed log");
+
+        let captured = driver
+            .process_actions(
+                vec![Action::ApplyToStateMachine {
+                    from: LogIndex(1),
+                    to: LogIndex(3),
+                }],
+                None,
+            )
+            .await;
+
+        assert!(
+            captured.error.is_some(),
+            "missing committed entry must surface error to caller"
+        );
+        assert!(
+            driver.halt_reason.is_some(),
+            "missing committed entry must halt the driver"
+        );
+        let reason = driver.halt_reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("committed entries missing") || reason.contains("apply"),
+            "halt_reason must describe the missing-entry failure, got: {reason}"
+        );
+
+        // state_machine.apply must NOT have been called on any entry —
+        // the contiguity check fires before any apply.
+        assert_eq!(
+            h.applied.lock().unwrap().len(),
+            0,
+            "apply() must not run when the committed range is incomplete",
+        );
+    }
+
+    // =====================================================================
+    // Stage 5.2 durable-log coordination tests for `handle_install_snapshot`
+    // (evaluator feedback iter-2 item 3)
+    //
+    // After install_snapshot, `RaftNode.last_log_index` must NOT diverge
+    // from the effective tail (max of log tip, snapshot anchor). The
+    // suffix-truncate path and the fetch-response materialiser must
+    // both consult `effective_log_tip` so subsequent appends / fetch
+    // state stay consistent with the snapshot anchor.
+    // =====================================================================
+
+    /// When the local log has an entry at `last_included_index` with
+    /// matching term, the install path retains the log (per Raft §7).
+    /// Entries strictly past `last_included_index` remain accessible to
+    /// later fetch / apply paths, AND the engine's `last_log_*` mirror
+    /// reconciles to the actual log tail (not just the snapshot anchor)
+    /// — Stage 5.2 evaluator iter-3 item 1 fix.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn install_snapshot_with_matching_term_retains_log_tail() {
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, _h) = build_driver_for_snapshot_tests(cfg);
+
+        // Pre-populate the log with entries 8..=11. The "anchor" entry
+        // at index 10 has term=3 — same as the snapshot we'll install.
+        driver
+            .log_store
+            .append(&[
+                Entry {
+                    index: LogIndex(8),
+                    term: Term(3),
+                    payload: EntryPayload::Command(Bytes::from_static(b"e8")),
+                },
+                Entry {
+                    index: LogIndex(9),
+                    term: Term(3),
+                    payload: EntryPayload::Command(Bytes::from_static(b"e9")),
+                },
+                Entry {
+                    index: LogIndex(10),
+                    term: Term(3),
+                    payload: EntryPayload::Command(Bytes::from_static(b"e10")),
+                },
+                Entry {
+                    index: LogIndex(11),
+                    term: Term(3),
+                    payload: EntryPayload::Command(Bytes::from_static(b"e11")),
+                },
+            ])
+            .expect("seed log");
+
+        // Mirror the durable seed into the engine's in-memory mirror
+        // (Stage 5.2 evaluator iter-3 item 4 fix). Without this the
+        // engine starts at last_log_index=0 and the
+        // raise-only `handle_snapshot_installed` happens to land at
+        // the snapshot anchor (10) which would mask the actual tail
+        // (11), so the post-install reconciliation bug never surfaces.
+        driver.node.set_last_log(LogIndex(11), Term(3));
+
+        let payload = b"snapshot-keep-tail".to_vec();
+        let metadata = SnapshotMeta {
+            id: String::new(),
+            last_included_index: LogIndex(10),
+            last_included_term: Term(3),
+            voter_set: driver.node.voter_set.clone(),
+            size_bytes: Some(payload.len() as u64),
+            checksum: None,
+        };
+
+        let captured = driver
+            .process_actions(
+                vec![Action::InstallSnapshot {
+                    metadata: metadata.clone(),
+                    data: payload.clone(),
+                }],
+                None,
+            )
+            .await;
+
+        assert!(captured.error.is_none(), "install must succeed");
+        assert!(
+            driver.halt_reason.is_none(),
+            "install must not halt the driver"
+        );
+
+        // The entry past the snapshot anchor must still be present —
+        // it is consistent with the snapshot's history.
+        let entry_11 = driver
+            .log_store
+            .get(LogIndex(11))
+            .expect("get must succeed");
+        assert!(
+            entry_11.is_some(),
+            "entry past snapshot anchor must be retained when term matches",
+        );
+
+        // CRITICAL (iter-3 item 1 invariant): the engine's `last_log_*`
+        // mirror reconciles to the actual log tail (11), NOT to the
+        // raise-only snapshot anchor (10). Without `set_last_log(
+        // effective_log_tip())` post-step the engine would report
+        // last_log_index = 11 only because we pre-mirrored above, but
+        // would NOT have advanced past it; with the fix in place, this
+        // path is always correct because effective_log_tip = max(
+        // log.last, snapshot.last) and the durable log retained 11.
+        assert_eq!(
+            driver.node.last_log_index,
+            LogIndex(11),
+            "engine last_log_index must equal the actual durable log tail (11) after a matching-term install that retained entries past the snapshot anchor",
+        );
+        assert_eq!(
+            driver.node.last_log_term,
+            Term(3),
+            "engine last_log_term must match the durable tail's term",
+        );
+    }
+
+    /// When the local log does NOT have a matching-term entry at
+    /// `last_included_index`, the install path wipes every entry
+    /// (per Raft §7). The snapshot supersedes a stale leadership's
+    /// log entirely and the engine's `last_log_*` mirror is clamped
+    /// DOWN to the snapshot anchor — Stage 5.2 evaluator iter-3
+    /// item 1 fix (raise-only `handle_snapshot_installed` would have
+    /// left the engine reporting a non-existent log tip at 11).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn install_snapshot_with_mismatched_term_wipes_log() {
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, _h) = build_driver_for_snapshot_tests(cfg);
+
+        // Pre-populate with entries from a stale leadership: anchor at
+        // index 10 has term=1 but the snapshot we'll install asserts
+        // term=5 at that index — a clear divergence.
+        driver
+            .log_store
+            .append(&[
+                Entry {
+                    index: LogIndex(8),
+                    term: Term(1),
+                    payload: EntryPayload::Command(Bytes::from_static(b"stale-8")),
+                },
+                Entry {
+                    index: LogIndex(9),
+                    term: Term(1),
+                    payload: EntryPayload::Command(Bytes::from_static(b"stale-9")),
+                },
+                Entry {
+                    index: LogIndex(10),
+                    term: Term(1),
+                    payload: EntryPayload::Command(Bytes::from_static(b"stale-10")),
+                },
+                Entry {
+                    index: LogIndex(11),
+                    term: Term(1),
+                    payload: EntryPayload::Command(Bytes::from_static(b"stale-11")),
+                },
+            ])
+            .expect("seed log");
+
+        // Mirror the stale durable seed into the engine — this is what
+        // makes the bug visible. With engine.last_log_index = 11 BEFORE
+        // install, the raise-only `handle_snapshot_installed` (snapshot
+        // anchor 10 < 11) does NOT advance the engine. After the wipe
+        // the durable log is empty but the engine would still report
+        // last_log_index = 11 if not for the driver's `set_last_log(
+        // effective_log_tip())` reconciliation post-step.
+        // (iter-3 item 4 fix.)
+        driver.node.set_last_log(LogIndex(11), Term(1));
+
+        let payload = b"snapshot-wipe-stale".to_vec();
+        let metadata = SnapshotMeta {
+            id: String::new(),
+            last_included_index: LogIndex(10),
+            last_included_term: Term(5), // mismatches the local Term(1)
+            voter_set: driver.node.voter_set.clone(),
+            size_bytes: Some(payload.len() as u64),
+            checksum: None,
+        };
+
+        let captured = driver
+            .process_actions(
+                vec![Action::InstallSnapshot {
+                    metadata: metadata.clone(),
+                    data: payload.clone(),
+                }],
+                None,
+            )
+            .await;
+
+        assert!(captured.error.is_none(), "install must succeed");
+        assert!(
+            driver.halt_reason.is_none(),
+            "install must not halt the driver"
+        );
+
+        // The entire log must have been wiped — the stale leadership's
+        // history conflicts with the snapshot.
+        assert_eq!(
+            driver.log_store.last_index(),
+            LogIndex(0),
+            "term mismatch at anchor must wipe the entire local log",
+        );
+        assert!(
+            driver.log_store.get(LogIndex(11)).expect("get").is_none(),
+            "stale entries past the anchor must also be wiped on term mismatch",
+        );
+
+        // CRITICAL (iter-3 item 1 invariant): the engine's `last_log_*`
+        // is clamped DOWN from the pre-install mirror (11) to the
+        // snapshot anchor (10). Without the driver's post-step
+        // `set_last_log(effective_log_tip())` reconciliation the engine
+        // would still report 11 even though the durable log is empty,
+        // making subsequent appends collide with non-existent state.
+        assert_eq!(
+            driver.node.last_log_index,
+            LogIndex(10),
+            "engine last_log_index must clamp DOWN to the snapshot anchor when the durable log was wiped",
+        );
+        assert_eq!(
+            driver.node.last_log_term,
+            Term(5),
+            "engine last_log_term must clamp DOWN to the snapshot anchor's term",
+        );
+        let (eff_idx, eff_term) = driver.effective_log_tip();
+        assert_eq!(
+            eff_idx,
+            LogIndex(10),
+            "effective_log_tip must return snapshot anchor when log is empty post-wipe",
+        );
+        assert_eq!(eff_term, Term(5));
+    }
+
+    /// `handle_install_snapshot` halts the driver when the log wipe
+    /// truncate fails. Halting on the wipe (vs. silently continuing)
+    /// is the safe choice: a partially-truncated log would leave a
+    /// divergent prefix that future appends could collide with.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn install_snapshot_truncate_failure_halts_driver() {
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
+
+        // Term mismatch at anchor → wipe path is taken.
+        driver
+            .log_store
+            .append(&[Entry {
+                index: LogIndex(10),
+                term: Term(1),
+                payload: EntryPayload::Command(Bytes::from_static(b"stale")),
+            }])
+            .expect("seed log");
+
+        // Arm truncate failure on the install-snapshot wipe.
+        h.fail_next_truncate
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let payload = b"snap".to_vec();
+        let metadata = SnapshotMeta {
+            id: String::new(),
+            last_included_index: LogIndex(10),
+            last_included_term: Term(5),
+            voter_set: driver.node.voter_set.clone(),
+            size_bytes: Some(payload.len() as u64),
+            checksum: None,
+        };
+
+        let captured = driver
+            .process_actions(
+                vec![Action::InstallSnapshot {
+                    metadata,
+                    data: payload,
+                }],
+                None,
+            )
+            .await;
+
+        assert!(
+            captured.error.is_some(),
+            "truncate failure during install must surface to caller"
+        );
+        assert!(
+            driver.halt_reason.is_some(),
+            "truncate failure during install must halt the driver"
+        );
+        let reason = driver.halt_reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("truncate") || reason.contains("install-snapshot"),
+            "halt_reason must describe the truncate failure, got: {reason}"
+        );
+    }
+
+    /// After install_snapshot, a subsequent `SuffixFromInclusive`
+    /// truncate that empties the in-memory log MUST NOT revert the
+    /// engine's `last_log_index` below the snapshot anchor.
+    ///
+    /// This is the concrete bug the evaluator flagged: the truncate
+    /// path was calling `set_last_log(log_store.last_index(), ...)`
+    /// which returns (0, Term(0)) on an empty log, silently erasing
+    /// the snapshot anchor from the engine's view.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn truncate_after_snapshot_install_preserves_snapshot_anchor() {
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, _h) = build_driver_for_snapshot_tests(cfg);
+
+        // Step 1: install a snapshot at index=10, term=5. The log is
+        // empty at this point so the wipe path is taken vacuously.
+        let payload = b"snap-anchor-test".to_vec();
+        let metadata = SnapshotMeta {
+            id: String::new(),
+            last_included_index: LogIndex(10),
+            last_included_term: Term(5),
+            voter_set: driver.node.voter_set.clone(),
+            size_bytes: Some(payload.len() as u64),
+            checksum: None,
+        };
+        driver
+            .process_actions(
+                vec![Action::InstallSnapshot {
+                    metadata,
+                    data: payload,
+                }],
+                None,
+            )
+            .await;
+        assert_eq!(driver.node.last_log_index, LogIndex(10));
+        assert_eq!(driver.node.last_log_term, Term(5));
+
+        // Step 2: simulate an AppendEntries from a (briefly) new leader
+        // adding entries 11..=13. The driver appends without calling
+        // set_last_log (the engine's handle_append_entries_request is
+        // expected to keep its mirror current — but here we are
+        // testing the post-truncate path, so we synthesise the append
+        // directly into the log store and then drive a TruncateLog).
+        driver
+            .log_store
+            .append(&[
+                Entry {
+                    index: LogIndex(11),
+                    term: Term(6),
+                    payload: EntryPayload::Command(Bytes::from_static(b"e11")),
+                },
+                Entry {
+                    index: LogIndex(12),
+                    term: Term(6),
+                    payload: EntryPayload::Command(Bytes::from_static(b"e12")),
+                },
+                Entry {
+                    index: LogIndex(13),
+                    term: Term(6),
+                    payload: EntryPayload::Command(Bytes::from_static(b"e13")),
+                },
+            ])
+            .expect("seed appended entries");
+
+        // Step 3: a TruncateLog(SuffixFromInclusive { 11 }) wipes
+        // every appended entry — log_store.last_index() == 0 after.
+        // PRE-FIX: set_last_log(0, Term(0)) would have reverted the
+        // engine to before the snapshot. POST-FIX: effective_log_tip()
+        // preserves the snapshot anchor (10, Term(5)).
+        let captured = driver
+            .process_actions(
+                vec![Action::TruncateLog(LogTruncation::SuffixFromInclusive {
+                    from_index_inclusive: LogIndex(11),
+                })],
+                None,
+            )
+            .await;
+
+        assert!(captured.error.is_none(), "truncate must succeed");
+        assert!(
+            driver.halt_reason.is_none(),
+            "truncate must not halt the driver"
+        );
+        assert_eq!(
+            driver.log_store.last_index(),
+            LogIndex(0),
+            "log must be empty after truncate from index 11",
+        );
+
+        // THE CRITICAL ASSERTION — the snapshot anchor survives.
+        assert_eq!(
+            driver.node.last_log_index,
+            LogIndex(10),
+            "engine.last_log_index must NOT revert below snapshot anchor when log is emptied",
+        );
+        assert_eq!(
+            driver.node.last_log_term,
+            Term(5),
+            "engine.last_log_term must reflect snapshot anchor's term, not Term(0)",
+        );
+    }
+
+    /// `materialize_fetch_response` resolves the term at
+    /// `fetch_offset - 1` from the snapshot anchor when the log alone
+    /// does not cover that index. A follower fetching at
+    /// `snapshot.last_included_index + 1` with the correct
+    /// `last_fetched_epoch` must NOT be told "diverged" merely because
+    /// the leader's log has been compacted past the anchor.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn serve_fetch_after_snapshot_install_uses_snapshot_anchor() {
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, _h) = build_driver_for_snapshot_tests(cfg);
+
+        // Install a snapshot at index=10, term=5 with empty log. After
+        // this, log_store.term_at(LogIndex(10)) returns None — but
+        // node.last_snapshot_meta knows the term.
+        let payload = b"snap-fetch-anchor".to_vec();
+        let metadata = SnapshotMeta {
+            id: String::new(),
+            last_included_index: LogIndex(10),
+            last_included_term: Term(5),
+            voter_set: driver.node.voter_set.clone(),
+            size_bytes: Some(payload.len() as u64),
+            checksum: None,
+        };
+        driver
+            .process_actions(
+                vec![Action::InstallSnapshot {
+                    metadata,
+                    data: payload,
+                }],
+                None,
+            )
+            .await;
+        assert!(
+            driver.log_store.term_at(LogIndex(10)).unwrap().is_none(),
+            "test precondition: log_store must NOT cover the snapshot anchor index"
+        );
+
+        // Materialize a fetch where the follower's last_fetched_epoch
+        // matches the snapshot's last_included_term. The response must
+        // NOT contain `diverging_epoch` — the snapshot anchor proves
+        // they're on the same history.
+        let resp = driver
+            .materialize_fetch_response(
+                driver.node.config.cluster_id.clone(),
+                0,
+                driver.node.id,
+                LogIndex(10),
+                LogIndex(11),
+                Term(5),
+            )
+            .expect("materialize_fetch_response must succeed");
+        assert!(
+            resp.diverging_epoch.is_none(),
+            "fetch at (snapshot.last_included_index + 1) with matching epoch must NOT diverge, \
+             but got: {:?}",
+            resp.diverging_epoch,
+        );
+        assert!(
+            resp.entries.is_empty(),
+            "no entries past the snapshot anchor to serve",
+        );
+
+        // Sanity check: with a MISMATCHED last_fetched_epoch the
+        // response SHOULD diverge — the helper's snapshot-aware lookup
+        // still correctly identifies divergence at the anchor.
+        let resp_diverge = driver
+            .materialize_fetch_response(
+                driver.node.config.cluster_id.clone(),
+                0,
+                driver.node.id,
+                LogIndex(10),
+                LogIndex(11),
+                Term(9), // wrong epoch
+            )
+            .expect("materialize_fetch_response must succeed");
+        let dv = resp_diverge
+            .diverging_epoch
+            .as_ref()
+            .expect("epoch mismatch at the snapshot anchor must produce a DivergingEpoch");
+        assert_eq!(
+            dv.epoch,
+            Term(5),
+            "DivergingEpoch.epoch must come from the snapshot anchor when the log is empty"
+        );
+        assert_eq!(
+            dv.end_offset,
+            LogIndex(10),
+            "DivergingEpoch.end_offset must be the snapshot anchor when log_store is empty"
+        );
+    }
+
+    /// **Stage 5.2 evaluator iter-3 item 2** — outbound snapshot
+    /// install pipeline: a complete `OutboundResult::FetchSnapshot`
+    /// from the recognised leader with a matching `cluster_id` /
+    /// `leader_epoch` MUST result in
+    /// `StateMachine::restore()` being called with the reassembled
+    /// data, the snapshot store carrying the metadata, and the
+    /// engine's snapshot indices advancing.
+    ///
+    /// This test is the actual "leader-to-follower install" coverage
+    /// the evaluator flagged was missing. Prior to this iter the
+    /// outbound FetchSnapshot drain only counted chunks; the new
+    /// pipeline reassembles the chunk stream in `MessageRouter` and
+    /// dispatches `Action::InstallSnapshot` here.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn outbound_fetch_snapshot_complete_invokes_state_machine_restore() {
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
+
+        // Set up the install fence: the node currently believes
+        // NodeId(2) is the leader at term=5 (these are the values the
+        // chunk envelope must match).
+        driver.node.hard_state.current_term = Term(5);
+        driver.node.leader_id = Some(NodeId(2));
+
+        let metadata = SnapshotMeta {
+            id: "snap-outbound".into(),
+            last_included_index: LogIndex(20),
+            last_included_term: Term(5),
+            voter_set: driver.node.voter_set.clone(),
+            size_bytes: Some(8),
+            checksum: None,
+        };
+        let data: Vec<u8> = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11];
+        let res = OutboundResult::FetchSnapshot {
+            peer: NodeId(2),
+            cluster_id: "test-driver".into(),
+            leader_epoch: 5,
+            chunk_count: 3,
+            completed: true,
+            metadata: Some(metadata.clone()),
+            data: data.clone(),
+        };
+
+        driver.handle_outbound_result(res).await;
+
+        assert!(
+            driver.halt_reason.is_none(),
+            "valid outbound install must NOT halt the driver: {:?}",
+            driver.halt_reason
         );
 
         // StateMachine::restore was called with the reassembled bytes.
@@ -10340,10 +9521,6 @@ port = 6012
             "TakeSnapshot cycle must not error, got {:?}",
             captured.error,
         );
-        // Stage 7.3 (iter 2) — drain the fire-and-forget worker so
-        // `Input::SnapshotComplete` runs and emits the prefix
-        // truncation we assert on below.
-        driver.await_pending_snapshot().await;
         assert!(
             driver.halt_reason.is_none(),
             "TakeSnapshot cycle must not halt, got {:?}",
@@ -10399,109 +9576,6 @@ port = 6012
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].0.last_included_index, LogIndex(150));
         assert_eq!(saved[0].1, snapshot_payload);
-    }
-
-    // -----------------------------------------------------------------
-    // Stage 6.2 evaluator iter-2 item 1 — operator-triggered snapshot
-    // surfaces a follow-up purge_prefix failure to the admin caller
-    // instead of returning Ok and silently halting the driver.
-    //
-    // Scenario: a leader receives a `DriverEvent::TriggerSnapshot`
-    // (the admin HTTP `POST /admin/trigger-snapshot` path). The
-    // state-machine snapshot + SnapshotStore.save_snapshot succeed,
-    // so the spawn_blocking snapshot worker returns Ok with
-    // follow-up `Action::TruncateLog(PrefixThroughInclusive(...))`.
-    // The follow-up's `purge_prefix` call then fails (e.g. disk
-    // error on segment-file deletion). The fix: the admin caller
-    // MUST receive `Err(Storage(...))` so the operator's dashboard
-    // does not show "snapshot ok" while the driver halts on its
-    // next tick. Previously the captured response was discarded and
-    // the caller was told `Ok(TriggeredSnapshotInfo)`.
-    // -----------------------------------------------------------------
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn trigger_snapshot_followup_purge_failure_surfaces_error_to_caller() {
-        let cfg = single_voter_config(2);
-        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
-
-        // Promote to Leader explicitly so `handle_trigger_snapshot`
-        // does not short-circuit with `NotLeader`. The default
-        // post-construction role is Follower.
-        driver.node.role = NodeRole::Leader;
-        driver.node.leader_id = Some(driver.node.id);
-        driver.node.hard_state.current_term = Term(4);
-
-        // Seed a small log so the engine has prefix work to do when
-        // it processes `Input::SnapshotComplete`.
-        let entries: Vec<Entry> = (1..=10)
-            .map(|i| Entry {
-                index: LogIndex(i),
-                term: Term(4),
-                payload: EntryPayload::Command(Bytes::from(format!("cmd-{i}").into_bytes())),
-            })
-            .collect();
-        driver
-            .log_store
-            .append(&entries)
-            .expect("seed entries into the log store");
-        driver.node.set_last_log(LogIndex(10), Term(4));
-        driver.node.commit_index = LogIndex(10);
-        driver.node.last_applied = LogIndex(10);
-
-        // Pre-seed snapshot bytes so save_snapshot is deterministic.
-        *h.snapshot_payload.lock().unwrap() = b"trigger-snapshot-payload".to_vec();
-
-        // Arm the failure injection: the FOLLOW-UP TruncateLog(
-        // PrefixThroughInclusive(10)) that the engine emits after
-        // `Input::SnapshotComplete` will hit `purge_prefix` and
-        // return Storage(...). This is the path the fix exercises.
-        h.fail_next_purge_prefix
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        let (reply_tx, reply_rx) = oneshot::channel();
-        driver.handle_trigger_snapshot(reply_tx).await;
-
-        // Stage 7.3 (iter 2) — `handle_trigger_snapshot` is now
-        // fire-and-forget; the worker delivers a `SnapshotCompletion`
-        // on `snapshot_done_rx` and `handle_snapshot_completed`
-        // surfaces the follow-up purge failure to the operator's
-        // reply oneshot. Bypassing `run()` means we drive the
-        // completion explicitly here so `reply_rx.await` resolves.
-        driver.await_pending_snapshot().await;
-
-        let result = reply_rx.await.expect("reply channel closed unexpectedly");
-        match result {
-            Err(XRaftError::Storage(msg)) => {
-                assert!(
-                    msg.contains("purge_prefix"),
-                    "error must propagate the underlying purge_prefix failure, got: {msg}",
-                );
-            }
-            other => panic!(
-                "expected Storage error from follow-up purge failure, got {other:?}; the admin caller must NOT receive Ok when the post-snapshot truncation fails",
-            ),
-        }
-
-        // The fail-stop contract: process_actions also sets
-        // `halt_reason`, so the driver's main loop would shut down
-        // on the next iteration. We don't run the loop here, but the
-        // halt_reason MUST be set so a follow-up tick triggers
-        // fail_stop_shutdown.
-        assert!(
-            driver.halt_reason.is_some(),
-            "follow-up purge failure must arm the driver's halt_reason for fail-stop on the next tick",
-        );
-
-        // The snapshot itself DID land in the store before the
-        // follow-up failed — we report failure to the caller but the
-        // partial state is preserved so the operator can inspect it.
-        let saved = h.saved_snapshots.lock().unwrap().clone();
-        assert_eq!(
-            saved.len(),
-            1,
-            "snapshot bytes should have been saved BEFORE the follow-up purge failed",
-        );
-        assert_eq!(saved[0].0.last_included_index, LogIndex(10));
     }
 
     // -----------------------------------------------------------------
@@ -10662,22 +9736,8 @@ port = 6012
 
         let transport = Arc::new(ChunkProducingTransport::new(chunks));
         let (mut driver, _handle) = build_driver_with_transport(cfg, transport);
-        // Stage 7.3: state_machine / snapshot_store are now wrapped in
-        // Arc<std::sync::Mutex<_>> so the background snapshot worker
-        // can offload via spawn_blocking. Grab the inner test handles
-        // under a short-lived lock — these handles are themselves
-        // Arc-shared with the SM/SS and can be polled concurrently.
-        let restores_handle = driver
-            .state_machine
-            .lock()
-            .expect("state_machine mutex poisoned in test setup")
-            .restores_received_handle();
-        let saved_handle = driver
-            .snapshot_store
-            .lock()
-            .expect("snapshot_store mutex poisoned in test setup")
-            .saved
-            .clone();
+        let restores_handle = driver.state_machine.restores_received_handle();
+        let saved_handle = driver.snapshot_store.saved.clone();
 
         // Follower pre-condition: recognises NodeId(99) as leader at
         // term 9, no log, no snapshot.
@@ -11100,10 +10160,6 @@ port = 6012
             "TakeSnapshot cycle must not error, got {:?}",
             take_captured.error,
         );
-        // Stage 7.3 (iter 2) — await the fire-and-forget snapshot
-        // worker so the follow-up TruncateLog runs before we assert
-        // the prefix is actually gone from the log store.
-        leader.await_pending_snapshot().await;
         assert!(
             leader.halt_reason.is_none(),
             "TakeSnapshot cycle must not halt: {:?}",
@@ -11184,17 +10240,8 @@ port = 6012
         let follower_cfg = single_voter_config(2);
         let transport = Arc::new(ChunkProducingTransport::empty());
         let (mut follower, _fh) = build_driver_with_transport(follower_cfg, transport.clone());
-        let restores_handle = follower
-            .state_machine
-            .lock()
-            .expect("state_machine mutex poisoned in test setup")
-            .restores_received_handle();
-        let saved_handle = follower
-            .snapshot_store
-            .lock()
-            .expect("snapshot_store mutex poisoned in test setup")
-            .saved
-            .clone();
+        let restores_handle = follower.state_machine.restores_received_handle();
+        let saved_handle = follower.snapshot_store.saved.clone();
         follower.node.id = follower_id;
         follower.node.hard_state.current_term = follower_term;
         follower.node.leader_id = Some(leader.node.id);
@@ -11390,1819 +10437,5 @@ port = 6012
         assert_eq!(follower.node.commit_index, LogIndex(80));
         assert_eq!(follower.node.last_log_index, LogIndex(80));
         assert_eq!(follower.node.last_log_term, Term(5));
-    }
-
-    /// Counting `DriverObserver` used by election-latency tests and
-    /// the Stage 7.1 Fetch-counter gating tests (iter-4 evaluator
-    /// finding #3). Captures the elapsed durations passed to
-    /// `on_election_won`, the count of status snapshots so cascade
-    /// detection can assert exactly-one-sample-per-election, AND the
-    /// per-direction Fetch RPC counts so we can prove the leader /
-    /// cluster gating in `handle_inbound_fetch` actually filters
-    /// non-leader and wrong-cluster receipts out of the `Received`
-    /// total.
-    #[derive(Default, Debug)]
-    struct CountingObserver {
-        elections: Mutex<Vec<Duration>>,
-        statuses: std::sync::atomic::AtomicUsize,
-        appends: std::sync::atomic::AtomicU64,
-        fetch_received: std::sync::atomic::AtomicU64,
-        fetch_sent: std::sync::atomic::AtomicU64,
-        snapshots_taken: std::sync::atomic::AtomicUsize,
-        snapshot_durations_secs_x1000: std::sync::atomic::AtomicU64,
-        snapshot_sizes_bytes: std::sync::atomic::AtomicU64,
-        snapshots_installed: std::sync::atomic::AtomicUsize,
-        last_install_through: std::sync::atomic::AtomicU64,
-        log_compactions: std::sync::atomic::AtomicUsize,
-        last_compaction_through: std::sync::atomic::AtomicU64,
-    }
-
-    impl DriverObserver for CountingObserver {
-        fn on_status<'a>(
-            &'a self,
-            _status: NodeStatus,
-        ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-            self.statuses
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Box::pin(async {})
-        }
-        fn on_append(&self, n: u64) {
-            self.appends
-                .fetch_add(n, std::sync::atomic::Ordering::SeqCst);
-        }
-        fn on_election_won(&self, elapsed: Duration) {
-            self.elections.lock().unwrap().push(elapsed);
-        }
-        fn on_fetch_request(&self, direction: FetchDirection) {
-            match direction {
-                FetchDirection::Received => {
-                    self.fetch_received
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                FetchDirection::Sent => {
-                    self.fetch_sent
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            }
-        }
-        fn on_snapshot_taken(&self, elapsed: Duration, data_size: u64) {
-            self.snapshots_taken
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.snapshot_durations_secs_x1000.fetch_add(
-                elapsed.as_millis() as u64,
-                std::sync::atomic::Ordering::SeqCst,
-            );
-            self.snapshot_sizes_bytes
-                .fetch_add(data_size, std::sync::atomic::Ordering::SeqCst);
-        }
-        fn on_snapshot_installed(&self, last_included_index: LogIndex) {
-            self.snapshots_installed
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            // Stage 7.3 (iter 6) — record the index too so tests can
-            // assert WHICH snapshot was installed, not just how many.
-            self.last_install_through
-                .store(last_included_index.0, std::sync::atomic::Ordering::SeqCst);
-        }
-        fn on_log_compaction(&self, through_index: LogIndex) {
-            self.log_compactions
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.last_compaction_through
-                .store(through_index.0, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    /// Iter-3 evaluator finding #4: a single-voter cluster cascades
-    /// `Follower → PreCandidate → Candidate → Leader` inside one
-    /// `tick()` action-list; the observer must still emit exactly
-    /// one election-latency sample (a 0-duration sample is the
-    /// truthful signal — wall-clock IS zero in the cascade case).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn single_voter_cascade_emits_election_latency_sample() {
-        let cfg = single_voter_config(2);
-        let (mut driver, handle, _applied) = build_driver(cfg);
-        let obs = Arc::new(CountingObserver::default());
-        driver.observer = Some(obs.clone() as Arc<dyn DriverObserver>);
-        let driver_join = tokio::spawn(driver.run());
-
-        // Wait for the self-election: the observer's elections vec
-        // should grow to at least 1 within the election timeout
-        // (election_timeout_max_ms = tick_ms*3 = 6ms in this config).
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if !obs.elections.lock().unwrap().is_empty() {
-                break;
-            }
-            if Instant::now() > deadline {
-                handle.shutdown();
-                let _ = driver_join.await;
-                panic!(
-                    "single-voter driver did not record an election within 2s — \
-                     statuses observed: {}",
-                    obs.statuses.load(std::sync::atomic::Ordering::SeqCst)
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-
-        handle.shutdown();
-        let join_result = tokio::time::timeout(Duration::from_secs(5), driver_join)
-            .await
-            .expect("driver shutdown must complete within 5s");
-        join_result.expect("driver join").expect("driver Ok(())");
-
-        // Exactly one election should have been recorded for the
-        // single-voter happy path (no step-down, no re-election).
-        let elections = obs.elections.lock().unwrap().clone();
-        assert_eq!(
-            elections.len(),
-            1,
-            "single-voter cascade should emit exactly 1 election sample, got {elections:?}"
-        );
-        // Wall-clock 0 is the expected cascade case (Follower →
-        // PreCandidate → Candidate → Leader inside one action-list).
-        // Don't assert == ZERO because the runtime's scheduler may
-        // interleave a status observation between role hops, leading
-        // to a tiny non-zero elapsed; we only need to ensure the
-        // sample is observed AND finite (well below the 2s timeout).
-        assert!(
-            elections[0] < Duration::from_secs(1),
-            "election latency must be sub-second on the local single-voter path, got {:?}",
-            elections[0]
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Stage 7.1 — Iter-4 evaluator finding #3: `xraft_fetch_requests_total
-    // {direction="received"}` must count Fetch RPCs RECEIVED BY THE
-    // LEADER (per `architecture.md` §7), not raw inbound listener
-    // traffic. `handle_inbound_fetch` captures the leader/cluster
-    // preconditions BEFORE consuming `req` into `RaftNode::step`, then
-    // only bumps the observer when BOTH hold. These tests exercise
-    // the truth table at the behavior level so a regression that
-    // reintroduces the pre-check increment is caught.
-    // -----------------------------------------------------------------
-
-    fn build_driver_with_observer(
-        config: ClusterConfig,
-    ) -> (TestDriver, DriverHandle, Arc<CountingObserver>) {
-        let (mut driver, handle, _applied) = build_driver(config);
-        let obs = Arc::new(CountingObserver::default());
-        driver.observer = Some(obs.clone() as Arc<dyn DriverObserver>);
-        (driver, handle, obs)
-    }
-
-    /// Positive case: a Fetch RPC accepted by a leader for the
-    /// matching cluster MUST bump the `Received` counter exactly once.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn inbound_fetch_received_by_leader_bumps_received_counter() {
-        // Single-voter cluster so the node self-elects to Leader
-        // without any peer interaction.
-        let cfg = single_voter_config(2);
-        let (mut driver, _handle, obs) = build_driver_with_observer(cfg);
-
-        // Force the leader-at-receipt precondition deterministically
-        // without waiting on the election timer (the test would
-        // otherwise be timing-fragile).
-        driver.node.role = NodeRole::Leader;
-        driver.node.leader_started_tick = Some(0);
-
-        let cluster = driver.node.config.cluster_id.clone();
-        let leader_epoch = driver.node.hard_state.current_term.0;
-        let (tx, _rx) = oneshot::channel();
-        let req = FetchRequest {
-            cluster_id: cluster,
-            leader_epoch,
-            replica_id: NodeId(2),
-            fetch_offset: LogIndex(0),
-            last_fetched_epoch: Term(0),
-        };
-        driver.handle_inbound_fetch(req, tx).await;
-
-        assert_eq!(
-            obs.fetch_received.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "leader-accepted Fetch from the matching cluster MUST bump the Received counter",
-        );
-        assert_eq!(
-            obs.fetch_sent.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "inbound Fetch must NOT bump the Sent counter",
-        );
-    }
-
-    /// Negative case (iter-4 evaluator #3): a Fetch RPC received while
-    /// this node is NOT the leader MUST NOT bump the `Received`
-    /// counter. The Stage 7.1 metric contract is "Fetch RPCs received
-    /// by leader" — a follower's listener accepting the Fetch is not
-    /// leader-received traffic.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn inbound_fetch_received_by_non_leader_does_not_bump_received_counter() {
-        // 3-voter config + 800ms election timeout so the node CANNOT
-        // self-elect during the test (it stays as Follower).
-        let toml = format!(
-            r#"
-node_id = 1
-cluster_id = "test-driver"
-listen_addr = "127.0.0.1:6905"
-tick_interval_ms = 2
-election_timeout_min_ms = 500
-election_timeout_max_ms = 800
-fetch_interval_ms = 10
-
-[[voters]]
-node_id = 1
-directory_id = "{d1}"
-host = "127.0.0.1"
-port = 6001
-
-[[voters]]
-node_id = 2
-directory_id = "{d2}"
-host = "127.0.0.1"
-port = 6002
-
-[[voters]]
-node_id = 3
-directory_id = "{d3}"
-host = "127.0.0.1"
-port = 6003
-"#,
-            d1 = Uuid::new_v4(),
-            d2 = Uuid::new_v4(),
-            d3 = Uuid::new_v4(),
-        );
-        let cfg = ClusterConfig::from_toml_str(&toml).expect("3-voter config parses");
-        let (mut driver, _handle, obs) = build_driver_with_observer(cfg);
-
-        // Precondition: node is in the Follower role (constructor
-        // default). The inbound Fetch will be rejected with NotLeader
-        // by the engine, and the gating in `handle_inbound_fetch`
-        // must skip the counter increment.
-        assert_eq!(
-            driver.node.role,
-            NodeRole::Follower,
-            "test precondition: node must be a Follower before the inbound Fetch",
-        );
-
-        let cluster = driver.node.config.cluster_id.clone();
-        let leader_epoch = driver.node.hard_state.current_term.0;
-        let (tx, _rx) = oneshot::channel();
-        let req = FetchRequest {
-            cluster_id: cluster,
-            leader_epoch,
-            replica_id: NodeId(2),
-            fetch_offset: LogIndex(0),
-            last_fetched_epoch: Term(0),
-        };
-        driver.handle_inbound_fetch(req, tx).await;
-
-        assert_eq!(
-            obs.fetch_received.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "non-leader receipt MUST NOT bump the Received counter \
-             (Stage 7.1 metric contract: leader-received traffic only)",
-        );
-    }
-
-    /// Negative case (iter-4 evaluator #3, secondary): a Fetch RPC
-    /// from a foreign cluster MUST NOT bump the `Received` counter
-    /// even if this node is currently Leader for ITS cluster — the
-    /// metric counts in-cluster leader-received traffic only.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn inbound_fetch_from_foreign_cluster_does_not_bump_received_counter() {
-        let cfg = single_voter_config(2);
-        let (mut driver, _handle, obs) = build_driver_with_observer(cfg);
-
-        driver.node.role = NodeRole::Leader;
-        driver.node.leader_started_tick = Some(0);
-
-        // Cluster mismatch: this leader is "test-driver", request
-        // claims to belong to "OTHER-CLUSTER".
-        let leader_epoch = driver.node.hard_state.current_term.0;
-        let (tx, _rx) = oneshot::channel();
-        let req = FetchRequest {
-            cluster_id: "OTHER-CLUSTER".into(),
-            leader_epoch,
-            replica_id: NodeId(2),
-            fetch_offset: LogIndex(0),
-            last_fetched_epoch: Term(0),
-        };
-        driver.handle_inbound_fetch(req, tx).await;
-
-        assert_eq!(
-            obs.fetch_received.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "foreign-cluster Fetch MUST NOT bump the Received counter \
-             even when this node IS leader for its own cluster",
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Stage 7.3 — Log Compaction Pipeline observer & checkpoint tests
-    //
-    // These tests focus on the new behaviour wired in this stage:
-    //   * Scenario `log-segment-gc` — after a TakeSnapshot cycle, the
-    //     driver fires `on_log_compaction(through_index)` once with
-    //     the snapshot anchor. (The actual segment-file deletion is
-    //     covered by `xraft-storage`'s
-    //     `file_purge_prefix_reclaims_fully_covered_segments`.)
-    //   * Scenario `epoch-checkpoint-divergence` — the leader uses
-    //     `LogStore::end_offset_for_epoch` to point a diverging
-    //     follower at the precise end of its claimed epoch, not just
-    //     the log tip.
-    //   * The `on_snapshot_taken` observer reports a finite duration
-    //     and the data size of the worker output.
-    // -----------------------------------------------------------------
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn scenario_log_segment_gc_fires_on_log_compaction_observer() {
-        let cfg = single_voter_config(2);
-        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
-        let obs = Arc::new(CountingObserver::default());
-        driver.observer = Some(obs.clone() as Arc<dyn DriverObserver>);
-
-        // Seed a small log so TakeSnapshot has entries to compact.
-        let entries: Vec<Entry> = (1..=50u64)
-            .map(|i| Entry {
-                index: LogIndex(i),
-                term: Term(2),
-                payload: EntryPayload::Command(Bytes::from(format!("v-{i}").into_bytes())),
-            })
-            .collect();
-        driver.log_store.append(&entries).unwrap();
-        *h.snapshot_payload.lock().unwrap() = b"snap-50".to_vec();
-
-        let _ = driver
-            .process_actions(
-                vec![Action::TakeSnapshot {
-                    through_index: LogIndex(50),
-                }],
-                None,
-            )
-            .await;
-        // Stage 7.3 (iter 2) — drain the snapshot worker so the
-        // TruncateLog follow-up fires before we assert on the
-        // log-compaction observer counters below.
-        driver.await_pending_snapshot().await;
-
-        // After the TakeSnapshot → SnapshotComplete →
-        // TruncateLog(PrefixThroughInclusive(50)) cycle, the
-        // log-compaction observer hook must fire exactly once with
-        // the snapshot anchor's last-included index.
-        assert_eq!(
-            obs.log_compactions
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "exactly one log compaction event expected after a single TakeSnapshot",
-        );
-        assert_eq!(
-            obs.last_compaction_through
-                .load(std::sync::atomic::Ordering::SeqCst),
-            50,
-            "log compaction observer must carry the snapshot anchor's last-included index",
-        );
-
-        // And the snapshot-taken observer should have fired once with
-        // a non-zero data size matching the payload we installed.
-        assert_eq!(
-            obs.snapshots_taken
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "exactly one snapshot taken expected",
-        );
-        let observed_size = obs
-            .snapshot_sizes_bytes
-            .load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(
-            observed_size,
-            b"snap-50".len() as u64,
-            "snapshot size observer must report the payload byte length",
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn scenario_epoch_checkpoint_divergence_returns_epoch_end_offset() {
-        // Follower thinks it last appended at epoch 4 / offset 100,
-        // but the leader's log shows epoch 4 ended at offset 6 (epoch
-        // 6 starts at offset 7). The leader must return
-        // `DivergingEpoch { epoch: 4, end_offset: 6 }` — NOT the log
-        // tip — so the follower truncates to exactly the divergence
-        // point.
-        let cfg = single_voter_config(2);
-        let (mut driver, _handle, _h) = build_driver_for_snapshot_tests(cfg);
-
-        let entries: Vec<Entry> = (1..=3u64)
-            .map(|i| Entry {
-                index: LogIndex(i),
-                term: Term(2),
-                payload: EntryPayload::NoOp,
-            })
-            .chain((4..=6u64).map(|i| Entry {
-                index: LogIndex(i),
-                term: Term(4),
-                payload: EntryPayload::NoOp,
-            }))
-            .chain((7..=10u64).map(|i| Entry {
-                index: LogIndex(i),
-                term: Term(6),
-                payload: EntryPayload::NoOp,
-            }))
-            .collect();
-        driver.log_store.append(&entries).unwrap();
-
-        // Sanity-check the test scaffold's checkpoint impl —
-        // end_offset_for_epoch must return precise per-epoch ends.
-        assert_eq!(
-            driver.log_store.end_offset_for_epoch(Term(2)).unwrap(),
-            Some(LogIndex(3))
-        );
-        assert_eq!(
-            driver.log_store.end_offset_for_epoch(Term(4)).unwrap(),
-            Some(LogIndex(6)),
-        );
-        assert_eq!(
-            driver.log_store.end_offset_for_epoch(Term(6)).unwrap(),
-            Some(LogIndex(10)),
-        );
-
-        // Fetch divergence path: follower asks for offset 8 (epoch 6
-        // territory) claiming its last_fetched_epoch was 4. The
-        // leader's term_at(7) = 6 mismatches → divergence; the
-        // checkpoint lookup MUST steer the follower back to epoch 4's
-        // end at offset 6, not the log tip 10.
-        let resp = driver
-            .materialize_fetch_response(
-                driver.node.config.cluster_id.clone(),
-                driver.node.hard_state.current_term.0,
-                driver.node.id,
-                LogIndex(10),
-                LogIndex(8),
-                Term(4),
-            )
-            .expect("materialize_fetch_response must succeed");
-
-        let dv = resp
-            .diverging_epoch
-            .as_ref()
-            .expect("epoch mismatch at prev=7 must produce a DivergingEpoch");
-        // Per `architecture.md` §5.4: response carries
-        // `(epoch=<follower's claimed epoch>, end=<that epoch's last
-        // offset on the leader>)`. The follower truncates to
-        // `end_offset` and re-fetches with `last_fetched_epoch =
-        // epoch`. So the epoch field MUST be the follower's claimed
-        // epoch (Term(4) here), NOT the leader's actual term at the
-        // mismatched prev — that would push the follower forward into
-        // the leader's epoch 6 territory and skip the precise
-        // truncate-to-6 step.
-        assert_eq!(
-            dv.epoch,
-            Term(4),
-            "diverging epoch must echo the follower's claimed epoch (Term(4)) — \
-             that's the epoch whose end_offset the leader is reporting per \
-             architecture.md §5.4",
-        );
-        assert_eq!(
-            dv.end_offset,
-            LogIndex(6),
-            "end_offset must come from the leader-epoch-checkpoint lookup for epoch 4, \
-             NOT the unconditional log-tip fallback at 10"
-        );
-        assert!(
-            resp.entries.is_empty(),
-            "divergence response must NOT carry entries (mutual exclusivity)",
-        );
-        assert!(
-            resp.snapshot_redirect.is_none(),
-            "no snapshot anchor → no redirect"
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Stage 7.3 — `background-snapshot-nonblocking` scenario.
-    //
-    // Given a leader processing client requests, when a background
-    // snapshot is taken, then client request latency does not spike
-    // (the tokio reactor stays free during snapshot serialisation).
-    //
-    // We prove this STRUCTURALLY: the test stages a state-machine
-    // whose `snapshot()` holds the calling thread for 200 ms via
-    // `std::thread::sleep`. If the driver were to call `snapshot()`
-    // on the reactor thread, every other tokio task on the same
-    // runtime would be starved for that full 200 ms. The driver
-    // instead routes the call through `tokio::task::spawn_blocking`,
-    // so the blocking sleep lands on a blocking-pool thread and the
-    // reactor stays free.
-    //
-    // A concurrent tokio task ticks a counter every ~10 ms via
-    // `tokio::time::sleep`. If the reactor were blocked, the ticker
-    // would not get to advance and the counter would stay near 0
-    // throughout the snapshot. We require ≥ 5 ticks during a 200 ms
-    // snapshot — a comfortable floor that survives CI jitter while
-    // still failing loudly if the reactor regresses to a blocking
-    // path. (A blocked reactor would record 0 ticks.)
-    // -----------------------------------------------------------------
-    #[tokio::test(flavor = "current_thread")]
-    async fn scenario_background_snapshot_does_not_block_tokio_reactor() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Instant;
-
-        let cfg = single_voter_config(2);
-        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
-
-        // 200 ms is well above CI scheduler noise; a regressed driver
-        // that calls snapshot() directly on the reactor thread would
-        // starve the ticker for the full 200 ms.
-        const SNAPSHOT_DELAY_MS: u64 = 200;
-        h.snapshot_delay_ms
-            .store(SNAPSHOT_DELAY_MS, Ordering::SeqCst);
-        *h.snapshot_payload.lock().unwrap() = b"snap-nonblocking".to_vec();
-
-        // Seed enough log so TakeSnapshot has a real index to anchor.
-        let entries: Vec<Entry> = (1..=10u64)
-            .map(|i| Entry {
-                index: LogIndex(i),
-                term: Term(1),
-                payload: EntryPayload::NoOp,
-            })
-            .collect();
-        driver.log_store.append(&entries).unwrap();
-
-        // Concurrent "client" task: every ~10 ms, increment a counter.
-        // If the reactor is blocked by the snapshot, this counter
-        // stays at 0 for the full SNAPSHOT_DELAY_MS window.
-        let ticks = Arc::new(AtomicUsize::new(0));
-        let ticks_clone = ticks.clone();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop_clone = stop.clone();
-        let ticker = tokio::spawn(async move {
-            while !stop_clone.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                ticks_clone.fetch_add(1, Ordering::SeqCst);
-            }
-        });
-
-        // Yield once so the ticker actually starts running before we
-        // kick off the snapshot (otherwise the snapshot's
-        // spawn_blocking dispatch could race the ticker's first
-        // poll).
-        tokio::task::yield_now().await;
-
-        // Drive the snapshot. Stage 7.3 (iter 2): TakeSnapshot is
-        // now FIRE-AND-FORGET — `process_actions` returns as soon
-        // as the spawn_blocking dispatch lands; the worker runs in
-        // the background and posts a `SnapshotCompletion` on
-        // `snapshot_done_rx`. `await_pending_snapshot()` awaits
-        // that completion (on the reactor, via a channel recv),
-        // so the reactor MUST stay free to poll the ticker for
-        // the full 200 ms while the blocking serialiser runs on
-        // the blocking pool.
-        let started = Instant::now();
-        let _ = driver
-            .process_actions(
-                vec![Action::TakeSnapshot {
-                    through_index: LogIndex(10),
-                }],
-                None,
-            )
-            .await;
-        // The dispatcher must have returned essentially
-        // instantly — if it took anywhere near 200 ms then the
-        // dispatch itself was blocking and the test is vacuous.
-        let dispatch_elapsed = started.elapsed();
-        assert!(
-            dispatch_elapsed < Duration::from_millis(SNAPSHOT_DELAY_MS / 2),
-            "TakeSnapshot dispatch took {dispatch_elapsed:?} — must \
-             return promptly because the worker runs in the \
-             background; if dispatch parks for the snapshot's full \
-             wall-clock then the driver loop is still blocked",
-        );
-        driver.await_pending_snapshot().await;
-        let elapsed = started.elapsed();
-
-        // Snapshot exactly once.
-        let snapshots_taken = h.snapshots_taken.lock().unwrap().clone();
-        assert_eq!(
-            snapshots_taken.len(),
-            1,
-            "snapshot() must have been invoked exactly once",
-        );
-
-        // Stop the ticker and wait for it to wind down.
-        stop.store(true, Ordering::SeqCst);
-        let final_ticks = ticks.load(Ordering::SeqCst);
-        ticker.abort();
-        let _ = ticker.await;
-
-        // The blocking sleep actually elapsed. If this is < 200 ms,
-        // the state-machine snapshot did NOT block — meaning our
-        // load-bearing premise (a slow serialiser) is wrong, and the
-        // ticks assertion below is meaningless. Catch that early.
-        assert!(
-            elapsed >= Duration::from_millis(SNAPSHOT_DELAY_MS),
-            "snapshot completed in {elapsed:?}, but the test SM was \
-             configured to sleep {SNAPSHOT_DELAY_MS} ms — the delay \
-             knob is not wired; this test would be vacuous",
-        );
-
-        // PROOF OF NON-BLOCKING: the concurrent ticker MUST have
-        // incremented many times during the snapshot. A blocked
-        // reactor would have ticks == 0. We require ≥ 5 ticks
-        // (i.e. ≥ 50 ms of real reactor progress during a 200 ms
-        // snapshot) — comfortably above scheduler jitter while still
-        // failing loudly if the driver regresses to a blocking
-        // snapshot path.
-        assert!(
-            final_ticks >= 5,
-            "tokio reactor was BLOCKED during snapshot: only {final_ticks} ticks \
-             observed during {elapsed:?} (expected ≥ 5). The driver must \
-             dispatch state_machine.snapshot() onto tokio::task::spawn_blocking \
-             so the reactor stays free for other tasks (e.g. inbound RPCs, \
-             client requests, replication appends).",
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Stage 7.3 (iter 2) — `background-snapshot-nonblocking`
-    // scenario, client-latency variant.
-    //
-    // Brief from implementation-plan.md / e2e-scenarios.md Feature 15:
-    //
-    // > Given a leader processing client requests, when a background
-    // > snapshot is taken, then client request latency does not spike
-    // > above 2x baseline.
-    //
-    // The complementary
-    // `scenario_background_snapshot_does_not_block_tokio_reactor`
-    // test above proves the reactor stays free. This test proves the
-    // tighter LATENCY property: actual client proposes observed
-    // during a snapshot do not slow down beyond 2× the no-snapshot
-    // baseline.
-    //
-    // Design choice: the test uses `TestSnapshotStore`'s new
-    // `save_snapshot_delay_ms` knob (NOT `snapshot_delay_ms`) to
-    // emulate the slow phase, because:
-    //   - `state_machine.snapshot()` is held under the SM mutex, so
-    //     a slow SM serialise serialises against `apply` — that's a
-    //     real correctness invariant (snapshot bytes must match the
-    //     advertised last_applied) and is not what the latency
-    //     property targets;
-    //   - the canonical "slow" phase a real KRaft snapshot incurs
-    //     is the DISK write (`save_snapshot`), which the driver
-    //     dispatches inside `spawn_blocking` and which does NOT hold
-    //     the SM mutex (the `MutexGuard` is dropped before the SS
-    //     lock is acquired — see `dispatch_snapshot_worker`). Slowing
-    //     `save_snapshot` is therefore the load that the
-    //     "client request latency" requirement actually addresses.
-    //
-    // Note we use `multi_thread` runtime flavor: the latency
-    // measurement requires the reactor + spawn_blocking pool to live
-    // on separate OS threads (a `current_thread` reactor that
-    // schedules `propose` after the spawn_blocking call has been
-    // submitted but before its sleep starts would be hard to reason
-    // about for tight latency claims).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scenario_background_snapshot_keeps_propose_latency_within_2x_baseline() {
-        use std::time::Instant;
-
-        let cfg = single_voter_config(2);
-        let (driver, handle, h) = build_driver_for_snapshot_tests(cfg);
-
-        // Spawn the driver's full run() loop. We need the real loop
-        // so `DriverEvent::Client` proposes go through
-        // `handle_client_command`, the engine emits AppendEntries +
-        // ApplyToStateMachine, apply resolves the waiter, and the
-        // propose future completes.
-        let run_task = tokio::spawn(driver.run());
-
-        // Wait for self-election by retrying `propose` until it
-        // succeeds. `propose` returns `NotLeader` IMMEDIATELY when
-        // the node has not yet won election, so a fixed
-        // `tokio::time::sleep(60ms)` is racey on busy CI runners
-        // — the propose's own 2 s timeout doesn't help because the
-        // future resolves quickly with the error rather than
-        // blocking. 5 s deadline tolerates substantial scheduler
-        // jitter while still failing loudly on a real election
-        // hang. NotLeader is returned BEFORE any state mutation
-        // (see `handle_client_command`'s leader check), so retries
-        // are append-safe — only the successful attempt enters
-        // the log. (Stage 7.3 iter-13 fix for flake observed in
-        // `scenario_background_snapshot_serialize_keeps_propose_latency_within_2x_baseline`.)
-        let warm_up = {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut last_err = None;
-            loop {
-                if Instant::now() > deadline {
-                    panic!(
-                        "warm-up propose did not succeed within 5 s; \
-                         single-voter cluster failed to elect itself. \
-                         Last error: {last_err:?}",
-                    );
-                }
-                match handle.propose(Bytes::from_static(b"warm-up")).await {
-                    Ok(idx) => break idx,
-                    Err(e) => {
-                        last_err = Some(e);
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                }
-            }
-        };
-        assert!(warm_up.0 >= 2);
-
-        // ----- Baseline: 20 sequential proposes without a snapshot -----
-        const SAMPLES: usize = 20;
-        let mut baseline = Vec::with_capacity(SAMPLES);
-        for i in 0..SAMPLES {
-            let cmd = Bytes::from(format!("baseline-{i}").into_bytes());
-            let started = Instant::now();
-            handle
-                .propose(cmd)
-                .await
-                .expect("baseline propose succeeds");
-            baseline.push(started.elapsed());
-        }
-        // Use median so a single jittery sample doesn't inflate the
-        // baseline (a higher baseline only makes the 2× ceiling
-        // easier to satisfy, but we want a tight test).
-        baseline.sort();
-        let baseline_median = baseline[SAMPLES / 2];
-
-        // ----- Trigger the background snapshot with a slow durable
-        // write. `save_snapshot` runs on the blocking pool inside
-        // `spawn_blocking`, so the reactor stays free; the SM mutex
-        // is released BEFORE `save_snapshot` is invoked, so apply
-        // (and therefore propose completion) does not block on the
-        // snapshot's disk write.
-        const SAVE_DELAY_MS: u64 = 250;
-        h.save_snapshot_delay_ms
-            .store(SAVE_DELAY_MS, std::sync::atomic::Ordering::SeqCst);
-        // trigger_snapshot is async-await; spawning it lets us issue
-        // proposes WHILE the snapshot worker is still running.
-        let snap_handle = handle.clone();
-        let snap_task = tokio::spawn(async move { snap_handle.trigger_snapshot().await });
-
-        // Give the snapshot worker a moment to reach the slow
-        // save_snapshot call before we start measuring proposes.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        // ----- During-snapshot: 20 sequential proposes -----
-        let mut during = Vec::with_capacity(SAMPLES);
-        for i in 0..SAMPLES {
-            let cmd = Bytes::from(format!("during-{i}").into_bytes());
-            let started = Instant::now();
-            handle
-                .propose(cmd)
-                .await
-                .expect("during-snapshot propose succeeds");
-            during.push(started.elapsed());
-        }
-        during.sort();
-        let during_median = during[SAMPLES / 2];
-
-        // Wait for snapshot completion (the timeout is generous —
-        // the snapshot itself only sleeps SAVE_DELAY_MS).
-        let snap_result = tokio::time::timeout(Duration::from_secs(5), snap_task)
-            .await
-            .expect("snapshot did not complete within 5 s")
-            .expect("snapshot task panicked")
-            .expect("snapshot returned error");
-        assert!(
-            snap_result.last_included_index >= 2,
-            "snapshot must anchor at the warm-up commit or later, got {}",
-            snap_result.last_included_index,
-        );
-
-        // Drive a final propose AFTER the snapshot to confirm the
-        // driver loop is still healthy (no hung apply, no leaked
-        // worker flag).
-        handle
-            .propose(Bytes::from_static(b"post-snapshot"))
-            .await
-            .expect("post-snapshot propose succeeds");
-
-        handle.shutdown();
-        let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
-
-        // PROOF: median latency during snapshot is ≤ 2 × baseline
-        // median. We use medians (not means) so a single jittery
-        // sample — which is realistic on a shared CI runner — does
-        // not flake the assertion. We also enforce an absolute
-        // floor (10 ms) below which the latency-ratio comparison is
-        // meaningless (everything fits in scheduler noise).
-        let baseline_ms = baseline_median.as_secs_f64() * 1000.0;
-        let during_ms = during_median.as_secs_f64() * 1000.0;
-        let floor_ms = 10.0_f64;
-        let allowance_ms = (baseline_ms * 2.0).max(floor_ms);
-        assert!(
-            during_ms <= allowance_ms,
-            "client propose latency during background snapshot ({during_ms:.2} ms) \
-             exceeded the 2× baseline ceiling ({allowance_ms:.2} ms, baseline median \
-             {baseline_ms:.2} ms). The driver's snapshot pipeline must run the slow \
-             `save_snapshot` phase on a `spawn_blocking` worker and must NOT hold \
-             the state-machine mutex across the slow phase; otherwise apply (and \
-             therefore propose completion) is gated by the snapshot's wall-clock.",
-        );
-
-        // Also assert the snapshot ACTUALLY ran for the configured
-        // delay window — if it didn't, the test is vacuous.
-        assert!(
-            !h.saved_snapshots.lock().unwrap().is_empty(),
-            "snapshot should have been saved at least once",
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Stage 7.3 (iter 4) — `background-snapshot-nonblocking` scenario,
-    // SERIALIZE-side latency variant.
-    //
-    // Iter-3 evaluator finding #1 (verbatim):
-    //   "The background snapshot path still holds the exclusive
-    //    state-machine mutex while serializing the snapshot ..., and
-    //    committed client proposals also need that mutex during apply
-    //    ..., the 2x-latency test avoids this by delaying save_snapshot
-    //    instead of serialization, so the stated
-    //    `background-snapshot-nonblocking` acceptance criterion is not
-    //    fully proven and can still fail under slow serialization."
-    //
-    // Iter 4 closed this gap by:
-    //   (a) extending the StateMachine trait with `begin_snapshot()`,
-    //       which captures the state under the SM lock and returns a
-    //       `SnapshotSerializer`;
-    //   (b) updating `dispatch_snapshot_worker` to release the SM
-    //       lock BEFORE invoking `SnapshotSerializer::serialize` on
-    //       the blocking pool;
-    //   (c) overriding TestStateMachine::begin_snapshot to capture
-    //       the payload + the new `snapshot_serialize_delay_ms` knob
-    //       and return a TestSnapshotSerializer that sleeps INSIDE
-    //       `serialize()` (with no SM lock held).
-    //
-    // This test injects the delay on the SERIALIZE side specifically.
-    // If iter-4's decoupling regresses (e.g. someone re-introduces a
-    // lock around the slow serialize step), apply will block during
-    // the serialize and propose latency will spike past the 2× ceiling,
-    // failing this test.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scenario_background_snapshot_serialize_keeps_propose_latency_within_2x_baseline() {
-        use std::time::Instant;
-
-        let cfg = single_voter_config(2);
-        let (driver, handle, h) = build_driver_for_snapshot_tests(cfg);
-
-        // Spawn the driver's full run() loop.
-        let run_task = tokio::spawn(driver.run());
-
-        // Wait for self-election by retrying `propose` until it
-        // succeeds. See the iter-3 latency test for the rationale —
-        // identical fix applied here per Stage 7.3 iter-13.
-        let warm_up = {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut last_err = None;
-            loop {
-                if Instant::now() > deadline {
-                    panic!(
-                        "warm-up propose did not succeed within 5 s; \
-                         single-voter cluster failed to elect itself. \
-                         Last error: {last_err:?}",
-                    );
-                }
-                match handle
-                    .propose(Bytes::from_static(b"warm-up-serialize"))
-                    .await
-                {
-                    Ok(idx) => break idx,
-                    Err(e) => {
-                        last_err = Some(e);
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                }
-            }
-        };
-        assert!(warm_up.0 >= 2);
-
-        // ----- Baseline: 20 sequential proposes without a snapshot -----
-        const SAMPLES: usize = 20;
-        let mut baseline = Vec::with_capacity(SAMPLES);
-        for i in 0..SAMPLES {
-            let cmd = Bytes::from(format!("serialize-baseline-{i}").into_bytes());
-            let started = Instant::now();
-            handle
-                .propose(cmd)
-                .await
-                .expect("baseline propose succeeds");
-            baseline.push(started.elapsed());
-        }
-        baseline.sort();
-        let baseline_median = baseline[SAMPLES / 2];
-
-        // ----- Trigger the background snapshot with a slow
-        // SERIALIZE phase (NOT save_snapshot). The serializer
-        // sleeps SERIALIZE_DELAY_MS during `serialize()`, which runs
-        // on the blocking pool AFTER the SM mutex has been dropped.
-        // If iter-4's two-phase API is honoured, apply (and therefore
-        // propose completion) is NOT blocked by the slow serialize.
-        const SERIALIZE_DELAY_MS: u64 = 250;
-        h.snapshot_serialize_delay_ms
-            .store(SERIALIZE_DELAY_MS, std::sync::atomic::Ordering::SeqCst);
-        let snap_handle = handle.clone();
-        let snap_task = tokio::spawn(async move { snap_handle.trigger_snapshot().await });
-
-        // Give the snapshot worker a moment to reach the slow
-        // serialize step before measuring proposes.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        // ----- During-snapshot: 20 sequential proposes -----
-        let mut during = Vec::with_capacity(SAMPLES);
-        for i in 0..SAMPLES {
-            let cmd = Bytes::from(format!("serialize-during-{i}").into_bytes());
-            let started = Instant::now();
-            handle
-                .propose(cmd)
-                .await
-                .expect("during-snapshot propose succeeds");
-            during.push(started.elapsed());
-        }
-        during.sort();
-        let during_median = during[SAMPLES / 2];
-
-        let snap_result = tokio::time::timeout(Duration::from_secs(5), snap_task)
-            .await
-            .expect("snapshot did not complete within 5 s")
-            .expect("snapshot task panicked")
-            .expect("snapshot returned error");
-        assert!(
-            snap_result.last_included_index >= 2,
-            "snapshot must anchor at the warm-up commit or later, got {}",
-            snap_result.last_included_index,
-        );
-
-        // Sanity: a propose AFTER the snapshot still succeeds (driver
-        // loop is healthy, no leaked in-flight flag).
-        handle
-            .propose(Bytes::from_static(b"post-snapshot-serialize"))
-            .await
-            .expect("post-snapshot propose succeeds");
-
-        handle.shutdown();
-        let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
-
-        // PROOF: median during-snapshot latency ≤ 2× baseline median.
-        // If the SM mutex is held across the slow serialize, propose
-        // → apply gets queued behind the serialize sleep, and median
-        // during-latency would be on the order of SERIALIZE_DELAY_MS
-        // / 2 ≈ 125 ms — vastly more than 2× the few-ms baseline.
-        let baseline_ms = baseline_median.as_secs_f64() * 1000.0;
-        let during_ms = during_median.as_secs_f64() * 1000.0;
-        let floor_ms = 10.0_f64;
-        let allowance_ms = (baseline_ms * 2.0).max(floor_ms);
-        assert!(
-            during_ms <= allowance_ms,
-            "client propose latency during slow-SERIALIZE snapshot ({during_ms:.2} ms) \
-             exceeded the 2× baseline ceiling ({allowance_ms:.2} ms, baseline median \
-             {baseline_ms:.2} ms). The driver's snapshot pipeline must release the \
-             state-machine mutex BEFORE invoking `SnapshotSerializer::serialize` — \
-             otherwise apply (and therefore propose completion) is gated by the \
-             slow serialize step. This regression breaks the iter-4 fix for \
-             evaluator item #1.",
-        );
-
-        // Sanity: the snapshot actually ran for the configured
-        // serialize delay. If it didn't, this test is vacuous.
-        assert!(
-            !h.snapshots_taken.lock().unwrap().is_empty(),
-            "snapshot should have been taken at least once",
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Stage 7.3 (iter 4) — anchor-persist failure FAIL-STOPS the
-    // driver instead of degrading silently.
-    //
-    // Iter-3 evaluator finding #2 (verbatim):
-    //   "Snapshot-anchor persistence failures are downgraded to
-    //    warnings after successful local snapshot completion and
-    //    snapshot install ..., which lets compaction proceed with
-    //    stale or missing epoch-floor durability."
-    //
-    // The fix: `handle_snapshot_completed` now treats
-    // `update_snapshot_anchor` errors as fatal — sets `halt_reason`,
-    // resolves the operator reply (if any) with `Err(Storage(...))`,
-    // and returns early so the driver fail-stops.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn snapshot_anchor_persist_failure_halts_driver_after_take_snapshot() {
-        let cfg = single_voter_config(2);
-        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
-
-        // Pre-populate the log with a few entries so the snapshot has
-        // something to anchor.
-        driver
-            .log_store
-            .append(&[
-                Entry {
-                    index: LogIndex(1),
-                    term: Term(1),
-                    payload: EntryPayload::Command(Bytes::from_static(b"a")),
-                },
-                Entry {
-                    index: LogIndex(2),
-                    term: Term(1),
-                    payload: EntryPayload::Command(Bytes::from_static(b"b")),
-                },
-            ])
-            .unwrap();
-
-        // Arm the test log store to fail the NEXT update_snapshot_anchor
-        // call. This injection point is on `TestLogStore`, which
-        // implements LogStore for the driver under test.
-        driver
-            .log_store
-            .fail_next_update_snapshot_anchor
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        // Dispatch the snapshot. The worker completes successfully
-        // (SM serialise + SS save are fine); on the post-worker path,
-        // `update_snapshot_anchor` fails, and the driver MUST halt.
-        driver
-            .process_actions(
-                vec![Action::TakeSnapshot {
-                    through_index: LogIndex(2),
-                }],
-                None,
-            )
-            .await;
-        driver.await_pending_snapshot().await;
-
-        assert!(
-            driver.halt_reason.is_some(),
-            "driver must halt when update_snapshot_anchor fails after a \
-             successful background snapshot — silent warn-and-continue \
-             leaves stale/missing epoch-floor durability and can mis-route \
-             followers below the compacted floor",
-        );
-        let halt_msg = driver.halt_reason.clone().unwrap();
-        assert!(
-            halt_msg.contains("update_snapshot_anchor"),
-            "halt_reason should reference the failing anchor write, got: {halt_msg}"
-        );
-
-        // The snapshot was taken at least once (the failure was
-        // post-worker, not the worker itself).
-        assert!(
-            !h.snapshots_taken.lock().unwrap().is_empty(),
-            "the snapshot worker completed (failure was in the post-completion anchor write)"
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Stage 7.3 (iter 5) — install-snapshot ordering tests for iter-4
-    // evaluator items 2 & 4.
-    //
-    // Item 2: anchor persist MUST happen BEFORE log mutation. If the
-    //   anchor fails, the log MUST remain pristine — restart will
-    //   re-attempt the install from the durable snapshot bytes.
-    //
-    // Item 4: the `on_log_compaction` (and `on_snapshot_installed`)
-    //   observer hook MUST fire ONLY after every durability + in-
-    //   memory step succeeds. An anchor failure must NOT bump the
-    //   compaction counter.
-    // -----------------------------------------------------------------
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn install_snapshot_anchor_failure_before_log_mutation_keeps_log_and_skips_metric() {
-        let cfg = single_voter_config(2);
-        let (mut driver, _handle, _h) = build_driver_for_snapshot_tests(cfg);
-        let obs = Arc::new(CountingObserver::default());
-        driver.observer = Some(obs.clone() as Arc<dyn DriverObserver>);
-
-        // Seed two entries so the install path WOULD have something
-        // to truncate if it got that far. Different term from the
-        // installed snapshot so the wipe branch would be taken.
-        driver
-            .log_store
-            .append(&[
-                Entry {
-                    index: LogIndex(1),
-                    term: Term(1),
-                    payload: EntryPayload::Command(Bytes::from_static(b"a")),
-                },
-                Entry {
-                    index: LogIndex(2),
-                    term: Term(1),
-                    payload: EntryPayload::Command(Bytes::from_static(b"b")),
-                },
-            ])
-            .unwrap();
-        let log_index_before = driver.log_store.last_index();
-        assert_eq!(log_index_before, LogIndex(2));
-
-        // Arm anchor-write failure for the NEXT update_snapshot_anchor.
-        driver
-            .log_store
-            .fail_next_update_snapshot_anchor
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        let payload = b"snap-install".to_vec();
-        let metadata = SnapshotMeta {
-            id: String::new(),
-            last_included_index: LogIndex(10),
-            last_included_term: Term(5),
-            voter_set: driver.node.voter_set.clone(),
-            size_bytes: Some(payload.len() as u64),
-            checksum: None,
-        };
-        let captured = driver
-            .process_actions(
-                vec![Action::InstallSnapshot {
-                    metadata,
-                    data: payload,
-                }],
-                None,
-            )
-            .await;
-
-        // The anchor failure must surface as a driver halt.
-        assert!(
-            captured.error.is_some(),
-            "anchor-write failure during install MUST surface to caller"
-        );
-        assert!(
-            driver.halt_reason.is_some(),
-            "anchor-write failure during install MUST halt the driver"
-        );
-        let halt_msg = driver.halt_reason.clone().unwrap_or_default();
-        assert!(
-            halt_msg.contains("update_snapshot_anchor"),
-            "halt_reason should reference the anchor failure; got: {halt_msg}"
-        );
-
-        // CRITICAL (iter-5 evaluator item 2): the log MUST remain
-        // pristine — anchor came BEFORE log mutation, so a failed
-        // anchor leaves zero log mutations behind.
-        assert_eq!(
-            driver.log_store.last_index(),
-            log_index_before,
-            "anchor-before-log-mutation contract violated: log was modified despite anchor write failure",
-        );
-
-        // CRITICAL (iter-5 evaluator item 4): the compaction metric
-        // MUST NOT fire — anchor failure means no successful install
-        // pipeline, so the counter MUST remain at zero.
-        assert_eq!(
-            obs.log_compactions
-                .load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "compaction-metric-after-success contract violated: counter bumped on a failed install pipeline",
-        );
-        assert_eq!(
-            obs.snapshots_installed
-                .load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "on_snapshot_installed must NOT fire when the install pipeline failed",
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn install_snapshot_fires_compaction_and_install_metrics_after_full_success() {
-        let cfg = single_voter_config(2);
-        let (mut driver, _handle, _h) = build_driver_for_snapshot_tests(cfg);
-        let obs = Arc::new(CountingObserver::default());
-        driver.observer = Some(obs.clone() as Arc<dyn DriverObserver>);
-
-        // Empty log: install-snapshot wipe path is taken vacuously.
-        let payload = b"snap-happy-path".to_vec();
-        let metadata = SnapshotMeta {
-            id: String::new(),
-            last_included_index: LogIndex(10),
-            last_included_term: Term(5),
-            voter_set: driver.node.voter_set.clone(),
-            size_bytes: Some(payload.len() as u64),
-            checksum: None,
-        };
-        let captured = driver
-            .process_actions(
-                vec![Action::InstallSnapshot {
-                    metadata,
-                    data: payload,
-                }],
-                None,
-            )
-            .await;
-        assert!(captured.error.is_none(), "happy-path install must succeed");
-        assert!(driver.halt_reason.is_none());
-
-        // Iter-5 (item 4): BOTH observer hooks must fire exactly once
-        // after the full install pipeline succeeds, carrying the
-        // snapshot's last-included index.
-        assert_eq!(
-            obs.log_compactions
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "on_log_compaction must fire exactly once after a successful install"
-        );
-        assert_eq!(
-            obs.last_compaction_through
-                .load(std::sync::atomic::Ordering::SeqCst),
-            10,
-            "on_log_compaction must carry the snapshot's last_included_index"
-        );
-        assert_eq!(
-            obs.snapshots_installed
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "on_snapshot_installed must fire exactly once after a successful install"
-        );
-        // Iter-6 (item 2): the `on_snapshot_installed` hook is now
-        // indexed — it carries the snapshot's `last_included_index`
-        // so observers can label or correlate the install event.
-        // This assertion exercises the indexed signature end-to-end
-        // through the driver call site.
-        assert_eq!(
-            obs.last_install_through
-                .load(std::sync::atomic::Ordering::SeqCst),
-            10,
-            "on_snapshot_installed must carry the snapshot's last_included_index"
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Stage 7.3 (iter 7) — atomic snapshot payload capture.
-    //
-    // Iter-6 evaluator findings (verbatim):
-    //   1. "Snapshot payload capture is still not tied to the
-    //      advertised `last_included_index`: ... `begin_snapshot` is
-    //      invoked later inside the async spawn_blocking path ...
-    //      after `process_actions` has returned to the event loop ...
-    //      so later applies ... can be included in bytes for an
-    //      older snapshot index."
-    //   2. "The background snapshot tests do not catch that pre-begin
-    //      race ... add a regression where state mutated after
-    //      snapshot dispatch but before `begin_snapshot` cannot
-    //      appear in the saved snapshot for the earlier index."
-    //
-    // The iter-7 STRUCTURAL FIX moves `begin_snapshot()` from the
-    // `spawn_blocking` worker to the SYNCHRONOUS prelude of
-    // `dispatch_snapshot_worker`. The driver thread holds the SM
-    // lock just long enough to call `begin_snapshot()`, captures the
-    // immutable serializer, drops the lock, and ONLY THEN spawns
-    // the worker (which runs `serialize()` + `save_snapshot()` with
-    // no SM lock held). The snapshot bytes are therefore atomic
-    // with the advertised `last_included_index`.
-    //
-    // This test proves that contract end-to-end via a NEW knob
-    // `begin_snapshot_delay_ms`. The knob delays `begin_snapshot`
-    // itself (NOT serialize). Under the iter-7 fix:
-    //   - process_actions BLOCKS on the driver thread for the
-    //     begin_snapshot delay (synchronous capture),
-    //   - by the time process_actions returns, payload v1 has
-    //     already been cloned into the serializer,
-    //   - any post-dispatch mutation of snapshot_payload cannot
-    //     reach the serializer.
-    // Under the iter-6 bug shape (begin_snapshot in spawn_blocking):
-    //   - process_actions returns immediately,
-    //   - the worker starts begin_snapshot in the background and
-    //     sleeps inside it,
-    //   - the test thread mutates snapshot_payload to v2 during
-    //     the worker's sleep,
-    //   - the worker's begin_snapshot then clones v2,
-    //   - serialize() emits v2 — a snapshot bytes/metadata mismatch.
-    #[tokio::test(flavor = "current_thread")]
-    async fn scenario_snapshot_payload_capture_is_atomic_with_metadata() {
-        let cfg = single_voter_config(2);
-        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
-
-        // Seed enough log so TakeSnapshot has a real anchor index.
-        let entries: Vec<Entry> = (1..=10u64)
-            .map(|i| Entry {
-                index: LogIndex(i),
-                term: Term(1),
-                payload: EntryPayload::NoOp,
-            })
-            .collect();
-        driver.log_store.append(&entries).unwrap();
-
-        // payload_v1 represents the state machine view AT
-        // through_index=10. It MUST be what gets saved.
-        let payload_v1: Vec<u8> = b"snapshot-bytes-AT-through-index-10".to_vec();
-        // payload_v2 represents a LATER state-machine mutation that
-        // happens after dispatch returns. Under Raft snapshot
-        // safety, these bytes MUST NOT appear in the saved snapshot
-        // because the snapshot's metadata advertises
-        // last_included_index=10 — a follower restoring it would
-        // be advanced past commits it has not seen.
-        let payload_v2: Vec<u8> = b"this-MUST-NOT-appear-in-the-saved-snapshot".to_vec();
-        *h.snapshot_payload.lock().unwrap() = payload_v1.clone();
-
-        // Force begin_snapshot to take 200 ms. This is the window
-        // during which a buggy implementation (begin_snapshot on a
-        // fire-and-forget worker, iter-6 shape) would lose the race.
-        // With the iter-7/8 fix, this 200 ms parks the DRIVER TASK
-        // inside process_actions (awaiting a spawn_blocking worker
-        // that runs begin_snapshot off-reactor), so by the time
-        // process_actions returns, payload v1 has already been
-        // captured.
-        const BEGIN_DELAY_MS: u64 = 200;
-        h.begin_snapshot_delay_ms
-            .store(BEGIN_DELAY_MS, std::sync::atomic::Ordering::SeqCst);
-
-        let dispatch_started = std::time::Instant::now();
-        driver
-            .process_actions(
-                vec![Action::TakeSnapshot {
-                    through_index: LogIndex(10),
-                }],
-                None,
-            )
-            .await;
-        let dispatch_elapsed = dispatch_started.elapsed();
-
-        // Iter-7/8 atomicity invariant: process_actions MUST NOT
-        // return before the awaited begin_snapshot capture
-        // completes. If begin_snapshot regressed to a
-        // fire-and-forget worker, dispatch would return in well
-        // under BEGIN_DELAY_MS and this assertion would fail
-        // loudly — providing direct evidence that the awaited-
-        // capture contract has broken.
-        assert!(
-            dispatch_elapsed >= Duration::from_millis(BEGIN_DELAY_MS),
-            "process_actions(TakeSnapshot) returned in {dispatch_elapsed:?}, \
-             but begin_snapshot was configured to sleep {BEGIN_DELAY_MS} ms. \
-             This indicates begin_snapshot is NO LONGER awaited inside \
-             dispatch_snapshot_worker — meaning a concurrent apply could \
-             race begin_snapshot's view capture and a snapshot at advertised \
-             last_included_index could contain bytes for a LATER index. \
-             This is the iter-6 evaluator item-1 Raft snapshot safety bug."
-        );
-
-        // CRITICAL: mutate snapshot_payload AFTER dispatch returns
-        // but BEFORE the worker's serialize() runs. Under iter-7
-        // this mutation is invisible (begin_snapshot already
-        // captured v1). Under the bug shape this mutation would
-        // race begin_snapshot and v2 would end up serialized.
-        *h.snapshot_payload.lock().unwrap() = payload_v2.clone();
-
-        // Now drain the worker (it will serialize the captured v1
-        // view and save it via SnapshotStore).
-        driver.await_pending_snapshot().await;
-
-        // PROOF: the saved snapshot bytes equal payload_v1 (the
-        // state at metadata-decision time), NOT payload_v2.
-        let saved = h.saved_snapshots.lock().unwrap().clone();
-        assert_eq!(saved.len(), 1, "exactly one snapshot must have been saved");
-        assert_eq!(
-            saved[0].0.last_included_index,
-            LogIndex(10),
-            "snapshot metadata must record the advertised last_included_index"
-        );
-        assert_eq!(
-            saved[0].1, payload_v1,
-            "snapshot BYTES must match the state captured at metadata-decision \
-             time (payload_v1). Bytes for a LATER state (payload_v2) cannot \
-             be saved under metadata that advertises last_included_index=10 \
-             without violating Raft snapshot safety. If this assertion fails, \
-             begin_snapshot is racing concurrent applies and the snapshot \
-             bytes are out of sync with the advertised index — the exact \
-             iter-6 evaluator item-1 bug."
-        );
-        assert_ne!(
-            saved[0].1, payload_v2,
-            "post-dispatch payload mutation MUST NOT bleed into the saved snapshot"
-        );
-
-        // Sanity: the snapshots_taken bookkeeping (recorded inside
-        // serialize()) MUST also be payload_v1 — the serializer
-        // owns its captured view, so serialize() cannot somehow
-        // emit v2.
-        let taken = h.snapshots_taken.lock().unwrap().clone();
-        assert_eq!(taken.len(), 1);
-        assert_eq!(
-            taken[0], payload_v1,
-            "serialize() must emit the v1 captured at begin_snapshot, not v2"
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Stage 7.3 (iter 8) — `background-snapshot-nonblocking`
-    // scenario, DEFAULT begin_snapshot path variant.
-    //
-    // Iter-6 evaluator item-2 / iter-8 evaluator item-2 gap: the
-    // existing `scenario_background_snapshot_does_not_block_tokio_reactor`
-    // test exercises TestStateMachine's OVERRIDE of begin_snapshot,
-    // which is fast (clones a payload). It does NOT cover the
-    // trait's DEFAULT begin_snapshot impl
-    // (`xraft-core/src/state_machine.rs:129-132`), which calls
-    // `self.snapshot()` EAGERLY and wraps the bytes in
-    // `EagerSerializer`. For state machines that don't override
-    // begin_snapshot, the iter-7 design (begin_snapshot
-    // synchronously on the driver thread) would block the reactor
-    // for the full snapshot() wall-clock — violating the Stage 7.3
-    // workstream's requirement: "use `tokio::task::spawn_blocking`
-    // to avoid blocking the event loop during snapshot
-    // serialization".
-    //
-    // This regression test toggles `use_eager_begin_snapshot=true`
-    // on TestStateMachine, which makes its begin_snapshot mimic
-    // the trait's default impl exactly (calls self.snapshot() +
-    // wraps in EagerSerializer). With `snapshot_delay_ms=200ms`
-    // the snapshot() call sleeps for 200 ms on the calling thread.
-    //
-    // Under the iter-8 dispatch (await spawn_blocking
-    // begin_snapshot) the 200 ms sleep runs on the blocking pool —
-    // the reactor stays free to poll a concurrent ticker, which
-    // increments every ~10 ms. The test asserts the ticker
-    // accumulated at least 5 ticks during the snapshot, proving
-    // the reactor was NOT blocked.
-    //
-    // Under the iter-7 dispatch (begin_snapshot synchronously on
-    // the driver thread) this test would FAIL: the 200 ms sleep
-    // would land on the reactor thread, the ticker would starve,
-    // ticks would stay at 0.
-    // -----------------------------------------------------------------
-    #[tokio::test(flavor = "current_thread")]
-    async fn scenario_default_begin_snapshot_runs_off_reactor_thread() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Instant;
-
-        let cfg = single_voter_config(2);
-        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
-
-        // Switch TestStateMachine into "default-impl mimic" mode so
-        // begin_snapshot calls self.snapshot() eagerly. This is the
-        // codepath taken by any production StateMachine that does
-        // NOT override begin_snapshot (i.e. relies on the trait
-        // default at xraft-core/src/state_machine.rs:129-132).
-        h.use_eager_begin_snapshot.store(true, Ordering::SeqCst);
-
-        // snapshot() will sleep for 200 ms. Under the iter-7 design
-        // this would run on the reactor thread (because
-        // dispatch_snapshot_worker called begin_snapshot inline).
-        // Under iter-8 it runs on a spawn_blocking worker — the
-        // reactor stays free.
-        const SNAPSHOT_DELAY_MS: u64 = 200;
-        h.snapshot_delay_ms
-            .store(SNAPSHOT_DELAY_MS, Ordering::SeqCst);
-        *h.snapshot_payload.lock().unwrap() = b"eager-default-snap".to_vec();
-
-        // Seed enough log so TakeSnapshot has a real anchor index.
-        let entries: Vec<Entry> = (1..=10u64)
-            .map(|i| Entry {
-                index: LogIndex(i),
-                term: Term(1),
-                payload: EntryPayload::NoOp,
-            })
-            .collect();
-        driver.log_store.append(&entries).unwrap();
-
-        // Concurrent "client" task that ticks a counter every ~10 ms.
-        // If the reactor is blocked by the snapshot's eager
-        // serialization, this counter stays at 0 for the full
-        // SNAPSHOT_DELAY_MS window.
-        let ticks = Arc::new(AtomicUsize::new(0));
-        let ticks_clone = ticks.clone();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop_clone = stop.clone();
-        let ticker = tokio::spawn(async move {
-            while !stop_clone.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                ticks_clone.fetch_add(1, Ordering::SeqCst);
-            }
-        });
-
-        // Yield once so the ticker actually starts before we kick
-        // off the snapshot.
-        tokio::task::yield_now().await;
-
-        let started = Instant::now();
-        let _ = driver
-            .process_actions(
-                vec![Action::TakeSnapshot {
-                    through_index: LogIndex(10),
-                }],
-                None,
-            )
-            .await;
-        // Iter-8 contract: dispatch AWAITS the awaited
-        // spawn_blocking capture, so for the default-eager path
-        // dispatch_elapsed reflects the full snapshot() wall-clock.
-        // The atomicity guarantee (no apply between dispatch and
-        // capture) is preserved by the await keeping the driver
-        // task parked. We assert dispatch took AT LEAST the
-        // snapshot delay — otherwise begin_snapshot is not being
-        // awaited (and atomicity would be lost).
-        let dispatch_elapsed = started.elapsed();
-        assert!(
-            dispatch_elapsed >= Duration::from_millis(SNAPSHOT_DELAY_MS),
-            "dispatch returned in {dispatch_elapsed:?} but the default \
-             begin_snapshot was configured to sleep {SNAPSHOT_DELAY_MS} ms. \
-             dispatch_snapshot_worker must AWAIT the capture phase to \
-             preserve metadata/payload atomicity (iter-7 invariant)."
-        );
-
-        driver.await_pending_snapshot().await;
-        let total_elapsed = started.elapsed();
-
-        // Snapshot exactly once.
-        let snapshots_taken = h.snapshots_taken.lock().unwrap().clone();
-        assert_eq!(
-            snapshots_taken.len(),
-            1,
-            "snapshot() must have been invoked exactly once (the default-\
-             impl mimic path calls snapshot() inside begin_snapshot)",
-        );
-
-        // Stop the ticker and capture its final count.
-        stop.store(true, Ordering::SeqCst);
-        let final_ticks = ticks.load(Ordering::SeqCst);
-        ticker.abort();
-        let _ = ticker.await;
-
-        // The snapshot's blocking sleep actually elapsed.
-        assert!(
-            total_elapsed >= Duration::from_millis(SNAPSHOT_DELAY_MS),
-            "snapshot completed in {total_elapsed:?}, but the test SM was \
-             configured to sleep {SNAPSHOT_DELAY_MS} ms inside snapshot() — \
-             the delay knob is not wired; this test would be vacuous",
-        );
-
-        // PROOF OF NON-BLOCKING FOR THE DEFAULT PATH: the
-        // concurrent ticker MUST have incremented many times
-        // during the eager snapshot. Under iter-7 (begin_snapshot
-        // on the driver thread) the reactor would be blocked and
-        // ticks would be ~0. Under iter-8 (begin_snapshot inside
-        // an awaited spawn_blocking worker) the reactor polls the
-        // ticker normally. We require >= 5 ticks (~50 ms of real
-        // reactor progress during a 200 ms snapshot) — comfortably
-        // above scheduler jitter while still failing loudly if the
-        // dispatch regresses to driver-thread capture for the
-        // default impl.
-        assert!(
-            final_ticks >= 5,
-            "tokio reactor was BLOCKED during the DEFAULT begin_snapshot \
-             path: only {final_ticks} ticks observed during \
-             {total_elapsed:?} (expected >= 5). The driver's \
-             dispatch_snapshot_worker must route StateMachine::\
-             begin_snapshot() through tokio::task::spawn_blocking so \
-             the reactor stays free for other tokio tasks — even for \
-             state machines that do not override begin_snapshot (and \
-             thus rely on the trait's default eager-serialize impl at \
-             xraft-core/src/state_machine.rs:129-132)."
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Stage 7.3 (iter 9) — DOCUMENTED-LIMITATION regression test for
-    // the `SnapshotCaptureMode::EagerMayStallDriver` contract.
-    //
-    // Why this test exists: iter-8 added an awaited
-    // `tokio::task::spawn_blocking(begin_snapshot)` to keep the tokio
-    // reactor free during a default-impl eager capture (see the
-    // `scenario_default_begin_snapshot_runs_off_reactor_thread` test
-    // above). The iter-8 evaluator (verdict iterate, score 89) pointed
-    // out that even though the REACTOR stays free, the DRIVER TASK is
-    // parked on the `.await`, so `DriverEvent::Client` proposes that
-    // get queued behind the snapshot dispatch in the single driver
-    // loop cannot progress to apply until the snapshot worker releases
-    // the SM mutex.
-    //
-    // Iter-9 resolution (Option L+Gate, per rubber-duck consult):
-    //   1. Surface the trade-off at the trait level via a new
-    //      [`xraft_core::state_machine::SnapshotCaptureMode`] enum and
-    //      [`xraft_core::state_machine::StateMachine::snapshot_capture_mode`]
-    //      method. State machines using the trait's default eager
-    //      `begin_snapshot` return [`EagerMayStallDriver`]; CoW-style
-    //      implementations return [`NonBlockingCapture`].
-    //   2. Scope the existing 2× latency test
-    //      (`scenario_background_snapshot_keeps_propose_latency_within_2x_baseline`)
-    //      to the `NonBlockingCapture` mode (it uses
-    //      `save_snapshot_delay_ms`, which delays only the
-    //      AFTER-lock save phase).
-    //   3. PROVE the `EagerMayStallDriver` contract is observable in
-    //      the real driver loop with the deterministic latch-based
-    //      test below.
-    //
-    // Test design — DETERMINISTIC, NOT WALL-CLOCK:
-    //   - Uses `multi_thread` runtime so the snapshot spawn_blocking
-    //     worker, the driver loop, and the test thread are all on
-    //     separate OS threads (the worker's `std::thread::sleep` and
-    //     spin-wait would otherwise starve a current_thread reactor).
-    //   - `snapshot_capture_barrier_engaged` is flipped to `true`
-    //     BEFORE triggering the snapshot. `TestStateMachine::snapshot()`
-    //     sets `snapshot_entered = true` and busy-waits until the
-    //     test releases the barrier. While `snapshot()` is in the
-    //     wait loop, it holds the SM mutex (because
-    //     `dispatch_snapshot_worker` locks the SM, calls
-    //     `begin_snapshot()` which the eager-mimic branch routes
-    //     through `self.snapshot()`, and only drops the lock after
-    //     the call returns).
-    //   - The test spawns `handle.propose(...)` and asserts (via a
-    //     `propose_done` flag) that propose CANNOT complete while the
-    //     SM lock is held. Then it releases the barrier and asserts
-    //     propose DOES complete.
-    //
-    // This test would FAIL if a future refactor made
-    // `EagerMayStallDriver` semantics no longer hold — e.g. if
-    // `dispatch_snapshot_worker` started deferring applies or
-    // decoupled propose from apply entirely. Such a regression is
-    // welcome but would invalidate the documented contract, so the
-    // test would surface it deliberately.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scenario_default_eager_begin_snapshot_stalls_driver_loop_documented_limitation() {
-        use std::sync::atomic::AtomicBool;
-        use std::time::Instant;
-
-        // ----- Trait-level capability assertion -----
-        // Before touching the driver, confirm that a TestStateMachine
-        // with the eager knob set reports `EagerMayStallDriver`. If a
-        // future refactor breaks the trait wiring, this fails at
-        // setup time with a clear message rather than a flaky stall
-        // observation.
-        {
-            let probe = TestStateMachine::default();
-            probe
-                .use_eager_begin_snapshot
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            assert_eq!(
-                probe.snapshot_capture_mode(),
-                xraft_core::state_machine::SnapshotCaptureMode::EagerMayStallDriver,
-                "TestStateMachine with use_eager_begin_snapshot=true \
-                 must report EagerMayStallDriver — the SLA contract \
-                 gate is not wired",
-            );
-        }
-
-        let cfg = single_voter_config(2);
-        let (driver, handle, h) = build_driver_for_snapshot_tests(cfg);
-
-        // Configure the SM for the default-impl mimic path BEFORE
-        // spawning the driver, so any election-induced apply already
-        // runs through the eager branch (no late-toggle race).
-        h.use_eager_begin_snapshot
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        *h.snapshot_payload.lock().unwrap() = b"eager-stalls-driver".to_vec();
-
-        // Spawn the driver's full run() loop. We need the real loop
-        // because the stall we are characterising is on the driver
-        // TASK (which selects on `events_rx`) — the snapshot worker
-        // parks the events arm, preventing the queued
-        // `DriverEvent::Client` from being dequeued and applied.
-        let run_task = tokio::spawn(driver.run());
-
-        // Wait for self-election by retrying `propose` until it
-        // succeeds. See the iter-3 latency test for the rationale —
-        // identical fix applied here per Stage 7.3 iter-13.
-        let warm_up = {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut last_err = None;
-            loop {
-                if Instant::now() > deadline {
-                    panic!(
-                        "warm-up propose did not succeed within 5 s; \
-                         single-voter cluster failed to elect itself. \
-                         Last error: {last_err:?}",
-                    );
-                }
-                match handle.propose(Bytes::from_static(b"warm-up")).await {
-                    Ok(idx) => break idx,
-                    Err(e) => {
-                        last_err = Some(e);
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                }
-            }
-        };
-        assert!(warm_up.0 >= 2, "warm-up propose must commit at index >= 2");
-
-        // ----- Engage the capture barrier -----
-        // Once this is `true`, the next `snapshot()` call (which the
-        // eager `begin_snapshot` triggers under the SM lock) will
-        // signal entry and busy-wait until the test flips it back.
-        h.snapshot_capture_barrier_engaged
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        // Trigger the snapshot. `trigger_snapshot()` returns when the
-        // worker completes; we spawn it so we can observe what
-        // happens while it is still running.
-        let snap_handle = handle.clone();
-        let snap_task = tokio::spawn(async move { snap_handle.trigger_snapshot().await });
-
-        // Spin-wait until `snapshot()` is definitively inside the
-        // busy-wait (and therefore holding the SM mutex). 2 s is
-        // generous; if we never reach this state the test fails
-        // loudly rather than racing.
-        {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !h.snapshot_entered.load(std::sync::atomic::Ordering::SeqCst) {
-                if Instant::now() > deadline {
-                    // Release before panicking so the snap_task
-                    // does not leak.
-                    h.snapshot_capture_barrier_engaged
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                    panic!(
-                        "snapshot worker did not enter the SM lock \
-                         within 2 s; barrier wiring or eager-mimic \
-                         dispatch is broken"
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        }
-
-        // ----- Issue a propose while the SM lock is held -----
-        // The propose is spawned on a fresh tokio task; the test
-        // thread observes `propose_done` to know whether the
-        // propose's apply step completed. Under the documented
-        // limitation, propose flows to the driver loop's
-        // events_rx arm BUT cannot progress to apply (which needs
-        // the SM lock) until the snapshot worker releases.
-        let propose_done = Arc::new(AtomicBool::new(false));
-        let propose_done_clone = propose_done.clone();
-        let propose_handle = handle.clone();
-        let propose_task = tokio::spawn(async move {
-            let r = propose_handle
-                .propose(Bytes::from_static(b"during-eager-snap"))
-                .await;
-            propose_done_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-            r
-        });
-
-        // Give the propose ample time to make progress IF the SLA
-        // contract were stronger than `EagerMayStallDriver` — i.e.
-        // if the driver loop somehow processed events behind the
-        // snapshot worker's back. 150 ms is far longer than a
-        // healthy propose round-trip on this cluster (median
-        // ~ low-ms in `keeps_propose_latency_within_2x_baseline`).
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        // CORE ASSERTION OF THE DOCUMENTED LIMITATION.
-        // If this fails (propose_done == true), then either:
-        //   (a) the driver no longer holds the SM lock across a
-        //       default eager `begin_snapshot` (a structural
-        //       improvement — revisit and tighten this test or
-        //       upgrade the SLA contract), OR
-        //   (b) `propose` no longer needs the SM lock to complete
-        //       (the apply path was decoupled), OR
-        //   (c) the test SM's barrier wiring regressed and the
-        //       lock is being released early (check the
-        //       `snapshot_capture_barrier_engaged` plumbing).
-        // Whichever it is, the `SnapshotCaptureMode` doc/contract
-        // and this test need to be revisited TOGETHER.
-        if propose_done.load(std::sync::atomic::Ordering::SeqCst) {
-            h.snapshot_capture_barrier_engaged
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            let _ = tokio::time::timeout(Duration::from_secs(2), propose_task).await;
-            let _ = tokio::time::timeout(Duration::from_secs(5), snap_task).await;
-            handle.shutdown();
-            let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
-            panic!(
-                "propose completed while a default-eager snapshot was \
-                 still holding the SM mutex. This either invalidates \
-                 the documented SnapshotCaptureMode::EagerMayStallDriver \
-                 contract (great — tighten the test and upgrade the \
-                 trait doc) or means the barrier wiring is broken. \
-                 See the test's CORE ASSERTION comment for triage."
-            );
-        }
-
-        // ----- Release the barrier and assert propose unblocks -----
-        h.snapshot_capture_barrier_engaged
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-
-        // Propose must now complete. 5 s timeout is generous; on a
-        // healthy run this happens in low-ms once the SM lock is
-        // released.
-        let propose_result = tokio::time::timeout(Duration::from_secs(5), propose_task)
-            .await
-            .expect("propose did not complete within 5 s after barrier release")
-            .expect("propose task panicked");
-        propose_result.expect("propose returned error after barrier release");
-        assert!(
-            propose_done.load(std::sync::atomic::Ordering::SeqCst),
-            "propose_done flag should be set after propose_task awaited successfully",
-        );
-
-        // Snapshot must complete too — covers the post-release
-        // teardown path (save_snapshot + observers + anchor
-        // update).
-        let snap_result = tokio::time::timeout(Duration::from_secs(5), snap_task)
-            .await
-            .expect("snapshot did not complete within 5 s after barrier release")
-            .expect("snapshot task panicked")
-            .expect("snapshot returned error");
-        assert!(
-            snap_result.last_included_index >= 2,
-            "snapshot must anchor at the warm-up commit or later, got {}",
-            snap_result.last_included_index,
-        );
-
-        // The eager-mimic path actually ran (sanity check — if
-        // snapshot() was never called the barrier would never have
-        // released and the test would have panicked above; this is
-        // belt-and-suspenders).
-        assert!(
-            !h.snapshots_taken.lock().unwrap().is_empty(),
-            "snapshot() must have been invoked at least once via the \
-             eager-mimic begin_snapshot path",
-        );
-
-        handle.shutdown();
-        let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
     }
 }
