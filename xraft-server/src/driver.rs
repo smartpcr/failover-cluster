@@ -3247,6 +3247,100 @@ port = 6022
         let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
     }
 
+    /// Inbound configured `snapshot_chunk_size` + bounded `max_bytes`
+    /// window that does NOT cover the snapshot tail.
+    ///
+    /// This is the production-realistic Phase 5 resume case: an
+    /// operator who has tuned `DriverConfig::snapshot_chunk_size`
+    /// (so chunks fit the gRPC envelope) AND a follower that paginates
+    /// large snapshots via bounded windows. The combination MUST yield
+    ///   - chunks of exactly `snapshot_chunk_size` bytes,
+    ///   - `chunk_index` values rooted at `offset / snapshot_chunk_size`,
+    ///   - `done = false` on the last chunk of the window (legitimate
+    ///     partial-window response — caller resumes at
+    ///     `offset + max_bytes`),
+    ///   - total bytes across the window equal to `max_bytes` exactly
+    ///     (no over-served, no under-served).
+    ///
+    /// Pins the interaction between the iter-3 `snapshot_chunk_size`
+    /// config field and the iter-1 bounded-window partial-response
+    /// contract. Without this test, a future refactor could decouple
+    /// the two paths and silently drop the partial-window guarantee
+    /// for configured chunk sizes.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fetch_snapshot_bounded_window_with_configured_chunk_size_yields_partial_window() {
+        // 16-byte payload, configured chunk_size = 4, bounded window
+        // max_bytes = 8 → 2 chunks of 4 bytes at chunk_index = 0, 1,
+        // BOTH with done = false (window does not cover the tail; the
+        // follower resumes at offset = 8).
+        let payload: Vec<u8> = (0..16u8).collect();
+        let snap_id = "snapshot-0000000001-00000000000000000010";
+        let cfg = single_voter_config(2);
+        let (driver, handle) =
+            build_driver_with_seeded_snapshot(cfg, NodeId(2), snap_id, payload.clone(), 4);
+        let run_task = tokio::spawn(driver.run());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let inbound = handle.inbound_handler();
+        let stream = inbound
+            .handle_fetch_snapshot(FetchSnapshotRequest {
+                cluster_id: "test-driver".into(),
+                leader_epoch: 1,
+                replica_id: NodeId(2),
+                snapshot_id: snap_id.into(),
+                offset: 0,
+                max_bytes: 8, // bounded — does NOT cover the snapshot tail
+            })
+            .await
+            .expect("expected Ok(stream) for valid bounded FetchSnapshot");
+
+        let chunks = drain_chunk_stream(stream).await;
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected 2 chunks at configured chunk_size=4 for an 8-byte bounded window, got {} — \
+             this likely means chunk_size and max_bytes interaction regressed",
+            chunks.len()
+        );
+        assert_eq!(chunks[0].chunk_index, 0, "first chunk index = 0/4 = 0");
+        assert_eq!(chunks[1].chunk_index, 1, "second chunk index = 4/4 = 1");
+        assert_eq!(chunks[0].data, payload[0..4]);
+        assert_eq!(chunks[1].data, payload[4..8]);
+        for c in &chunks {
+            assert_eq!(
+                c.data.len(),
+                4,
+                "every chunk must be exactly the configured chunk_size of 4 bytes — \
+                 chunk_size MUST NOT be derived from max_bytes"
+            );
+            assert!(
+                !c.done,
+                "bounded window that does NOT cover the snapshot tail must have done=false on \
+                 every chunk (incl. the last) — the follower resumes from offset = 8"
+            );
+        }
+        // Total bytes across the window match max_bytes exactly: no
+        // over-served (router would reject), no under-served (router
+        // would reject), exactly the bounded-window happy path.
+        let total: usize = chunks.iter().map(|c| c.data.len()).sum();
+        assert_eq!(
+            total, 8,
+            "bounded-window response total bytes MUST equal max_bytes for the \
+             legitimate partial-window case"
+        );
+        assert!(
+            chunks[0].metadata.is_some(),
+            "first chunk must carry metadata"
+        );
+        assert!(
+            chunks[1].metadata.is_none(),
+            "subsequent chunks must not carry metadata"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
+    }
+
     // -----------------------------------------------------------------
     // Helper sanity check: inbound Vote always replies (default-deny on drop).
     // -----------------------------------------------------------------
