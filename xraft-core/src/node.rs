@@ -193,6 +193,19 @@ pub struct PeerState {
     /// log end. Used to gate leadership-transfer and membership-change
     /// protocols. Spec name: `last_caught_up_time` (architecture.md ┬º3.2).
     pub last_caught_up_time: u64,
+    /// Stage 7.1 (iter-6 evaluator finding #1) ΓÇö monotonic per-leader
+    /// sequence number stamped on every accepted [`FetchRequest`] from
+    /// this peer. Distinct from [`Self::last_fetch_time`] which is a
+    /// tick timestamp used for lease-window aging: `last_fetch_seq` is
+    /// used by the leader-lease *slow-path* (ReadIndex confirmation
+    /// round-trip) to prove "this peer has acknowledged my leadership
+    /// at or after the moment a pending read was captured", with
+    /// strict-greater (`>`) ordering and without the coarse-tick
+    /// ambiguity that affects timestamp comparisons. The corresponding
+    /// monotonic source is [`RaftNode::fetch_seq`]; on every accepted
+    /// `FetchRequest` the leader bumps `self.fetch_seq` and copies the
+    /// new value into the requesting peer's `last_fetch_seq`.
+    pub last_fetch_seq: u64,
     /// Whether this peer participates in quorum decisions (false for
     /// `Observer` nodes ΓÇö non-voting replicas).
     pub is_voter: bool,
@@ -207,6 +220,7 @@ impl PeerState {
             last_fetch_offset: LogIndex(0),
             last_fetch_time: 0,
             last_caught_up_time: 0,
+            last_fetch_seq: 0,
             is_voter,
         }
     }
@@ -338,6 +352,41 @@ pub struct RaftNode {
     /// recreates the engine from durable state with the flag at default
     /// (`false`).
     pub snapshot_in_flight: bool,
+    /// Logical-tick timestamp at which this node became Leader, used as
+    /// the "baseline" for Leader-Lease validation. Set to
+    /// `Some(logical_tick)` in [`become_leader`] and cleared in
+    /// [`become_follower`] / `become_pre_candidate` / `become_candidate`.
+    /// Stage 7.1: the lease check requires `peer.last_fetch_time >
+    /// leader_started_tick` so a freshly-elected leader does not report a
+    /// false-positive lease before any follower has actually fetched
+    /// (the pre-stamped `peer.last_fetch_time = logical_tick` in
+    /// `become_leader` is a Check-Quorum grace-period baseline, NOT
+    /// evidence of real follower contact).
+    pub leader_started_tick: Option<u64>,
+    /// Logical-tick counter incremented each [`Input::Tick`] while
+    /// `role == Leader && config.enable_check_quorum` is true. When the
+    /// counter reaches [`Self::check_quorum_interval_ticks`], the engine
+    /// runs one Check-Quorum pass (counting voters with recent
+    /// `peer.last_fetch_time`) and resets the counter to zero. Cleared
+    /// on every role transition so a re-elected leader gets a fresh
+    /// grace window before the first check fires.
+    pub check_quorum_elapsed_ticks: u64,
+    /// Pre-computed Check-Quorum / Leader-Lease window in logical ticks
+    /// (ceiling-division of `config.effective_check_quorum_interval_ms`
+    /// by `config.tick_interval_ms`, floored at 1). Derived at engine
+    /// construction time so the hot tick path is not re-doing the
+    /// division.
+    pub check_quorum_interval_ticks: u64,
+    /// Stage 7.1 (iter-6 evaluator finding #1) ΓÇö monotonic counter
+    /// incremented on every accepted inbound [`FetchRequest`]. Used as
+    /// the source value stamped into [`PeerState::last_fetch_seq`] so
+    /// the driver's lease *slow-path* (ReadIndex round-trip) can prove
+    /// quorum acknowledgement strictly after a pending read was
+    /// captured. Unlike a tick-based timestamp, this counter advances
+    /// once per RPC rather than once per tick, so within-tick fetches
+    /// are still distinguishable. Never reset on role transitions
+    /// (u64-monotonic across the node's lifetime).
+    pub fetch_seq: u64,
     /// RNG used to randomise election timeouts. Seeded from the system
     /// entropy by default; tests use [`RaftNode::new_with_seed`] for
     /// deterministic behaviour.
@@ -382,6 +431,18 @@ impl RaftNode {
                 }
             }
         }
+        // Stage 6.1: seed the local node's initial role as Observer
+        // when its `node_id` appears in `config.observers`. Otherwise
+        // every node starts as Follower per the Raft baseline (it may
+        // become Candidate/PreCandidate/Leader after the first election
+        // timeout). Observer nodes never time out into an election —
+        // see the `tick()` arm in this file which skips
+        // `become_pre_candidate` for `NodeRole::Observer`.
+        let initial_role = if config.observers.contains(&config.node_id.0) {
+            NodeRole::Observer
+        } else {
+            NodeRole::Follower
+        };
         // We seed the timer's RNG from the same source so the entire engine is
         // deterministic when constructed via `new_with_seed`.
         let mut timer_rng = StdRng::seed_from_u64(rng.next_u64());
@@ -394,7 +455,7 @@ impl RaftNode {
 
         Ok(Self {
             id: config.node_id,
-            role: NodeRole::Follower,
+            role: initial_role,
             hard_state: HardState {
                 current_term: Term(0),
                 voted_for: None,
@@ -406,7 +467,6 @@ impl RaftNode {
             pre_votes_received: VoteGrantedSet::new(),
             peers,
             voter_set,
-            config,
             leader_id: None,
             last_leader_contact_tick: None,
             logical_tick: 0,
@@ -416,6 +476,19 @@ impl RaftNode {
             last_fetch_tick: None,
             last_snapshot_meta: None,
             snapshot_in_flight: false,
+            leader_started_tick: None,
+            check_quorum_elapsed_ticks: 0,
+            // ceil-div so a sub-tick window still translates to at least
+            // one tick of grace. Floored at 1 so an over-eager operator
+            // cannot collapse the window to 0 ticks (which would fire on
+            // every leader tick and likely cause leader churn).
+            check_quorum_interval_ticks: {
+                let window_ms = config.effective_check_quorum_interval_ms();
+                let tick_ms = config.tick_interval_ms.max(1);
+                window_ms.div_ceil(tick_ms).max(1)
+            },
+            fetch_seq: 0,
+            config,
             rng: StdRng::seed_from_u64(rng.next_u64()),
         })
     }
@@ -526,6 +599,35 @@ impl RaftNode {
                 message: OutboundMessage::FetchRequest(req),
             });
             self.last_fetch_tick = Some(self.logical_tick);
+        }
+
+        // Stage 7.1: leader Check-Quorum tick. Distinct from the election
+        // timeout — the leader runs its own coarser-grained reachability
+        // check at `check_quorum_interval_ticks` (typically 2× the upper
+        // bound of election timeout) and steps down if it cannot count
+        // itself plus a majority of voters with recent Fetch activity.
+        if self.role == NodeRole::Leader && self.config.enable_check_quorum {
+            self.check_quorum_elapsed_ticks = self.check_quorum_elapsed_ticks.saturating_add(1);
+            if self.check_quorum_elapsed_ticks >= self.check_quorum_interval_ticks {
+                self.check_quorum_elapsed_ticks = 0;
+                if !self.check_quorum_reachable() {
+                    tracing::warn!(
+                        node_id = %self.id,
+                        term = %self.hard_state.current_term,
+                        interval_ticks = self.check_quorum_interval_ticks,
+                        "Check-Quorum failed: leader could not count a majority of voters \
+                         with recent Fetch activity; stepping down to Follower"
+                    );
+                    // Same-term step-down. `become_follower` does NOT emit
+                    // PersistHardState when the term is unchanged (we are
+                    // already durable at this term + self-vote), but DOES
+                    // emit `Action::StepDown` so the driver can drop
+                    // leader-side state (waiters, replication-lag metrics).
+                    let current_term = self.hard_state.current_term;
+                    actions.extend(self.become_follower(current_term, None));
+                    return actions;
+                }
+            }
         }
 
         if !self.election_timer.is_expired() {
@@ -653,6 +755,19 @@ impl RaftNode {
         // fetch scheduling cursor.
         self.leader_no_op_index = None;
         self.last_fetch_tick = None;
+        // Stage 7.1 (iter-5 evaluator finding #3): clear leader-only
+        // Check-Quorum / Leader-Lease bookkeeping on every step-down.
+        // `leader_started_tick` is the lease baseline (Some(tick) only
+        // while we are leader) and `check_quorum_elapsed_ticks` is the
+        // Check-Quorum interval counter (incremented on Tick while
+        // leader); both must reset to their default-construction values
+        // so a future re-election starts with a clean slate. The peer
+        // sister role-transitions (`become_pre_candidate`,
+        // `become_candidate`) already do this; mirroring it here closes
+        // the gap on the higher-term VoteRequest / FetchResponse /
+        // VoteResponse paths that go through `become_follower`.
+        self.leader_started_tick = None;
+        self.check_quorum_elapsed_ticks = 0;
         self.election_timer.reset(&mut self.rng);
         if stepping_down {
             actions.push(Action::StepDown);
@@ -697,6 +812,9 @@ impl RaftNode {
         // does not pull from a leader).
         self.leader_no_op_index = None;
         self.last_fetch_tick = None;
+        // Stage 7.1: clear leader-side Check-Quorum / Leader-Lease state.
+        self.leader_started_tick = None;
+        self.check_quorum_elapsed_ticks = 0;
         self.election_timer.reset(&mut self.rng);
 
         let next_term = Term(self.hard_state.current_term.0.saturating_add(1));
@@ -747,6 +865,12 @@ impl RaftNode {
         // Stage 3.3: clear leader-only no-op marker and fetch cursor.
         self.leader_no_op_index = None;
         self.last_fetch_tick = None;
+        // Stage 7.1: clear leader-side Check-Quorum / Leader-Lease state
+        // (defensive — the candidate path is reachable directly from
+        // single-voter pre-vote cascade and from the historical fast-path
+        // election trigger).
+        self.leader_started_tick = None;
+        self.check_quorum_elapsed_ticks = 0;
         self.election_timer.reset(&mut self.rng);
 
         let mut actions = vec![Action::PersistHardState];
@@ -807,6 +931,15 @@ impl RaftNode {
         self.pre_votes_received.clear();
         // Stage 3.3: a leader does not pull from itself.
         self.last_fetch_tick = None;
+        // Stage 7.1: record the logical-tick baseline used by Leader-Lease.
+        // `peer.last_fetch_time` is pre-stamped to `logical_tick` below as a
+        // Check-Quorum grace baseline, but lease evaluation requires a STRICT
+        // `peer.last_fetch_time > leader_started_tick` so the lease only
+        // becomes active after at least one real post-election Fetch. This
+        // is the rubber-duck Blocker 1 fix: without the strict baseline the
+        // lease would be falsely active for one tick after every election.
+        self.leader_started_tick = Some(self.logical_tick);
+        self.check_quorum_elapsed_ticks = 0;
         self.election_timer.reset(&mut self.rng);
 
         // Initialise per-peer replication state. In the pull model the leader
@@ -900,6 +1033,112 @@ impl RaftNode {
             .filter(|id| voter_ids.contains(id))
             .count();
         granted >= needed
+    }
+
+    /// Stage 7.1 — Check-Quorum reachability test.
+    ///
+    /// Returns `true` when this leader counts **itself plus voter peers
+    /// whose `last_fetch_time` is within the Check-Quorum window** to a
+    /// quorum (i.e. `(n/2)+1` of the configured voter set). Returns
+    /// `false` otherwise, signalling the caller (the `handle_tick`
+    /// Check-Quorum branch) to step down.
+    ///
+    /// "Within the window" is defined as
+    /// `logical_tick - peer.last_fetch_time < check_quorum_interval_ticks`
+    /// (strict `<` — the boundary `==` tick is OUTSIDE the window because
+    /// it is exactly `check_quorum_interval_ticks` old). The leader
+    /// always counts itself as one of the in-window voters.
+    ///
+    /// When no `voter_set` is configured (legacy flat `peers` mode),
+    /// returns `true` so a node running without structured voter metadata
+    /// is never spuriously stepped down by Check-Quorum.
+    pub fn check_quorum_reachable(&self) -> bool {
+        let Some(vs) = self.voter_set.as_ref() else {
+            return true;
+        };
+        let needed = vs.quorum_size();
+        let voter_ids: std::collections::HashSet<NodeId> =
+            vs.voters().iter().map(|v| v.node_id).collect();
+
+        // Self always counts when we are still the leader (we are
+        // trivially "in contact" with ourselves). The leader-self count
+        // is the rubber-duck reminder that a 3-voter cluster needs only
+        // ONE other reachable voter for quorum (1 + 1 + 1 = quorum=2 of 3).
+        let mut reachable_voters: usize = if voter_ids.contains(&self.id) { 1 } else { 0 };
+        let window = self.check_quorum_interval_ticks;
+        for (peer_id, peer) in self.peers.iter() {
+            if !voter_ids.contains(peer_id) {
+                continue;
+            }
+            // Saturating subtraction guards against logical-tick wrap
+            // (which would take centuries at 10ms ticks but stay
+            // defensive — overflow here would falsely report a giant
+            // age and trip an unnecessary step-down).
+            let age = self.logical_tick.saturating_sub(peer.last_fetch_time);
+            if age < window {
+                reachable_voters = reachable_voters.saturating_add(1);
+            }
+        }
+        reachable_voters >= needed
+    }
+
+    /// Stage 7.1 — Leader-Lease evaluation.
+    ///
+    /// Returns `true` only when **all** of the following hold:
+    /// 1. `config.enable_leader_lease` is on.
+    /// 2. This node is currently the Leader.
+    /// 3. Counting self plus voter peers whose `last_fetch_time` strictly
+    ///    exceeds `leader_started_tick` AND is within the
+    ///    `check_quorum_interval_ticks` window, the leader can form a
+    ///    quorum of the configured voter set.
+    ///
+    /// Condition (3) is the rubber-duck Blocker 1 fix: `become_leader`
+    /// pre-stamps every peer's `last_fetch_time` to the current
+    /// `logical_tick` as a Check-Quorum grace baseline. Without the
+    /// strict `> leader_started_tick` filter the lease would be falsely
+    /// active for the entire first window after every election, before
+    /// any follower has actually sent a Fetch RPC.
+    ///
+    /// Single-voter clusters: self alone is a quorum, so a single-voter
+    /// leader with the flag enabled holds the lease at all times while
+    /// leading.
+    ///
+    /// **Internal optimisation only.** Per `tech-spec.md` §2.5 XRAFT v1
+    /// does not expose an external client read API; this helper is for
+    /// admin status queries and engine-internal `StateMachine` lookups
+    /// that want to skip an extra commit-index confirmation round-trip.
+    pub fn has_active_lease(&self) -> bool {
+        if !self.config.enable_leader_lease {
+            return false;
+        }
+        if self.role != NodeRole::Leader {
+            return false;
+        }
+        let Some(vs) = self.voter_set.as_ref() else {
+            return false;
+        };
+        let Some(started_tick) = self.leader_started_tick else {
+            return false;
+        };
+        let needed = vs.quorum_size();
+        let voter_ids: std::collections::HashSet<NodeId> =
+            vs.voters().iter().map(|v| v.node_id).collect();
+        let mut lease_voters: usize = if voter_ids.contains(&self.id) { 1 } else { 0 };
+        let window = self.check_quorum_interval_ticks;
+        for (peer_id, peer) in self.peers.iter() {
+            if !voter_ids.contains(peer_id) {
+                continue;
+            }
+            // Real post-election fetch evidence required.
+            if peer.last_fetch_time <= started_tick {
+                continue;
+            }
+            let age = self.logical_tick.saturating_sub(peer.last_fetch_time);
+            if age < window {
+                lease_voters = lease_voters.saturating_add(1);
+            }
+        }
+        lease_voters >= needed
     }
 
     // ---------------------------------------------------------------------
@@ -1063,6 +1302,20 @@ impl RaftNode {
             self.last_leader_contact_tick = None;
             self.votes_received.clear();
             self.pre_votes_received.clear();
+            // Stage 7.1 (iter-5 evaluator finding #3): the inline
+            // higher-term step-down here intentionally bypasses
+            // `become_follower` (to coalesce the term-bump + vote-grant
+            // into a single PersistHardState — rubber-duck issue #3),
+            // so we MUST manually mirror `become_follower`'s leader-
+            // only state cleanup. Without this, a stepped-down former
+            // leader keeps `leader_started_tick = Some(_)` and the
+            // accumulated `check_quorum_elapsed_ticks`, which would
+            // make `has_active_lease()` and the next leadership
+            // cycle's Check-Quorum window observe stale leader-only
+            // bookkeeping (Stage 7.1 field docs at §"Cleared on" call
+            // out follower transition as the canonical reset point).
+            self.leader_started_tick = None;
+            self.check_quorum_elapsed_ticks = 0;
             // Adopting a higher term means our election round is invalidated;
             // start a fresh timer for the new term.
             self.election_timer.reset(&mut self.rng);
@@ -1801,8 +2054,15 @@ impl RaftNode {
         }
 
         // Update peer-liveness fields ΓÇö but NOT replication progress.
+        // Stage 7.1 (iter-6 evaluator finding #1): also bump the
+        // monotonic `fetch_seq` and stamp `peer.last_fetch_seq` so the
+        // driver-level lease slow-path can prove "this voter has acked
+        // leadership at or after the captured baseline" with a strict
+        // (`>`) comparison that does not depend on tick granularity.
+        self.fetch_seq = self.fetch_seq.saturating_add(1);
         if let Some(peer) = self.peers.get_mut(&req.replica_id) {
             peer.last_fetch_time = self.logical_tick;
+            peer.last_fetch_seq = self.fetch_seq;
         }
         // Refresh self-contact: leader observed activity from the cluster.
         self.last_leader_contact_tick = Some(self.logical_tick);
@@ -2326,6 +2586,68 @@ port = 6000
         assert!(node.leader_id.is_none());
     }
 
+    // Stage 6.1 acceptance (iter-3 evaluator finding #3):
+    // `ClusterConfig.observers` containing this node's id must seed
+    // `NodeRole::Observer` at construction. The reverse — node not in
+    // observers — still starts as `Follower`.
+    #[test]
+    fn new_node_starts_as_observer_when_listed_in_observers_field() {
+        let toml = format!(
+            r#"
+node_id = 5
+cluster_id = "test"
+listen_addr = "0.0.0.0:6000"
+tick_interval_ms = 10
+election_timeout_min_ms = 100
+election_timeout_max_ms = 200
+observers = [5]
+
+[[voters]]
+node_id = 1
+directory_id = "{}"
+host = "node1"
+port = 6000
+"#,
+            Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).unwrap();
+        let node = RaftNode::new_with_seed(cfg, 1).unwrap();
+        assert_eq!(
+            node.role,
+            NodeRole::Observer,
+            "node listed in `observers` must construct as Observer"
+        );
+    }
+
+    #[test]
+    fn new_node_with_unrelated_observer_list_still_starts_as_follower() {
+        let toml = format!(
+            r#"
+node_id = 1
+cluster_id = "test"
+listen_addr = "0.0.0.0:6000"
+tick_interval_ms = 10
+election_timeout_min_ms = 100
+election_timeout_max_ms = 200
+observers = [7, 8]
+
+[[voters]]
+node_id = 1
+directory_id = "{}"
+host = "node1"
+port = 6000
+"#,
+            Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).unwrap();
+        let node = RaftNode::new_with_seed(cfg, 1).unwrap();
+        assert_eq!(
+            node.role,
+            NodeRole::Follower,
+            "node NOT listed in `observers` must construct as Follower"
+        );
+    }
+
     #[test]
     fn new_node_has_correct_id() {
         let node = RaftNode::new_with_seed(test_config(), 1).unwrap();
@@ -2793,6 +3115,94 @@ port = 6000
         assert_eq!(node.leader_id, Some(NodeId(2)));
     }
 
+    /// Stage 7.1 iter-5 evaluator finding #3 — `become_follower` MUST
+    /// clear the leader-only `leader_started_tick` (the lease
+    /// baseline) and `check_quorum_elapsed_ticks` (the Check-Quorum
+    /// interval counter) on every step-down. Their field docs at
+    /// `pub leader_started_tick` / `pub check_quorum_elapsed_ticks`
+    /// explicitly state the reset point is "follower transition" /
+    /// "every role transition"; without this clearing a stepped-down
+    /// former leader would observe a stale lease baseline on its
+    /// next re-election (or — worse — `has_active_lease()` could
+    /// return `true` against the OLD baseline while in Follower
+    /// role, depending on the lease predicate's role check).
+    #[test]
+    fn become_follower_clears_stage_7_1_leader_only_state() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        // Drive into the Leader role so the Stage 7.1 leader-only
+        // state is non-default.
+        let _ = node.become_candidate();
+        let _ = node.become_leader();
+        assert_eq!(node.role, NodeRole::Leader);
+        assert!(
+            node.leader_started_tick.is_some(),
+            "test precondition: a fresh Leader must have a non-None \
+             leader_started_tick (set in become_leader)"
+        );
+        // Simulate some Check-Quorum tick accumulation.
+        node.check_quorum_elapsed_ticks = 42;
+
+        // Step down to follower at a higher term (the canonical path).
+        let _ = node.become_follower(Term(node.current_term().0 + 1), None);
+
+        assert_eq!(node.role, NodeRole::Follower);
+        assert_eq!(
+            node.leader_started_tick, None,
+            "become_follower MUST clear leader_started_tick on step-down \
+             (Stage 7.1 field doc: 'Cleared in become_follower')"
+        );
+        assert_eq!(
+            node.check_quorum_elapsed_ticks, 0,
+            "become_follower MUST reset check_quorum_elapsed_ticks to 0 \
+             on step-down (Stage 7.1 field doc: 'Cleared on every role \
+             transition')"
+        );
+    }
+
+    /// Stage 7.1 iter-5 evaluator finding #3 — the inline higher-term
+    /// `VoteRequest` path bypasses `become_follower` (to coalesce the
+    /// term-bump + vote grant into a single PersistHardState — see
+    /// rubber-duck non-blocking issue #3) and therefore must
+    /// independently mirror the leader-only Stage 7.1 state cleanup.
+    /// Without this, a leader that steps down via a higher-term
+    /// VoteRequest would keep stale `leader_started_tick` and
+    /// `check_quorum_elapsed_ticks`.
+    #[test]
+    fn handle_vote_request_higher_term_clears_stage_7_1_leader_only_state() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        let _ = node.become_candidate();
+        let _ = node.become_leader();
+        assert_eq!(node.role, NodeRole::Leader);
+        assert!(
+            node.leader_started_tick.is_some(),
+            "test precondition: Leader has leader_started_tick set"
+        );
+        node.check_quorum_elapsed_ticks = 17;
+        let starting_term = node.current_term();
+
+        // Higher-term VoteRequest: takes the inline step-down path
+        // at `node.rs::handle_vote_request` (`req.term >
+        // current_term` branch) — NOT the `become_follower` path.
+        let _ = node.handle_vote_request(vote_req(
+            "test",
+            starting_term.0 + 4,
+            NodeId(2),
+            node.last_log_index.0,
+            node.last_log_term.0,
+        ));
+
+        assert_eq!(node.role, NodeRole::Follower);
+        assert_eq!(
+            node.leader_started_tick, None,
+            "inline higher-term step-down MUST clear leader_started_tick \
+             (otherwise a future re-election observes a stale lease baseline)"
+        );
+        assert_eq!(
+            node.check_quorum_elapsed_ticks, 0,
+            "inline higher-term step-down MUST reset check_quorum_elapsed_ticks"
+        );
+    }
+
     #[test]
     fn become_pre_candidate_emits_pre_vote_requests_without_term_bump() {
         let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
@@ -2996,11 +3406,15 @@ port = 6000
             tls_ca_path: None,
             tls_domain_name: None,
             connect_timeout_ms: 5_000,
-            rpc_timeout_ms: 10_000,
+            rpc_timeout_ms: 30_000,
             max_rpc_retries: 3,
             retry_initial_backoff_ms: 100,
             retry_max_backoff_ms: 5_000,
             max_message_size: 64 * 1024 * 1024,
+            observers: vec![],
+            enable_check_quorum: true,
+            enable_leader_lease: false,
+            check_quorum_interval_ms: None,
         };
         let err = RaftNode::new_with_seed(cfg, 1).expect_err(
             "RaftNode::new_with_seed must propagate invalid voter config as Err, \
@@ -3919,6 +4333,7 @@ port = 6004
             entries,
             diverging_epoch,
             snapshot_redirect: None,
+            is_leader: true,
         }
     }
 
@@ -5646,6 +6061,7 @@ port = 6000
                 last_included_index: LogIndex(last_included_index),
                 last_included_term: Term(last_included_term),
             }),
+            is_leader: true,
         }
     }
 
@@ -5738,6 +6154,7 @@ port = 6000
                 last_included_index: LogIndex(50),
                 last_included_term: Term(4),
             }),
+            is_leader: true,
         };
 
         let actions = node.handle_fetch_response(resp);

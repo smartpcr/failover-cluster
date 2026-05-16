@@ -46,8 +46,15 @@ pub trait StateMachine: Send + Sync {
     /// Run a read-only query against committed state.
     ///
     /// Implementations MUST NOT mutate state from this method. The driver
-    /// guarantees the state machine has caught up to at least the read's
-    /// required commit index before invoking `query` (linearizable reads).
+    /// invokes `query` against the state machine state currently applied on
+    /// the serving driver instance (i.e. at `last_applied >= prior commit
+    /// index` for the same leader).
+    ///
+    /// In v1 this is an apply-cursor read on the serving leader: it sees
+    /// every entry the local driver has applied at call time, but does not
+    /// perform a quorum confirmation (no ReadIndex / leader lease). Callers
+    /// that need cross-leader linearizable reads must wait for a future
+    /// ReadIndex / leader-lease protocol — see `tech-spec.md` §2.6.
     fn query(&self, query: &[u8]) -> Result<Vec<u8>>;
 
     /// Take a snapshot of the current state machine state.
