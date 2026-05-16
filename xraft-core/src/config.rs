@@ -519,6 +519,41 @@ impl ClusterConfig {
                     )));
                 }
             }
+
+            // Stage 7.2 (evaluator iter-1 finding #4): when voters
+            // is non-empty, enforce the local-node membership rule
+            // — the local `node_id` MUST appear in exactly one of
+            // voters OR observers. Previously this was enforced
+            // only by `NodeConfig::validate_membership`, but a
+            // programmatic `ClusterConfig` built directly (e.g.
+            // `Server::start_with_state_machine` taking a caller-
+            // supplied config) bypassed that check. Moving the
+            // check here makes it universal regardless of
+            // construction path. We intentionally skip this when
+            // `voters.is_empty()` so the snapshot-restore
+            // bootstrap path (where membership comes from a
+            // persisted/snapshot `VoterSet` rather than config)
+            // can still pass validation; the server layer
+            // performs a stricter post-reconciliation membership
+            // check after the voter set has been determined.
+            let self_id = self.node_id.0;
+            let in_voters = self.voters.iter().any(|v| v.node_id == self_id);
+            let in_observers = self.observers.contains(&self_id);
+            if !in_voters && !in_observers {
+                let voter_ids: Vec<u64> = self.voters.iter().map(|v| v.node_id).collect();
+                return Err(XRaftError::Config(format!(
+                    "node_id {self_id} is not present in the voters list or observers list \
+                     (voters = {voter_ids:?}, observers = {:?}); each node MUST be a member \
+                     of exactly one set",
+                    self.observers,
+                )));
+            }
+            if in_voters && in_observers {
+                return Err(XRaftError::Config(format!(
+                    "node_id {self_id} appears in BOTH the voters and observers lists; \
+                     each node MUST be a member of exactly one set"
+                )));
+            }
         }
 
         if self.election_timeout_min_ms == 0 {

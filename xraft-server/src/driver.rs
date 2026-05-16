@@ -523,6 +523,52 @@ impl DriverHandle {
             .map_err(|_| XRaftError::Transport(PROPOSE_CHANNEL_CLOSED.to_string()))
     }
 
+    /// Stage 7.2 — reject any `AddVoter` command unconditionally.
+    ///
+    /// Dynamic cluster membership is **out of scope for v1** and
+    /// deferred to a future story entirely — `tech-spec.md` §2.7,
+    /// `architecture.md` §5.5, and `e2e-scenarios.md` Feature 12 all
+    /// agree on this scoping. The voter set is established at first
+    /// boot from `ClusterConfig.voters`, persisted in
+    /// `quorum-state`, and **immutable** for the cluster's lifetime
+    /// in v1.
+    ///
+    /// This method exists as the explicit programmatic boundary so
+    /// operator tooling can match on `XRaftError::Unsupported`
+    /// without scraping log lines. The method does NOT touch the
+    /// driver event loop or the engine — the rejection is local and
+    /// synchronous so the voter set on disk is provably unchanged
+    /// after the call returns.
+    pub async fn add_voter(&self, _voter: NodeId) -> XResult<()> {
+        let _ = self; // pin self lifetime; method is intentionally local-only
+        Err(XRaftError::Unsupported(
+            "AddVoter is out of scope for v1 — dynamic cluster membership \
+             is deferred to a future story entirely (per tech-spec.md §2.7, \
+             architecture.md §5.5, e2e-scenarios.md Feature 12). The voter \
+             set is static after first boot; restart the cluster with a \
+             different configuration to change membership."
+                .into(),
+        ))
+    }
+
+    /// Stage 7.2 — reject any `RemoveVoter` command unconditionally.
+    ///
+    /// See [`Self::add_voter`] for the v1 scoping rationale. The
+    /// rejection is symmetric: there is no AddVoter, so there is no
+    /// RemoveVoter either. Returning the same `XRaftError::Unsupported`
+    /// variant lets callers handle the pair uniformly.
+    pub async fn remove_voter(&self, _voter: NodeId) -> XResult<()> {
+        let _ = self;
+        Err(XRaftError::Unsupported(
+            "RemoveVoter is out of scope for v1 — dynamic cluster membership \
+             is deferred to a future story entirely (per tech-spec.md §2.7, \
+             architecture.md §5.5, e2e-scenarios.md Feature 12). The voter \
+             set is static after first boot; restart the cluster with a \
+             different configuration to change membership."
+                .into(),
+        ))
+    }
+
     /// Build an inbound RPC handler for the gRPC server. The handler
     /// implements [`RaftMessageHandler`] by forwarding every RPC into
     /// the driver's event channel and awaiting the reply.
@@ -1612,6 +1658,52 @@ where
         // state immediately, not just after the first tick/RPC.
         self.record_role_transition_observations().await;
 
+        // Stage 7.2 iter-3 finding #1: drain any recovered
+        // committed-but-unapplied range BEFORE serving any RPC.
+        //
+        // Server::start_with_state_machine restores the state
+        // machine from the latest local snapshot, then raises
+        // `node.commit_index` from the persisted hard-state
+        // checkpoint (clamped against the durable log tip). At
+        // this point the engine may have entries in
+        // `(last_applied, commit_index]` that are committed,
+        // durable in the log, but not yet applied to the
+        // state machine. `handle_tick` is NOT a trigger for
+        // `Action::ApplyToStateMachine` — apply emission keys off
+        // commit-index ADVANCEMENT, not absolute level — so if we
+        // wait for the first tick those entries will sit in the log
+        // unapplied until the leader (eventually) re-commits them.
+        // Explicitly drain `apply_committed()` here to bring the
+        // state machine forward to the recovered commit baseline
+        // before the loop starts. Failures during the drain are
+        // halt-class (same contract as any runtime apply failure).
+        let recovery_apply = self.node.apply_committed();
+        if !recovery_apply.is_empty() {
+            info!(
+                target: "xraft_server::driver",
+                node_id = %self.node.id,
+                action_count = recovery_apply.len(),
+                last_applied_pre = self.node.last_applied.0,
+                commit_index = self.node.commit_index.0,
+                "draining recovered apply pipeline on driver startup \
+                 (Stage 7.2 iter-3 finding #1 — persisted commit_index \
+                 raised the engine past the snapshot baseline)"
+            );
+            let _ = self.process_actions(recovery_apply, None).await;
+            if self.halt_reason.is_some() {
+                error!(
+                    target: "xraft_server::driver",
+                    node_id = %self.node.id,
+                    reason = %self.halt_reason.as_deref().unwrap_or("unknown"),
+                    "recovery apply-drain failed; failing-stop before serving"
+                );
+                return self.fail_stop_shutdown().await;
+            }
+            // Re-publish the metrics after the drain so /health
+            // and /metrics observe the post-recovery state.
+            self.record_role_transition_observations().await;
+        }
+
         loop {
             tokio::select! {
                 biased;
@@ -2503,6 +2595,19 @@ where
         while let Some(action) = worklist.pop_front() {
             match action {
                 Action::PersistHardState => {
+                    // Stage 7.2 iter-3 finding #1: snapshot the engine's
+                    // current commit_index into the hard-state BEFORE
+                    // persisting, clamped to the durable log tip so we
+                    // never write a value pointing past entries that are
+                    // not yet appended-and-flushed. The clamp is the
+                    // safety net: if `PersistHardState` is processed
+                    // before its companion `AppendEntries` (commit
+                    // bump + new entries in the same batch), the
+                    // persisted commit_index temporarily under-reports
+                    // — that's safe (the leader will re-commit) but
+                    // never over-reports past durable log state.
+                    self.node.hard_state.commit_index =
+                        std::cmp::min(self.node.commit_index, self.log_store.last_index());
                     if let Err(e) = self.hs_store.persist(&self.node.hard_state) {
                         let msg = format!("hard-state persist failed: {e}");
                         error!(target: "xraft_server::driver", %msg, "halting driver");
@@ -3870,6 +3975,16 @@ where
         // driver contract requires that durable state matches the
         // in-memory state we are about to drop. We capture the FIRST
         // failure (persist before flush) and propagate as Err.
+        //
+        // Stage 7.2 iter-3 finding #1: clamp the commit_index
+        // snapshot to the durable log tip before the final persist,
+        // matching the per-action `PersistHardState` handler. On a
+        // graceful shutdown the engine and log are in sync (no
+        // in-flight AppendEntries), but the clamp is the contract:
+        // a persisted commit_index NEVER points past durable log
+        // state, regardless of caller ordering.
+        self.node.hard_state.commit_index =
+            std::cmp::min(self.node.commit_index, self.log_store.last_index());
         let final_err: Option<String> = match self.hs_store.persist(&self.node.hard_state) {
             Ok(()) => match self.log_store.flush() {
                 Ok(()) => None,
@@ -3989,6 +4104,7 @@ fn clone_err(err: &XResult<LogIndex>) -> XRaftError {
             XRaftError::Config(s) => XRaftError::Config(s.clone()),
             XRaftError::CorruptSnapshot(s) => XRaftError::CorruptSnapshot(s.clone()),
             XRaftError::SnapshotNotFound(s) => XRaftError::SnapshotNotFound(s.clone()),
+            XRaftError::Unsupported(s) => XRaftError::Unsupported(s.clone()),
         },
     }
 }
@@ -4100,6 +4216,7 @@ mod tests {
     #[derive(Default)]
     struct TestHardStateStore {
         state: Option<HardState>,
+        voter_set: Option<xraft_core::types::VoterSet>,
         persist_count: std::sync::atomic::AtomicUsize,
         fail_next_persist: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -4119,6 +4236,13 @@ mod tests {
         }
         fn load(&self) -> XResult<Option<HardState>> {
             Ok(self.state.clone())
+        }
+        fn persist_voter_set(&mut self, vs: &xraft_core::types::VoterSet) -> XResult<()> {
+            self.voter_set = Some(vs.clone());
+            Ok(())
+        }
+        fn load_voter_set(&self) -> XResult<Option<xraft_core::types::VoterSet>> {
+            Ok(self.voter_set.clone())
         }
     }
 
