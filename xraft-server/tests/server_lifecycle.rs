@@ -1180,20 +1180,22 @@ async fn metrics_endpoint_exposes_mvp_metric_set() {
     let _ = tokio::time::timeout(Duration::from_secs(5), handle.join()).await;
 }
 
-/// Stage 6.1's `/metrics` endpoint must expose only the MVP
-/// subset; the remaining canonical metrics from `architecture.md`
-/// §7 are added by later stages (Stage 7.1 adds
-/// `xraft_replication_lag`, `xraft_commit_latency_seconds`,
-/// `xraft_fetch_requests_total`; Stage 7.3 adds
-/// `xraft_snapshot_installs_total`, `xraft_log_end_offset`).
+/// Negative-assertion guard for Stage 7.3 metrics that are NOT
+/// yet wired into the registry. Stage 7.1's leader / replication
+/// observability extensions (`xraft_replication_lag`,
+/// `xraft_commit_latency_seconds`, `xraft_fetch_requests_total`)
+/// have ALREADY landed via the Check-Quorum-and-Leader-Lease
+/// merge, so they intentionally fall outside this list — see the
+/// companion `metrics_endpoint_exposes_mvp_metric_set` test which
+/// asserts they ARE present.
 ///
-/// This negative assertion makes the Stage 6.1 scope structural:
-/// when Stage 7.1 / 7.3 land they will need to update this list
-/// at the same time they extend the registry, preventing accidental
-/// scope creep in Stage 6.1 and giving the later stages a
-/// compile-time-style reminder via a single failing test.
+/// This negative test keeps the Stage 7.3 (log compaction) scope
+/// structural: when Stage 7.3 lands its owner must update this
+/// list at the same time it extends the registry, preventing
+/// accidental cross-stage scope creep and giving the later stage
+/// a compile-time-style reminder via a single failing test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn metrics_endpoint_excludes_post_stage_6_1_metrics() {
+async fn metrics_endpoint_excludes_stage_7_3_metrics() {
     let tmp = TempDir::new().unwrap();
     let cfg = build_server_config(&tmp);
     let handle = Server::start(cfg).await.expect("server must start");
@@ -1202,18 +1204,14 @@ async fn metrics_endpoint_excludes_post_stage_6_1_metrics() {
     let body = http_get(&handle.admin_addr.to_string(), "/metrics").await;
 
     for later_stage_metric in [
-        // Stage 7.1
-        "xraft_replication_lag",
-        "xraft_commit_latency_seconds",
-        "xraft_fetch_requests_total",
-        // Stage 7.3
+        // Stage 7.3 — log compaction metrics, not yet registered.
         "xraft_snapshot_installs_total",
         "xraft_log_end_offset",
     ] {
         assert!(
             !body.contains(later_stage_metric),
-            "Stage 6.1 /metrics must not expose '{later_stage_metric}' \
-             (it belongs to a later stage); body = {body}"
+            "/metrics must not expose '{later_stage_metric}' until Stage 7.3 \
+             registers it; body = {body}"
         );
     }
 
