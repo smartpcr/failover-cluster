@@ -24,7 +24,22 @@
 //! retriable failure with `max_retries == 0` (or with the retry budget
 //! exhausted) still evicts the channel — the contract is "transport-class
 //! error ⇒ evict", not "retried-error ⇒ evict". Unary and streaming RPC
-//! paths agree on this invariant.
+//! paths agree on this invariant. **Every** retriable eviction is logged
+//! at `tracing::Level::WARN` against `target: "xraft_transport::client"`:
+//!   - in-budget retries log `"<RPC> retriable error, backing off …"`
+//!     before invalidating (the about-to-retry path);
+//!   - budget-exhausted unary calls log `"<RPC> retriable error, retry
+//!     budget exhausted, evicting pooled channel: …"` before invalidating
+//!     and surfacing the error (the give-up path);
+//!   - mid-stream FetchSnapshot retriable errors log `"FetchSnapshot
+//!     stream retriable error, evicting pooled channel: …"` before
+//!     invalidating (no retry — whole-stream restart would corrupt
+//!     snapshot-offset book-keeping; see `# Retry policy`).
+//!
+//! Operators see every retriable failure in the SAME log stream they
+//! already filter on for in-budget retries; the streaming mid-stream
+//! path and the budget-exhausted branches formerly evicted silently,
+//! which made transport-class failures invisible at this layer.
 //!
 //! # Retry policy
 //!
@@ -426,7 +441,21 @@ impl RaftGrpcClient {
                     // unconditionally via `Self::evict_pooled_channel`;
                     // gating eviction on remaining budget here was an
                     // unary-vs-streaming inconsistency.
+                    //
+                    // Emit a `warn!` matching the in-budget retry log
+                    // shape so the budget-exhausted path is visible in
+                    // the same operator log stream. The message says
+                    // "retry budget exhausted, evicting pooled
+                    // channel" (rather than "backing off") to reflect
+                    // the actual action taken — there is no retry to
+                    // follow.
                     if Self::is_retriable(&status) {
+                        warn!(
+                            target: "xraft_transport::client",
+                            peer = peer.0,
+                            attempts = attempt + 1,
+                            "Vote RPC retriable error, retry budget exhausted, evicting pooled channel: {status}"
+                        );
                         self.invalidate(peer).await;
                     }
                     return Err(XRaftError::Transport(format!(
@@ -472,8 +501,15 @@ impl RaftGrpcClient {
                 }
                 Err(status) => {
                     // See `send_vote` for the rationale on
-                    // budget-exhausted-but-still-evict.
+                    // budget-exhausted-but-still-evict AND for the
+                    // matching `warn!` log shape.
                     if Self::is_retriable(&status) {
+                        warn!(
+                            target: "xraft_transport::client",
+                            peer = peer.0,
+                            attempts = attempt + 1,
+                            "PreVote RPC retriable error, retry budget exhausted, evicting pooled channel: {status}"
+                        );
                         self.invalidate(peer).await;
                     }
                     return Err(XRaftError::Transport(format!(
@@ -520,8 +556,15 @@ impl RaftGrpcClient {
                 }
                 Err(status) => {
                     // See `send_vote` for the rationale on
-                    // budget-exhausted-but-still-evict.
+                    // budget-exhausted-but-still-evict AND for the
+                    // matching `warn!` log shape.
                     if Self::is_retriable(&status) {
+                        warn!(
+                            target: "xraft_transport::client",
+                            peer = peer.0,
+                            attempts = attempt + 1,
+                            "Fetch RPC retriable error, retry budget exhausted, evicting pooled channel: {status}"
+                        );
                         self.invalidate(peer).await;
                     }
                     return Err(XRaftError::Transport(format!(
@@ -578,8 +621,17 @@ impl RaftGrpcClient {
                     // path below (the `.then(...)` adapter) already
                     // evicts unconditionally on retriable status; this
                     // line gives the *initial-RPC* path the same
-                    // behaviour.
+                    // behaviour AND emits the same `warn!` log shape
+                    // as the unary budget-exhausted branches so the
+                    // module-level "every retriable eviction logs"
+                    // invariant holds.
                     if Self::is_retriable(&status) {
+                        warn!(
+                            target: "xraft_transport::client",
+                            peer = peer.0,
+                            attempts = attempt + 1,
+                            "FetchSnapshot RPC init retriable error, retry budget exhausted, evicting pooled channel: {status}"
+                        );
                         self.invalidate(peer).await;
                     }
                     return Err(XRaftError::Transport(format!(
@@ -613,7 +665,29 @@ impl RaftGrpcClient {
                         // unary + streaming RPC paths. Non-retriable
                         // codes leave the cache alone — the channel
                         // is still healthy at the HTTP/2 layer.
+                        //
+                        // Emit a `warn!` line at the same target as
+                        // the unary retry paths so operators see
+                        // mid-stream evictions in the same stream of
+                        // log records they already filter on for
+                        // unary RPC failures. The unary paths log
+                        // `"<RPC> RPC retriable error, backing off
+                        // …"` BEFORE retrying; here the call is NOT
+                        // retried (whole-stream restart would corrupt
+                        // snapshot-offset book-keeping — see the
+                        // `Retry policy` doc above), so the message
+                        // says "evicting pooled channel" rather than
+                        // "backing off" to reflect the actual action
+                        // taken. Closes the observability asymmetry
+                        // where unary retriable failures were visible
+                        // in logs but streaming retriable failures
+                        // were silent at this layer.
                         if Self::is_retriable(&status) {
+                            warn!(
+                                target: "xraft_transport::client",
+                                peer = peer.0,
+                                "FetchSnapshot stream retriable error, evicting pooled channel: {status}"
+                            );
                             Self::evict_pooled_channel(&pool, peer).await;
                         }
                         Err(XRaftError::Transport(format!(

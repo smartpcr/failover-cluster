@@ -1453,3 +1453,236 @@ fn client_config_derives_all_fields_from_transport_config() {
         "tls=None on transport ⇒ tls=None on client"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scenario: warn-log capture (iter-15 fix for prior evaluator findings)
+// ---------------------------------------------------------------------------
+//
+// The module-level `# Connection pool` rustdoc on `RaftGrpcClient` now
+// claims that EVERY retriable eviction emits a `warn!` at
+// `target: "xraft_transport::client"`. The iter-14 evaluator flagged
+// two gaps in that contract:
+//
+//   1. Unary budget-exhausted eviction branches (`send_vote` /
+//      `send_pre_vote` / `send_fetch` / initial `send_fetch_snapshot`)
+//      were evicting silently — only the in-budget retry branches and
+//      the mid-stream FetchSnapshot path had `warn!` lines. Iter 15
+//      adds matching warn logs to the four budget-exhausted branches.
+//   2. The new mid-stream FetchSnapshot warn (iter-14) was not
+//      asserted by any test — only the eviction side-effect
+//      (`pool_size() == 0`) was checked.
+//
+// The tests below close both gaps by installing a process-global
+// tracing subscriber backed by an in-memory buffer (using the SAME
+// `CaptureWriter` shape `xraft-core/src/node.rs::even_voter_warning`
+// uses for `with_default` in sync tests, lifted to a `set_global_default`
+// so warn! emitted from tokio-spawned tasks is captured regardless of
+// which worker thread polled them) and snapshot-then-diff the buffer
+// across the RPC call. Substring matches are deliberately specific
+// (e.g. `"FetchSnapshot stream retriable error"`, `"Fetch RPC
+// retriable error, retry budget exhausted"`) so parallel tests
+// emitting their own warns do not produce false positives.
+
+fn warn_capture_buffer() -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static BUF: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+    BUF.get_or_init(|| Arc::new(Mutex::new(Vec::new()))).clone()
+}
+
+#[derive(Clone)]
+struct WarnCaptureWriter;
+
+impl std::io::Write for WarnCaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        warn_capture_buffer().lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for WarnCaptureWriter {
+    type Writer = WarnCaptureWriter;
+    fn make_writer(&'a self) -> WarnCaptureWriter {
+        WarnCaptureWriter
+    }
+}
+
+/// Install a global tracing subscriber that funnels every WARN-level
+/// event into `warn_capture_buffer()` exactly once per test-binary
+/// process. Calling this from multiple tests is safe — the
+/// `OnceLock` guarantees a single `set_global_default` call, and the
+/// `let _ = …` swallows the `Err` if some other code already set a
+/// global default first.
+fn install_warn_capture_subscriber_once() {
+    use std::sync::OnceLock;
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let subscriber = tracing_subscriber::FmtSubscriber::builder()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(WarnCaptureWriter)
+            .with_ansi(false)
+            .with_target(true)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+
+/// Snapshot the current length of the capture buffer so the caller
+/// can read only the bytes appended during the RPC under test.
+fn warn_capture_len_snapshot() -> usize {
+    warn_capture_buffer().lock().unwrap().len()
+}
+
+/// Return the bytes appended to the capture buffer since
+/// `before_len`, decoded lossily into UTF-8. Tests assert presence
+/// of specific substrings within this slice rather than the whole
+/// buffer so parallel tests do not interfere.
+fn warn_capture_diff_since(before_len: usize) -> String {
+    let buf_arc = warn_capture_buffer();
+    let buf = buf_arc.lock().unwrap();
+    String::from_utf8_lossy(&buf[before_len..]).to_string()
+}
+
+#[tokio::test]
+async fn fetch_snapshot_mid_stream_retriable_emits_warn_log() {
+    use futures::StreamExt as _;
+
+    install_warn_capture_subscriber_once();
+
+    let (port, std_listener) = bind_ephemeral();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let endpoint = format!("http://127.0.0.1:{port}");
+
+    // Stub configured to fail mid-stream after the first chunk. The
+    // server adapter maps `XRaftError::Transport` to
+    // `Status::unavailable`, which is the retriable code the
+    // streaming `.then(...)` warn-then-evict branch keys off.
+    let handler = StubHandler::with_mid_stream_error();
+    let (shutdown, srv_handle) = spawn_plain_server(std_listener, handler.clone());
+    wait_for_listening(addr, Duration::from_secs(2)).await;
+
+    let mut cfg = client_config(endpoint);
+    cfg.max_retries = 0;
+    let client = RaftGrpcClient::new(cfg);
+
+    let req = FetchSnapshotRequest {
+        cluster_id: TEST_CLUSTER_ID.to_string(),
+        leader_epoch: TEST_LEADER_EPOCH,
+        replica_id: NodeId(CLIENT_NODE_ID),
+        snapshot_id: "snap-test".to_string(),
+        offset: 0,
+        max_bytes: 0,
+    };
+    let mut stream = client
+        .send_fetch_snapshot(NodeId(SERVER_NODE_ID), req)
+        .await
+        .expect("initial RPC succeeds; failure is mid-stream");
+
+    // First chunk: Ok.
+    let _ = stream
+        .next()
+        .await
+        .expect("stream yields a first item")
+        .expect("first chunk decodes ok");
+
+    // Take the snapshot HERE — right before the call that should
+    // emit the warn — so the diff is as narrow as possible and
+    // interleaved warns from parallel tests are minimised.
+    let before = warn_capture_len_snapshot();
+
+    // Second item: the synthetic Err. The `.then(...)` closure's
+    // retriable branch should fire `warn!` BEFORE evicting.
+    let second = stream.next().await.expect("stream yields a second item");
+    assert!(
+        second.is_err(),
+        "second item must be the mid-stream transport error"
+    );
+
+    // The .then closure awaits `Self::evict_pooled_channel` AFTER
+    // emitting `warn!`, so by the time the Err reaches the consumer
+    // the warn has already been formatted into the capture buffer.
+    let captured = warn_capture_diff_since(before);
+    assert!(
+        captured.contains("FetchSnapshot stream retriable error"),
+        "mid-stream eviction warn! must appear in captured log; got: {captured}"
+    );
+    assert!(
+        captured.contains("xraft_transport::client"),
+        "warn target must be 'xraft_transport::client'; got: {captured}"
+    );
+    assert!(
+        captured.contains("WARN"),
+        "captured event must be at WARN level; got: {captured}"
+    );
+    assert!(
+        captured.contains("evicting pooled channel"),
+        "warn message must announce the eviction action; got: {captured}"
+    );
+
+    shutdown.notify_one();
+    srv_handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn unary_budget_exhausted_retriable_emits_warn_log() {
+    install_warn_capture_subscriber_once();
+
+    let (port, std_listener) = bind_ephemeral();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let endpoint = format!("http://127.0.0.1:{port}");
+
+    let handler = StubHandler::new();
+    let (shutdown, srv_handle) = spawn_plain_server(std_listener, handler.clone());
+    wait_for_listening(addr, Duration::from_secs(2)).await;
+
+    // max_retries = 0 sends the very first retriable failure straight
+    // to the budget-exhausted branch — the path the iter-14 evaluator
+    // flagged as silently evicting.
+    let mut cfg = client_config(endpoint);
+    cfg.max_retries = 0;
+    let client = RaftGrpcClient::new(cfg);
+
+    // Warm the pool with a successful Vote so the subsequent Fetch
+    // is operating against a cached channel; this proves the warn
+    // fires on the give-up path, not on a connect failure.
+    let _ = client
+        .send_vote(NodeId(SERVER_NODE_ID), sample_vote_request())
+        .await
+        .expect("warm-up vote succeeds");
+
+    // Flip the stub: every subsequent Fetch returns
+    // `XRaftError::Transport`, which the server adapter maps to
+    // `Status::unavailable` (the retriable code that drives the
+    // unary eviction policy).
+    handler.fetch_always_fails.store(true, Ordering::SeqCst);
+
+    let before = warn_capture_len_snapshot();
+
+    let _err = client
+        .send_fetch(NodeId(SERVER_NODE_ID), sample_fetch_request(202))
+        .await
+        .expect_err("Fetch must surface the retriable transport failure");
+
+    let captured = warn_capture_diff_since(before);
+    assert!(
+        captured.contains("Fetch RPC retriable error, retry budget exhausted"),
+        "unary budget-exhausted warn! must appear in captured log; got: {captured}"
+    );
+    assert!(
+        captured.contains("xraft_transport::client"),
+        "warn target must be 'xraft_transport::client'; got: {captured}"
+    );
+    assert!(
+        captured.contains("WARN"),
+        "captured event must be at WARN level; got: {captured}"
+    );
+    assert!(
+        captured.contains("evicting pooled channel"),
+        "warn message must announce the eviction action; got: {captured}"
+    );
+
+    shutdown.notify_one();
+    srv_handle.await.unwrap().unwrap();
+}
