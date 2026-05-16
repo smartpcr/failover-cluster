@@ -434,9 +434,36 @@ impl NodeState {
             high_watermark: self.high_watermark,
             voter_set: self.voter_set.clone(),
         }
+    }
+
+    /// Record a proposed membership change (architecture §5.5).
+    ///
+    /// Stores a `PendingMembershipChange` describing an uncommitted
+    /// VotersRecord at log `offset` so that dual-quorum HW advancement uses
+    /// `voters` for entries at or after `offset`. `promoted_node_id` /
+    /// `promoted_endpoint` identify the observer being added as a voter and
+    /// are retained so the observer can be restored if the VotersRecord is
+    /// later truncated.
+    ///
+    /// xraft permits at most one in-flight membership change; calling this
+    /// while a pending change already exists returns `LogStoreError`.
+    pub fn propose_membership_change(
+        &mut self,
+        offset: u64,
+        voters: Vec<VoterInfo>,
+        promoted_node_id: NodeId,
+        promoted_endpoint: Endpoint,
+    ) -> Result<(), LogStoreError> {
+        if self.pending_membership_change.is_some() {
+            return Err(LogStoreError::new(
+                "cannot propose membership change: another change is already pending",
+            ));
+        }
         self.pending_membership_change = Some(PendingMembershipChange {
             offset,
-            proposed_voter_set,
+            voters,
+            promoted_node_id,
+            promoted_endpoint,
         });
         Ok(())
     }
