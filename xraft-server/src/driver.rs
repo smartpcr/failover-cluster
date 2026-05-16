@@ -4494,9 +4494,8 @@ mod tests {
 
     impl StateMachine for TestStateMachine {
         fn apply(&mut self, index: LogIndex, command: &[u8]) -> XResult<Vec<u8>> {
-            if self
-                .fail_next_apply
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            if let Some(fail_idx) = *self.fail_apply_at.lock().unwrap()
+                && fail_idx == index
             {
                 return Err(XRaftError::Storage(format!(
                     "injected apply failure at {index}"
