@@ -10,145 +10,10 @@ status: "planned"
 
 # Raft Node State Machine — Design Narrative
 
-## Design provenance
-
-This spec was iterated against an automated evaluator across multiple rounds.
-Resolved per-iteration decisions are folded into the body (see `## Resolved
-Decisions` and `## Cross-Document Supersedes`); historical per-iteration
-checklists live in the commit messages and the workstream's `## Iteration
-Summary` tab rather than in this long-lived document.
-
-### Prior feedback resolution (iteration 5)
-
-The iteration-4 evaluator (score 86) raised three concrete gaps. Each is
-addressed in this iteration:
-
-1. `ADDRESSED` — **YAML folded scalar splits identifiers.** The
-   `step-single-voter-self-quorum-cascade` entry in `wit-tree.yaml` no
-   longer embeds the four identifiers
-   (`single-voter-cluster-auto-promotes-to-leader`,
-   `single_voter_cluster_auto_promotes_to_leader`,
-   `election-loop-in-single-voter-cluster-via-tick`,
-   `election_loop_in_single_voter_cluster_via_tick`) inside a folded
-   `description:` block where YAML's `>-` folding could insert spaces
-   into the identifier. Every identifier now lives as an atomic,
-   double-quoted YAML scalar under a new structured
-   `test_obligations:` field (verified by `yaml.safe_load` round-trip
-   in this commit). The folded `description:` only contains prose.
-2. `ADDRESSED` — **Backtick-wrapped identifier split across lines in
-   `plan.md` Resolved Decisions.** Item 2 of `## Resolved Decisions`
-   was rewritten so each backtick-quoted identifier sits on a single
-   physical source line; the same atomic-identifier discipline is
-   used in the rewritten Step 2.5 narrative.
-3. `ADDRESSED` — **Weakened action-order / zero-`SendMessage`
-   obligation on the direct `become_candidate()` scenario.** Step 2.5
-   in this plan and the `test_obligations` block in `wit-tree.yaml`
-   now explicitly separate (a) **existing source assertions** — what
-   `xraft-core/src/node.rs::single_voter_cluster_auto_promotes_to_leader`
-   already verifies (role, membership of `PersistHardState`,
-   `BecomeLeader`, `AppendEntries(no-op)`) — from (b) **spec
-   hardening assertions Stage 3.1 MUST add** when the test is updated
-   (`current_term() == Term(1)`, zero `SendMessage`, and the strict
-   `PersistHardState`-emitted-first action ordering). This restores
-   the strong contract the iter-2 plan had while staying honest about
-   what the current source test does and does not yet prove.
-
-A fourth iter-4 finding — that "nearby dependencies still reference
-`phase-raft-consensus-engine`" in `implementation-plan.md` — was
-re-verified against the current file and is `NOT FOUND` for
-dependency anchors. Every `Dependencies:` line in
-`docs/stories/failover-cluster-XRAFT/implementation-plan.md` now uses
-the canonical `phase-consensus-engine` anchor: the anchored grep
-`grep -n "^- phase-raft-consensus-engine"
-docs/stories/failover-cluster-XRAFT/implementation-plan.md` returns
-zero matches, while `grep -n "^- phase-consensus-engine"
-docs/stories/failover-cluster-XRAFT/implementation-plan.md` returns
-four matches — Stage 3.2's dep on
-`phase-consensus-engine/stage-raft-node-state-machine`, Stage 3.3's
-dep on `phase-consensus-engine/stage-leader-election`, Phase 4's
-parent dep on `phase-consensus-engine`, and Phase 5's parent dep on
-`phase-consensus-engine`. The unanchored grep
-`grep "phase-raft-consensus-engine"
-docs/stories/failover-cluster-XRAFT/implementation-plan.md` matches
-*only* the new Stage 3.1 "Canonical anchor disambiguation" callout
-that quotes the full git branch name
-(`ws/failover-cluster-XRAFT/phase-raft-consensus-engine-stage-raft-node-state-machine`)
-to explain why the workstream branch is named differently from the
-canonical anchor — i.e. the only remaining matches are *prose that
-explicitly warns about the slug difference*, not dependency anchors.
-The same two surviving occurrences of `phase-raft-consensus-engine`
-in `docs/stories/failover-cluster-XRAFT/workstreams.yaml` are the
-factual git `branch:` value and its explanatory comment; these are
-not dependency anchors and would break the workstream tooling if
-renamed.
-
-### Iter-7 note: scope reaffirmation
-
-Iteration 6 attempted to also commit source-side hardening assertions
-to `xraft-core/src/node.rs::single_voter_cluster_auto_promotes_to_leader`
-(the three Step 2.5 checks: `current_term() == Term(1)`, zero
-`Action::SendMessage`, and the strict `PersistHardState`-first
-ordering). That source-side edit was prepared in the working tree
-but never committed because **the planning brief explicitly forbids
-modifying source files outside `docs/specs/`** ("Do NOT write
-application code, tests, or modify source files outside
-`docs/specs/`"). Iteration 7 reverts the unstaged source-tree
-modification and keeps the iter-5 design narrative as the canonical
-contract; the three Step 2.5 hardening assertions remain
-**implementation-PR obligations** owned by the engineer who lands
-the `step-single-voter-self-quorum-cascade` step, not by this
-planning document. The attribution is tightened in Step 2.5 below
-and in `wit-tree.yaml` under the new
-`implementation_pr_owner` field on every entry of
-`step-single-voter-self-quorum-cascade.test_obligations`.
-
-### Prior feedback resolution (iteration 8)
-
-The two most-recent evaluator turns (iter 53 and iter 54 in the
-chain shown in this iteration's brief) both reported the score-0
-generator/pipeline transient (`generator-inactive`, "empty
-assistant text"). The brief explicitly says: "This is a pipeline
-fault, not feedback on your work. Do NOT rewrite your prior work
-in response. Re-run your build / tests once and wait for the next
-evaluator turn." Iteration 8 honours that instruction:
-
-1. `ADDRESSED — pipeline-transient handling`. No substantive
-   rewrite of `plan.md` or `wit-tree.yaml` body sections is made
-   in response to the two transient turns. The iter-7 design
-   narrative (commit `af288c6`) remains the canonical contract.
-2. `ADDRESSED — prior actionable critique re-verified`. The last
-   actionable critique aimed at the *plan* chain (iter-4 → iter-5,
-   plus the iter-7 self-audit) was already fully addressed in
-   commit `af288c6`: YAML folded-scalar identifier splits removed
-   (atomic scalars under `test_obligations`), spec hardening
-   assertions reattributed as implementation-PR obligations
-   (`spec_hardening_assertions_owner_note` +
-   `implementation_pr_owner` in `wit-tree.yaml`), and the cross-doc
-   dependency anchors normalised to `phase-consensus-engine`. This
-   iteration re-grepped both files and confirms zero regressions.
-3. `ADDRESSED — backup-artefact operator answers honoured`. Both
-   operator answers cited in this iteration's brief
-   (`delete-leftover-backup-artefacts` → "Yes, delete all five
-   backup artefacts in this Stage 3.1 workstream's next iter";
-   `stage-3-1-leftover-backup-files-cleanup` →
-   "delete-via-future-workstream") are accommodated by the
-   current state of this worktree: `git ls-files | grep -E
-   "(review-backup|iter-snapshot\.bak)"` returns **zero matches**,
-   meaning the artefacts are not tracked here and there is nothing
-   to delete in this commit. The Open Questions entry is updated
-   below to record the verified-empty state instead of citing a
-   single answer in isolation.
-4. `DEFERRED — implementation-chain critiques (iter-53 score-89
-   "UNVERIFIED CLAIM" and iter-54 stalled-questions)` apply to the
-   sibling **implementation** evaluator chain (they reference
-   `.forge/iter-notes.md`, `xraft-server/src/driver.rs:1366`,
-   `xraft-core/src/node.rs:step`, and the `cargo test` gate on
-   `xraft-server --lib`). The planning iteration cannot address
-   them because the brief forbids touching files outside
-   `docs/specs/`, and `.forge/iter-notes.md` is not present in
-   this worktree (`git ls-files .forge/` returns zero matches).
-   These critiques are owned by the next implementation
-   iteration on this branch.
+Iteration history and evaluator-resolution checklists live in the git log of
+this branch and in the workstream's `## Iteration Summary` tab; this
+document records only durable design decisions for the Stage 3.1 Raft Node
+State Machine contract.
 
 ## Context and Intent
 
@@ -631,29 +496,10 @@ These were open questions in earlier iterations and are now resolved:
    before any `SendMessage` that depends on the persisted field" —
    encoded by always pushing `PersistHardState` first in the
    affected transitions.
-
-## Open Questions
-
-1. **Leftover backup artefacts (`xraft-core/src/node.rs.review-backup`
-   and `docs/stories/failover-cluster-XRAFT/*.iter-snapshot.bak`).**
-   Two operator answers exist in the iteration brief:
-   `delete-leftover-backup-artefacts` says "Yes, delete all five
-   backup artefacts in this Stage 3.1 workstream's next iter", and
-   the more-specific follow-up
-   `stage-3-1-leftover-backup-files-cleanup` says
-   `delete-via-future-workstream`. As of iteration 8, both are
-   moot for *this* worktree: `git ls-files` filtered by
-   `(review-backup|iter-snapshot\.bak)` returns **zero matches**
-   (verified this iteration), and `Get-ChildItem -Recurse -Force`
-   over the working tree finds no on-disk artefacts either. Both
-   globs (`*.iter-snapshot.bak` and `*.review-backup`) are also
-   covered by the repo-level `.gitignore` (lines 9 and 10), so
-   any artefact that does appear in a future iteration's working
-   tree is automatically untracked. Nothing remains to delete in
-   the Stage 3.1 worktree, so no source-tree mutation belongs in
-   this planning iteration. If a future iteration imports the
-   artefacts from a sibling worktree, the implementation
-   workstream named in
-   `stage-3-1-leftover-backup-files-cleanup` will own removal.
-   This planning document does not modify files outside
-   `docs/specs/` regardless — the brief forbids it.
+4. **Backup artefacts are out of contract.** Backup and snapshot
+   artefacts (`*.review-backup`, `*.iter-snapshot.bak`) are not part
+   of the Stage 3.1 design contract. The repository's `.gitignore`
+   covers both patterns, so any such files that appear in a working
+   tree are untracked by design. Any cleanup of such artefacts
+   outside this worktree belongs to a dedicated cleanup workstream,
+   not this planning stage.
