@@ -60,6 +60,40 @@ fn pick_free_port() -> u16 {
     port
 }
 
+/// Bind an ephemeral port and KEEP the listener so the port stays
+/// reserved through the hand-off to `spawn_plain_server_from_listener`.
+///
+/// Race-free alternative to `pick_free_port` + `spawn_plain_server`:
+/// the original two-step (bind probe → drop → re-bind inside a spawned
+/// task) opens a window for another process or parallel test to snatch
+/// the port between the drop and the re-bind. That window is what
+/// produced the iter 6 post-pass gate flake
+/// "Fetch connect to peer 2 after 9 attempts: connect to peer 2:
+/// transport error" on `pool_fetch_via_leader_follows_advertised_leader`
+/// — the leader server's bind silently failed inside its spawned task
+/// while the redirect Fetch retried into an empty port.
+///
+/// The returned `std::net::TcpListener` is consumed by
+/// `spawn_plain_server_from_listener`, which converts it into a
+/// `tokio::net::TcpListener` and feeds
+/// `tonic::Server::serve_with_incoming_shutdown` — the same
+/// pre-bound-listener pattern production uses in
+/// `xraft-transport/src/grpc.rs::start_server_with_listener`.
+fn bind_test_listener() -> (TcpListener, std::net::SocketAddr) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("listener local_addr");
+    // tonic's `serve_with_incoming_shutdown` drives the listener with
+    // tokio's async accept loop, which requires the underlying socket
+    // to be in non-blocking mode. `tokio::net::TcpListener::from_std`
+    // *does not* flip the flag for us — leaving the std listener in
+    // blocking mode produces a `WouldBlock`-storm panic the first time
+    // tonic polls the accept future.
+    listener
+        .set_nonblocking(true)
+        .expect("set listener to non-blocking");
+    (listener, addr)
+}
+
 /// Wait up to `timeout` for `addr` to accept TCP connections. Used
 /// to bridge the race between `tonic::Server::serve_with_shutdown`
 /// returning the spawned future and the OS-level accept queue being
@@ -213,6 +247,43 @@ fn spawn_plain_server<H: RaftMessageHandler + Send + Sync + 'static>(
         tonic::transport::Server::builder()
             .add_service(svc)
             .serve_with_shutdown(addr, async move {
+                shutdown_clone.notified().await;
+            })
+            .await
+    });
+    (shutdown, handle)
+}
+
+/// Spawn a tonic server that adopts an ALREADY-BOUND `TcpListener`
+/// instead of re-binding the address inside the spawned task.
+///
+/// Paired with `bind_test_listener` to close the bind race that the
+/// `pick_free_port` + `spawn_plain_server` pair leaves open between
+/// dropping the probe listener and rebinding inside the spawn. Used by
+/// `pool_fetch_via_leader_follows_advertised_leader` where two servers
+/// must come up concurrently and a stolen port surfaces as a
+/// "connect to peer N: transport error" retry storm during the
+/// redirect hop.
+///
+/// Mirrors `xraft-transport/src/grpc.rs::start_server_with_listener`
+/// which is the production path for the same pattern.
+fn spawn_plain_server_from_listener<H: RaftMessageHandler + Send + Sync + 'static>(
+    std_listener: TcpListener,
+    handler: Arc<H>,
+) -> (
+    Arc<Notify>,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+) {
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_clone = shutdown.clone();
+    let svc = RaftGrpcServer::new(handler).into_service();
+    let handle = tokio::spawn(async move {
+        let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
+            .expect("convert std TcpListener to tokio TcpListener");
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(tokio_listener);
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(incoming, async move {
                 shutdown_clone.notified().await;
             })
             .await
@@ -374,17 +445,23 @@ async fn peer_client_reconnect_after_restart() {
 /// and surface the leader's response to the caller.
 #[tokio::test]
 async fn pool_fetch_via_leader_follows_advertised_leader() {
-    let follower_port = pick_free_port();
-    let leader_port = pick_free_port();
-    let follower_addr: std::net::SocketAddr = format!("127.0.0.1:{follower_port}").parse().unwrap();
-    let leader_addr: std::net::SocketAddr = format!("127.0.0.1:{leader_port}").parse().unwrap();
+    // Use the held-listener variant so the leader / follower ports
+    // can't be stolen between `bind` and `serve`. See
+    // `bind_test_listener` / `spawn_plain_server_from_listener` doc
+    // comments for why the drop-then-rebind pattern flakes under
+    // parallel `cargo test`.
+    let (follower_listener, follower_addr) = bind_test_listener();
+    let (leader_listener, leader_addr) = bind_test_listener();
+    let follower_port = follower_addr.port();
+    let leader_port = leader_addr.port();
 
     // Stand up two servers: node 1 = follower that points to leader_id=2,
     //                       node 2 = leader (is_leader=true).
     let follower_handler = StubHandler::follower_pointing_to(2);
     let leader_handler = StubHandler::leader(2);
-    let (sh_f, jh_f) = spawn_plain_server(follower_addr, follower_handler.clone());
-    let (sh_l, jh_l) = spawn_plain_server(leader_addr, leader_handler.clone());
+    let (sh_f, jh_f) =
+        spawn_plain_server_from_listener(follower_listener, follower_handler.clone());
+    let (sh_l, jh_l) = spawn_plain_server_from_listener(leader_listener, leader_handler.clone());
     wait_for_listening(follower_addr, Duration::from_secs(2)).await;
     wait_for_listening(leader_addr, Duration::from_secs(2)).await;
 
