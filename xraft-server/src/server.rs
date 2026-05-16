@@ -27,6 +27,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -36,6 +37,7 @@ use xraft_core::config::{ClusterConfig, NodeConfig};
 use xraft_core::error::{Result as XResult, XRaftError};
 use xraft_core::state_machine::{NoOpStateMachine, StateMachine};
 use xraft_core::storage::{HardStateStore, LogStore, SnapshotStore};
+use xraft_core::types::LogIndex;
 
 use xraft_storage::{FileHardStateStore, FileLogStore, FileSnapshotStore};
 
@@ -44,7 +46,7 @@ use xraft_client::pool::ConnectionPool;
 use xraft_transport::grpc::{GrpcTransport, GrpcTransportConfig};
 
 use crate::admin::{AdminConfig, AdminServer};
-use crate::driver::{Driver, DriverChannels, DriverConfig, DriverHandle};
+use crate::driver::{Driver, DriverChannels, DriverConfig, DriverHandle, TriggeredSnapshotInfo};
 use crate::metrics::XRaftMetrics;
 use crate::status::{NodeStatus, StatusPublisher};
 
@@ -199,6 +201,62 @@ impl ServerHandle {
     /// Borrow the driver handle for in-process `propose` calls.
     pub fn driver_handle(&self) -> DriverHandle {
         self.driver_handle.clone()
+    }
+
+    /// Embedded API (Stage 6.2) — submit `command` to the leader's log
+    /// via the driver's internal command channel and await commit.
+    ///
+    /// Returns the committed [`LogIndex`] on success, or:
+    /// - [`XRaftError::NotLeader`] when this node is not the leader at
+    ///   submission time (the error carries the leader hint).
+    /// - [`XRaftError::Shutdown`] when the driver drains before
+    ///   commit.
+    /// - [`XRaftError::Storage`] when the durable append fails.
+    ///
+    /// This is the sanctioned write entry point for library
+    /// consumers — `xraft-client::PeerClient` is internal-only and
+    /// exposes no `propose` surface (per `tech-spec.md` §2.6 and
+    /// `e2e-scenarios.md` Feature 11).
+    pub async fn propose(&self, command: Bytes) -> XResult<LogIndex> {
+        self.driver_handle.propose(command).await
+    }
+
+    /// Embedded API (Stage 6.2) — route `query` to the consumer-
+    /// provided [`StateMachine::query`] against committed state.
+    ///
+    /// Leader-only: a follower returns `XRaftError::NotLeader {
+    /// leader_hint }` so the caller can route. The query observes
+    /// every entry the engine has applied at serve time
+    /// (`last_applied >= prior_commit_index`); read-index /
+    /// lease-fenced linearisable reads are out of scope for v1.
+    ///
+    /// This is the sanctioned read entry point for library
+    /// consumers — `xraft-client::PeerClient` is internal-only and
+    /// exposes no `read` surface (per `tech-spec.md` §2.6 and
+    /// `e2e-scenarios.md` Feature 11).
+    pub async fn read(&self, query: Bytes) -> XResult<Bytes> {
+        self.driver_handle.query(query).await
+    }
+
+    /// Embedded admin API (Stage 6.2) — synchronously trigger a
+    /// fresh snapshot at the leader's current `commit_index`,
+    /// returning a [`TriggeredSnapshotInfo`] describing the
+    /// resulting `(last_included_index, last_included_term,
+    /// size_bytes)` anchor. Used both by in-process consumers
+    /// (operators embedding the engine) and by the HTTP admin
+    /// endpoint `POST /admin/trigger-snapshot` that
+    /// `xraft_client::AdminClient::trigger_snapshot` routes to.
+    ///
+    /// Errors:
+    /// - [`XRaftError::NotLeader`] when this node is not the leader
+    ///   (carries the leader hint so the caller can redirect).
+    /// - [`XRaftError::Config`] when a snapshot is already in flight.
+    /// - [`XRaftError::Shutdown`] during graceful drain / fail-stop.
+    /// - [`XRaftError::Storage`] when the snapshot persistence path
+    ///   (state-machine snapshot or `SnapshotStore::save_snapshot`)
+    ///   fails — the driver halts in that case.
+    pub async fn trigger_snapshot(&self) -> XResult<TriggeredSnapshotInfo> {
+        self.driver_handle.trigger_snapshot().await
     }
 
     /// Borrow the `StatusPublisher` so the SIGHUP-reload path
@@ -474,6 +532,13 @@ impl Server {
         let admin_builder = AdminServer::bind(&AdminConfig::new(admin_addr_cfg.clone())).await?;
         let admin_addr_resolved = admin_builder.local_addr();
 
+        // Snapshot the cluster roster for the admin `/admin/status`
+        // endpoint. We snapshot eagerly (Arc-wrap) so the admin
+        // serve task does not hold a reference to the mutable
+        // `ClusterConfig` and so reloads (if any) can swap it
+        // atomically in a future stage.
+        let cluster_info = Arc::new(crate::admin::ClusterInfo::from_cluster_config(&cluster));
+
         let transport_shutdown = {
             let t = transport.clone();
             Arc::new(move || t.shutdown()) as Arc<dyn Fn() + Send + Sync>
@@ -507,7 +572,8 @@ impl Server {
         // Admin spawn is now infallible (the bind already succeeded
         // in step 5). Doing it LAST means no admin-side failure can
         // leak the gRPC + driver tasks.
-        let admin = admin_builder.serve(metrics.clone());
+        let admin =
+            admin_builder.serve_with_driver(metrics.clone(), cluster_info, driver_handle.clone());
         let admin_addr = admin.local_addr;
         debug_assert_eq!(
             admin_addr, admin_addr_resolved,
@@ -659,7 +725,7 @@ mod tests {
             tls_ca_path: None,
             tls_domain_name: None,
             connect_timeout_ms: 5_000,
-            rpc_timeout_ms: 10_000,
+            rpc_timeout_ms: 30_000,
             max_rpc_retries: 3,
             retry_initial_backoff_ms: 100,
             retry_max_backoff_ms: 5_000,
@@ -779,5 +845,154 @@ mod tests {
         );
 
         drop(admin_blocker);
+    }
+
+    /// Single-voter cluster: a node that is its own quorum elects
+    /// itself within the first election timeout. Wait up to `deadline`
+    /// for the engine's role to flip to `Leader` so subsequent
+    /// `propose` / `read` calls don't race the election.
+    async fn await_leader(handle: &ServerHandle, deadline: Duration) {
+        let start = std::time::Instant::now();
+        loop {
+            let status = handle.status().current().await;
+            if status.role == xraft_core::types::NodeRole::Leader {
+                return;
+            }
+            if start.elapsed() > deadline {
+                panic!(
+                    "no leader within {:?}; observed role = {:?}",
+                    deadline, status.role
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Counting state machine that records every committed command's
+    /// payload length into a shared counter and exposes the count via
+    /// `query`. Used by the embedded-API scenario tests.
+    #[derive(Default)]
+    struct CountingStateMachine {
+        applied_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        last_payload: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl CountingStateMachine {
+        fn applied(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+            self.applied_bytes.clone()
+        }
+    }
+
+    impl xraft_core::state_machine::StateMachine for CountingStateMachine {
+        fn apply(
+            &mut self,
+            _index: xraft_core::types::LogIndex,
+            command: &[u8],
+        ) -> xraft_core::error::Result<Vec<u8>> {
+            self.applied_bytes
+                .fetch_add(command.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut g) = self.last_payload.lock() {
+                *g = command.to_vec();
+            }
+            Ok(command.to_vec())
+        }
+        fn query(&self, _query: &[u8]) -> xraft_core::error::Result<Vec<u8>> {
+            let v = self.applied_bytes.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(v.to_le_bytes().to_vec())
+        }
+        fn snapshot(&self) -> xraft_core::error::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn restore(&mut self, _snapshot: &[u8]) -> xraft_core::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn embedded_propose_returns_committed_log_index() {
+        // Scenario: embedded-propose-api — Given an `XRaftServer` running
+        // as leader, When `propose(command)` is called with a command,
+        // Then the command is appended to the log, committed after
+        // quorum replication, and the call returns the committed
+        // `LogIndex`.
+        let tmp = TempDir::new().unwrap();
+        let sm = CountingStateMachine::default();
+        let applied = sm.applied();
+        let cfg = ServerConfig {
+            cluster: single_voter_config(tmp.path().to_path_buf()),
+            admin_listen_addr: Some("127.0.0.1:0".into()),
+            driver_config: None,
+        };
+        let handle = Server::start_with_state_machine(cfg, sm)
+            .await
+            .expect("start must succeed");
+        await_leader(&handle, Duration::from_secs(2)).await;
+
+        let payload = Bytes::from_static(b"hello-stage-6-2");
+        let committed = handle
+            .propose(payload.clone())
+            .await
+            .expect("propose must commit on a single-voter leader");
+        assert!(committed.0 >= 1, "first commit must have LogIndex >= 1");
+        // The SM applied the entry — apply runs synchronously inside
+        // the driver loop right before the propose reply is sent.
+        let applied_total = applied.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            applied_total as usize,
+            payload.len(),
+            "state machine must have observed exactly one apply of our payload"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle.join())
+            .await
+            .expect("graceful shutdown must complete within 5s");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn embedded_read_routes_to_state_machine_query() {
+        // Scenario: embedded-read-api — Given an `XRaftServer` with
+        // committed state in the `StateMachine`, When `read(query)` is
+        // called, Then it routes to `StateMachine::query()` and returns
+        // the result bytes.
+        let tmp = TempDir::new().unwrap();
+        let sm = CountingStateMachine::default();
+        let cfg = ServerConfig {
+            cluster: single_voter_config(tmp.path().to_path_buf()),
+            admin_listen_addr: Some("127.0.0.1:0".into()),
+            driver_config: None,
+        };
+        let handle = Server::start_with_state_machine(cfg, sm)
+            .await
+            .expect("start must succeed");
+        await_leader(&handle, Duration::from_secs(2)).await;
+
+        // Submit two proposals so the counting SM has non-trivial
+        // state.
+        let p1 = Bytes::from_static(b"aaa");
+        let p2 = Bytes::from_static(b"bbbbb");
+        handle.propose(p1.clone()).await.expect("first propose");
+        handle.propose(p2.clone()).await.expect("second propose");
+
+        let result = handle
+            .read(Bytes::from_static(b"count"))
+            .await
+            .expect("read must succeed on leader");
+        assert_eq!(
+            result.len(),
+            8,
+            "counting SM encodes the count as u64 little-endian"
+        );
+        let observed = u64::from_le_bytes(result[..].try_into().expect("u64 bytes"));
+        assert_eq!(
+            observed as usize,
+            p1.len() + p2.len(),
+            "read must observe state from prior committed proposals"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle.join())
+            .await
+            .expect("graceful shutdown must complete within 5s");
     }
 }

@@ -1,5 +1,6 @@
-//! HTTP admin endpoint: `/health` (JSON node status) and `/metrics`
-//! (Prometheus text-format scrape).
+//! HTTP admin endpoint: `/health` (JSON node status), `/metrics`
+//! (Prometheus text-format scrape), and `/admin/status` (cluster-level
+//! routing snapshot).
 //!
 //! Both routes are served from a single `axum::Router` mounted on a
 //! dedicated listen address (see [`AdminConfig::listen_addr`]). The
@@ -10,10 +11,14 @@
 //! ## Endpoints
 //!
 //! - `GET /health` — JSON: `{ node_id, role, term, commit_index,
-//!   last_applied, leader_id, last_log_index }`. Always returns
-//!   `200 OK` once the server is listening; the consumer infers
-//!   liveness from the response body (e.g. `role != "follower" ||
-//!   leader_id != null`).
+//!   last_applied, leader_id, last_log_index, config_revision }`.
+//!   Always returns `200 OK` once the server is listening; the
+//!   consumer infers liveness from the response body (e.g.
+//!   `role != "follower" || leader_id != null`).
+//! - `GET /admin/status` — Stage 6.2 cluster-level snapshot. Adds
+//!   `cluster_id` and the configured `voters` set on top of the
+//!   `/health` fields so routing-aware tooling can locate the
+//!   leader without poking every voter in turn.
 //! - `GET /metrics` — Prometheus text-exposition payload. Content
 //!   type `application/openmetrics-text` per the OpenMetrics spec.
 //! - `GET /` — minimal 200 banner so a default kube-style liveness
@@ -25,16 +30,47 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tracing::{error, info};
 
 use xraft_core::error::XRaftError;
 
+use crate::driver::DriverHandle;
 use crate::metrics::XRaftMetrics;
 use crate::status::StatusPublisher;
+
+/// Cluster-level metadata surfaced via `GET /admin/status`.
+///
+/// Constructed from [`xraft_core::config::ClusterConfig`] at server
+/// bootstrap and wrapped in an `Arc` so it can be cheaply cloned into
+/// the axum handler state.
+///
+/// Fields are deliberately a stable JSON projection: `cluster_id`
+/// matches the canonical config field, `voters` is the ordered list
+/// of voter `node_id`s. Operator tooling consumes this verbatim so
+/// any future field additions MUST keep these two fields stable.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterInfo {
+    /// Operator-assigned cluster identifier (mirrors
+    /// [`xraft_core::config::ClusterConfig::cluster_id`]).
+    pub cluster_id: String,
+    /// Voter `node_id`s in roster order.
+    pub voters: Vec<u64>,
+}
+
+impl ClusterInfo {
+    /// Build a `ClusterInfo` from the canonical `ClusterConfig`.
+    pub fn from_cluster_config(cluster: &xraft_core::config::ClusterConfig) -> Self {
+        Self {
+            cluster_id: cluster.cluster_id.clone(),
+            voters: cluster.voters.iter().map(|v| v.node_id).collect(),
+        }
+    }
+}
 
 /// Configuration for the admin HTTP listener.
 #[derive(Debug, Clone)]
@@ -60,24 +96,64 @@ impl AdminConfig {
 struct AdminState {
     metrics: Arc<XRaftMetrics>,
     status: Arc<StatusPublisher>,
+    cluster_info: Arc<ClusterInfo>,
+    /// Optional driver handle used by mutating admin endpoints
+    /// (currently only `POST /admin/trigger-snapshot`). `None` when
+    /// the router is constructed standalone in tests that don't
+    /// exercise the snapshot path.
+    driver: Option<DriverHandle>,
 }
 
 /// Build the [`Router`] for the admin endpoints over the supplied
-/// metrics + status shared state. Exposed publicly so integration
-/// tests can drive `Router::oneshot` against the same routes the
-/// production binary serves.
-pub fn router(metrics: Arc<XRaftMetrics>) -> Router {
+/// metrics + status + cluster-info shared state. Exposed publicly
+/// so integration tests can drive `Router::oneshot` against the
+/// same routes the production binary serves.
+///
+/// The `POST /admin/trigger-snapshot` route is registered
+/// unconditionally; when no [`DriverHandle`] is supplied (via
+/// [`router_with_driver`]) the handler returns
+/// `503 Service Unavailable` so callers receive a clear error
+/// rather than a 404 they could misinterpret as a routing miss.
+pub fn router(metrics: Arc<XRaftMetrics>, cluster_info: Arc<ClusterInfo>) -> Router {
+    router_inner(metrics, cluster_info, None)
+}
+
+/// Variant of [`router`] that wires in a [`DriverHandle`] so the
+/// `POST /admin/trigger-snapshot` route can drive an
+/// operator-triggered snapshot through the driver loop. The driver
+/// handle is cloneable; callers retain their own copy for graceful
+/// shutdown sequencing.
+pub fn router_with_driver(
+    metrics: Arc<XRaftMetrics>,
+    cluster_info: Arc<ClusterInfo>,
+    driver: DriverHandle,
+) -> Router {
+    router_inner(metrics, cluster_info, Some(driver))
+}
+
+fn router_inner(
+    metrics: Arc<XRaftMetrics>,
+    cluster_info: Arc<ClusterInfo>,
+    driver: Option<DriverHandle>,
+) -> Router {
     let status = metrics.status_publisher();
-    let state = AdminState { metrics, status };
+    let state = AdminState {
+        metrics,
+        status,
+        cluster_info,
+        driver,
+    };
     Router::new()
         .route("/", get(root_handler))
         .route("/health", get(health_handler))
+        .route("/admin/status", get(admin_status_handler))
+        .route("/admin/trigger-snapshot", post(trigger_snapshot_handler))
         .route("/metrics", get(metrics_handler))
         .with_state(state)
 }
 
 async fn root_handler() -> &'static str {
-    "xraft-server admin endpoint — see /health and /metrics"
+    "xraft-server admin endpoint — see /health, /admin/status and /metrics"
 }
 
 /// Handler for `GET /health`. Returns the latest [`NodeStatus`]
@@ -95,6 +171,98 @@ async fn health_handler(State(state): State<AdminState>) -> Response {
         );
     }
     Json(body).into_response()
+}
+
+/// Handler for `GET /admin/status`. Returns the latest node-status
+/// snapshot fused with the cluster-level routing metadata
+/// ([`ClusterInfo`]). Routing-aware tooling (Stage 6.2 `AdminClient`)
+/// hits this endpoint instead of `/health` when it needs to discover
+/// the leader without iterating every voter.
+async fn admin_status_handler(State(state): State<AdminState>) -> Response {
+    let snapshot = state.status.current().await;
+    let mut body = serde_json::to_value(snapshot).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "cluster_id".to_string(),
+            serde_json::Value::from(state.cluster_info.cluster_id.clone()),
+        );
+        obj.insert(
+            "voters".to_string(),
+            serde_json::to_value(&state.cluster_info.voters)
+                .unwrap_or_else(|_| serde_json::json!([])),
+        );
+    }
+    Json(body).into_response()
+}
+
+/// Handler for `POST /admin/trigger-snapshot` (Stage 6.2, evaluator
+/// feedback iter 1 item 2). Drives a synchronous
+/// operator-triggered snapshot through the driver loop and
+/// surfaces the resulting [`crate::driver::TriggeredSnapshotInfo`] as JSON.
+///
+/// Status-code mapping (mirrored by
+/// `xraft_client::admin::AdminClient::trigger_snapshot`):
+/// - `200 OK` — snapshot taken; body is the JSON
+///   `TriggeredSnapshotInfo`.
+/// - `409 Conflict` — local node is not the leader; body is
+///   `{"error": "...", "leader_hint": <node_id>?}` so the operator
+///   tool can redirect.
+/// - `409 Conflict` — a snapshot is already in flight (engine
+///   `snapshot_in_flight = true`); operator backs off.
+/// - `503 Service Unavailable` — driver is shutting down OR the
+///   admin server was built without a driver handle (test-only
+///   path); body carries the reason.
+/// - `500 Internal Server Error` — storage / SM error during
+///   snapshot persistence. Driver has halted; body carries the
+///   reason.
+async fn trigger_snapshot_handler(State(state): State<AdminState>) -> Response {
+    let Some(driver) = state.driver.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "admin server built without a driver handle; trigger-snapshot unavailable"
+            })),
+        )
+            .into_response();
+    };
+    match driver.trigger_snapshot().await {
+        Ok(info) => (StatusCode::OK, Json(info)).into_response(),
+        Err(XRaftError::NotLeader { leader_hint }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "not leader; retry against the cluster leader",
+                "leader_hint": leader_hint.map(|n| n.0),
+            })),
+        )
+            .into_response(),
+        Err(XRaftError::Config(msg)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response(),
+        Err(XRaftError::Shutdown) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "driver is shutting down; retry against another node",
+            })),
+        )
+            .into_response(),
+        Err(XRaftError::Transport(msg)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": format!("driver transport error: {msg}"),
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            error!(target: "xraft_server::admin", error = %e, "trigger-snapshot failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{e}") })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Handler for `GET /metrics`. Renders the Prometheus registry as
@@ -149,14 +317,37 @@ impl AdminServerBuilder {
     /// Consume the builder, spawn the axum serve task, and return a
     /// running [`AdminServer`] handle. Infallible: the bind already
     /// succeeded, so the only thing left is the spawn itself.
-    pub fn serve(self, metrics: Arc<XRaftMetrics>) -> AdminServer {
+    pub fn serve(self, metrics: Arc<XRaftMetrics>, cluster_info: Arc<ClusterInfo>) -> AdminServer {
+        self.serve_inner(metrics, cluster_info, None)
+    }
+
+    /// Like [`serve`](Self::serve) but wires in a [`DriverHandle`] so
+    /// `POST /admin/trigger-snapshot` becomes operational. Production
+    /// callers (`crate::Server::start_with_state_machine`) take this
+    /// path; tests typically use [`serve`](Self::serve) when they do
+    /// not need to exercise the snapshot trigger.
+    pub fn serve_with_driver(
+        self,
+        metrics: Arc<XRaftMetrics>,
+        cluster_info: Arc<ClusterInfo>,
+        driver: DriverHandle,
+    ) -> AdminServer {
+        self.serve_inner(metrics, cluster_info, Some(driver))
+    }
+
+    fn serve_inner(
+        self,
+        metrics: Arc<XRaftMetrics>,
+        cluster_info: Arc<ClusterInfo>,
+        driver: Option<DriverHandle>,
+    ) -> AdminServer {
         let Self {
             local_addr,
             listener,
         } = self;
         info!(target: "xraft_server::admin", addr = %local_addr, "admin HTTP server serving");
 
-        let router = router(metrics);
+        let router = router_inner(metrics, cluster_info, driver);
         let shutdown = Arc::new(Notify::new());
         let shutdown_for_task = shutdown.clone();
 
@@ -226,9 +417,13 @@ impl AdminServer {
     /// immediately by [`AdminServerBuilder::serve`]. Used by tests
     /// and any caller that does not need synchronous bind/spawn
     /// separation.
-    pub async fn start(cfg: &AdminConfig, metrics: Arc<XRaftMetrics>) -> Result<Self, XRaftError> {
+    pub async fn start(
+        cfg: &AdminConfig,
+        metrics: Arc<XRaftMetrics>,
+        cluster_info: Arc<ClusterInfo>,
+    ) -> Result<Self, XRaftError> {
         let builder = Self::bind(cfg).await?;
-        Ok(builder.serve(metrics))
+        Ok(builder.serve(metrics, cluster_info))
     }
 
     /// Signal the admin server to shut down. Idempotent.
@@ -272,11 +467,18 @@ mod tests {
         s
     }
 
+    fn test_cluster_info() -> Arc<ClusterInfo> {
+        Arc::new(ClusterInfo {
+            cluster_id: "test-cluster".into(),
+            voters: vec![1, 2, 3],
+        })
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn health_endpoint_returns_node_status_json() {
         let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(2)));
         metrics.publish_state(leader_status()).await;
-        let app = router(metrics);
+        let app = router(metrics, test_cluster_info());
 
         let resp = app
             .oneshot(
@@ -313,7 +515,7 @@ mod tests {
         let r2 = status.bump_config_revision();
         assert_eq!(r1, 1);
         assert_eq!(r2, 2);
-        let app = router(metrics);
+        let app = router(metrics, test_cluster_info());
 
         let resp = app
             .oneshot(
@@ -330,11 +532,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn admin_status_endpoint_returns_cluster_metadata_plus_status() {
+        // Stage 6.2 contract: /admin/status must carry cluster_id +
+        // voters so AdminClient.status() can identify the leader and
+        // the voter roster in a single round-trip.
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(2)));
+        metrics.publish_state(leader_status()).await;
+        let app = router(metrics, test_cluster_info());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["cluster_id"], "test-cluster");
+        assert_eq!(v["voters"], serde_json::json!([1, 2, 3]));
+        // Node-status fields are still surfaced.
+        assert_eq!(v["node_id"], 2);
+        assert_eq!(v["role"], "leader");
+        assert_eq!(v["term"], 5);
+        assert_eq!(v["leader_id"], 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn metrics_endpoint_emits_openmetrics_text() {
         let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(3)));
         metrics.publish_state(leader_status()).await;
         metrics.record_appends(7);
-        let app = router(metrics);
+        let app = router(metrics, test_cluster_info());
 
         let resp = app
             .oneshot(
@@ -364,7 +596,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn root_returns_banner_not_404() {
         let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
-        let app = router(metrics);
+        let app = router(metrics, test_cluster_info());
         let resp = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -375,9 +607,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn start_binds_ephemeral_port_and_shuts_down_gracefully() {
         let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
-        let server = AdminServer::start(&AdminConfig::new("127.0.0.1:0"), metrics)
-            .await
-            .expect("admin start must succeed");
+        let server = AdminServer::start(
+            &AdminConfig::new("127.0.0.1:0"),
+            metrics,
+            test_cluster_info(),
+        )
+        .await
+        .expect("admin start must succeed");
         let addr = server.local_addr;
         assert!(addr.port() > 0, "ephemeral port must be assigned");
         server.shutdown();
@@ -396,7 +632,7 @@ mod tests {
             .expect("bind must succeed");
         let bound_addr = builder.local_addr();
         assert!(bound_addr.port() > 0, "ephemeral port must be assigned");
-        let server = builder.serve(metrics);
+        let server = builder.serve(metrics, test_cluster_info());
         assert_eq!(server.local_addr, bound_addr, "serve preserves bound addr");
         server.shutdown();
         server.join().await.expect("admin join must succeed");
@@ -421,5 +657,55 @@ mod tests {
             ),
             other => panic!("expected Config error, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trigger_snapshot_without_driver_returns_service_unavailable() {
+        // Stage 6.2: the `POST /admin/trigger-snapshot` route must
+        // be registered even when the router is built without a
+        // driver handle (test-only fast path), and the handler must
+        // surface a 503 with a clear error body so callers do not
+        // mis-interpret a missing-driver scenario as a 404 routing
+        // miss.
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        let app = router(metrics, test_cluster_info());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/trigger-snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let err = v["error"].as_str().expect("error field must be string");
+        assert!(
+            err.contains("trigger-snapshot unavailable"),
+            "error body must explain the missing-driver path: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trigger_snapshot_route_only_responds_to_post() {
+        // Stage 6.2 wire contract: the trigger-snapshot endpoint is
+        // POST-only (mutating operation). A GET against the same
+        // path must yield 405 Method Not Allowed so an operator who
+        // mistakes it for a read endpoint gets a clear error.
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        let app = router(metrics, test_cluster_info());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/trigger-snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 }

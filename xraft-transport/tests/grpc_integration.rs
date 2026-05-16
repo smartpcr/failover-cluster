@@ -105,6 +105,7 @@ impl RaftMessageHandler for StubHandler {
             entries: Vec::new(),
             diverging_epoch: None,
             snapshot_redirect: None,
+            is_leader: true,
         })
     }
 
