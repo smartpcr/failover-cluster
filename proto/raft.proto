@@ -68,6 +68,22 @@ message FetchResponse {
   uint64 high_watermark    = 4;
   repeated LogEntry entries = 5;
   optional DivergingEpoch diverging_epoch = 6;
+  // Stage 5.2 (implementation-plan §5.2 step 4): leader-side
+  // snapshot redirect. Set when the follower's `fetch_offset` is at
+  // or below the leader's compacted prefix (snapshot anchor). The
+  // follower switches to FetchSnapshot to catch up. Mutually
+  // exclusive with `entries` and `diverging_epoch`.
+  optional SnapshotRedirect snapshot_redirect = 7;
+}
+
+// Sent by the leader inside a FetchResponse when the follower's
+// `fetch_offset` falls at or below the leader's compacted prefix
+// (i.e. <= last_snapshot.last_included_index). Carries the snapshot
+// id + anchor so the follower can issue a FetchSnapshotRequest.
+message SnapshotRedirect {
+  string snapshot_id          = 1;
+  uint64 last_included_index  = 2;
+  uint64 last_included_term   = 3;
 }
 
 // ---------------------------------------------------------------------------

@@ -49,9 +49,10 @@ use crate::config::ClusterConfig;
 use crate::error::Result;
 use crate::message::Entry;
 use crate::message::{
-    Action, EntryPayload, FetchRequest, FetchResponse, Input, OutboundMessage, PreVoteRequest,
-    PreVoteResponse, VoteRequest, VoteResponse,
+    Action, EntryPayload, FetchRequest, FetchResponse, FetchSnapshotRequest, Input, LogTruncation,
+    OutboundMessage, PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse,
 };
+use crate::storage::SnapshotMeta;
 use crate::types::{HardState, LogIndex, NodeId, NodeRole, Term, VoteGrantedSet, VoterSet};
 
 // ---------------------------------------------------------------------------
@@ -308,6 +309,35 @@ pub struct RaftNode {
     /// [`Input::Tick`] emits a fresh `FetchRequest` to `leader_id`. Cleared
     /// to `None` on every role change (so a new follower fetches eagerly).
     pub last_fetch_tick: Option<u64>,
+    /// Metadata for the most recent durable snapshot, if any.
+    ///
+    /// Set on:
+    /// - [`Input::SnapshotComplete`] — the driver has finished saving a
+    ///   snapshot the engine asked for via [`Action::TakeSnapshot`].
+    /// - [`Input::SnapshotInstalled`] — the driver has finished restoring
+    ///   a leader-supplied snapshot.
+    ///
+    /// Stage 5.2 wiring — see `implementation-plan.md` §5.2.
+    pub last_snapshot_meta: Option<SnapshotMeta>,
+    /// `true` while a previously-emitted [`Action::TakeSnapshot`] has not
+    /// yet completed (the driver has not fed back
+    /// [`Input::SnapshotComplete`]). Stage 5.2 trigger debouncer (see
+    /// `implementation-plan.md` §5.2 step 1 and `maybe_take_snapshot`):
+    /// without this flag, every committed entry past the threshold would
+    /// re-emit `TakeSnapshot`, drowning the driver in duplicate snapshot
+    /// requests.
+    ///
+    /// Cleared on:
+    /// - [`Input::SnapshotComplete`] — the in-flight snapshot finished.
+    /// - [`Input::SnapshotInstalled`] — a leader-supplied snapshot
+    ///   superseded any in-flight local snapshot.
+    ///
+    /// On a fail-stop driver halt (e.g. `state_machine.snapshot()`
+    /// returns `Err`) the flag stays set, but the driver halts so no
+    /// further `step` calls happen — the operator-restart recovery path
+    /// recreates the engine from durable state with the flag at default
+    /// (`false`).
+    pub snapshot_in_flight: bool,
     /// RNG used to randomise election timeouts. Seeded from the system
     /// entropy by default; tests use [`RaftNode::new_with_seed`] for
     /// deterministic behaviour.
@@ -384,6 +414,8 @@ impl RaftNode {
             last_log_term: Term(0),
             leader_no_op_index: None,
             last_fetch_tick: None,
+            last_snapshot_meta: None,
+            snapshot_in_flight: false,
             rng: StdRng::seed_from_u64(rng.next_u64()),
         })
     }
@@ -440,6 +472,8 @@ impl RaftNode {
                 replica_id,
                 confirmed_offset,
             } => self.handle_fetch_request_acked(replica_id, confirmed_offset),
+            Input::SnapshotComplete { metadata } => self.handle_snapshot_complete(metadata),
+            Input::SnapshotInstalled { metadata } => self.handle_snapshot_installed(metadata),
         }
     }
 
@@ -812,11 +846,11 @@ impl RaftNode {
 
         // Single-voter cluster: the no-op is already replicated to a quorum
         // (just the leader), so commit_index and last_applied can advance
-        // immediately without waiting for any peer Fetch.
-        if self.try_advance_commit_index().is_some()
-            && let Some(apply) = self.maybe_apply()
-        {
-            actions.push(apply);
+        // immediately without waiting for any peer Fetch. Stage 5.2:
+        // `drain_apply_pipeline` also emits `Action::TakeSnapshot` if the
+        // post-apply log lag has crossed the configured threshold.
+        if self.try_advance_commit_index().is_some() {
+            actions.extend(self.drain_apply_pipeline());
         }
 
         actions
@@ -1366,6 +1400,70 @@ impl RaftNode {
         Some(Action::ApplyToStateMachine { from, to })
     }
 
+    /// Stage 5.2 trigger logic (`implementation-plan.md` §5.2 step 1).
+    ///
+    /// Returns [`Action::TakeSnapshot`] when:
+    /// - no snapshot is currently in flight ([`Self::snapshot_in_flight`] is
+    ///   `false`), AND
+    /// - `commit_index - last_snapshot_index > config.max_log_entries_before_compaction`.
+    ///
+    /// Sets `snapshot_in_flight = true` so subsequent `maybe_take_snapshot`
+    /// calls (made from later `step`s) won't re-emit the action while the
+    /// driver is still working on the previous one. Cleared on
+    /// [`Input::SnapshotComplete`] / [`Input::SnapshotInstalled`].
+    ///
+    /// `through_index` is set to the current `commit_index` — every entry
+    /// up to and including this index is durably committed and safe to
+    /// fold into the snapshot.
+    fn maybe_take_snapshot(&mut self) -> Option<Action> {
+        if self.snapshot_in_flight {
+            return None;
+        }
+        let snap_idx = self
+            .last_snapshot_meta
+            .as_ref()
+            .map(|m| m.last_included_index.0)
+            .unwrap_or(0);
+        let lag = self.commit_index.0.saturating_sub(snap_idx);
+        if lag > self.config.max_log_entries_before_compaction {
+            self.snapshot_in_flight = true;
+            tracing::debug!(
+                node_id = %self.id,
+                commit_index = %self.commit_index,
+                last_snapshot_index = snap_idx,
+                threshold = self.config.max_log_entries_before_compaction,
+                "snapshot threshold crossed; emitting Action::TakeSnapshot"
+            );
+            Some(Action::TakeSnapshot {
+                through_index: self.commit_index,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Stage 5.2 internal helper that bundles the standard "after a
+    /// commit-index advance" action sequence:
+    /// 1. [`Action::ApplyToStateMachine`] for the newly-committed range
+    ///    (via [`Self::maybe_apply`]),
+    /// 2. [`Action::TakeSnapshot`] when the post-apply log lag has
+    ///    crossed `max_log_entries_before_compaction`
+    ///    (via [`Self::maybe_take_snapshot`]).
+    ///
+    /// Returns the actions in the canonical order so callers can simply
+    /// `actions.extend(self.drain_apply_pipeline())`. Empty when nothing
+    /// is pending.
+    fn drain_apply_pipeline(&mut self) -> Vec<Action> {
+        let mut out = Vec::new();
+        if let Some(apply) = self.maybe_apply() {
+            out.push(apply);
+        }
+        if let Some(snap) = self.maybe_take_snapshot() {
+            out.push(snap);
+        }
+        out
+    }
+
     /// Stage 3.3 step 5 (`implementation-plan.md` ┬º3.3): emit
     /// [`Action::ApplyToStateMachine`] for every log entry between
     /// `last_applied + 1` and `commit_index`, advancing `last_applied`.
@@ -1380,8 +1478,142 @@ impl RaftNode {
     /// `become_leader` cascade on a single-voter cluster ΓÇö already calls
     /// the internal helper as part of their action sequence, so the public
     /// method exists primarily as a manual-trigger / re-entry point.
-    pub fn apply_committed(&mut self) -> Option<Action> {
-        self.maybe_apply()
+    /// Stage 3.3 step 5 (`implementation-plan.md` §3.3): emit
+    /// [`Action::ApplyToStateMachine`] for every log entry between
+    /// `last_applied + 1` and `commit_index`, advancing `last_applied`.
+    /// Returns `Vec::new()` when `last_applied == commit_index` (nothing
+    /// pending).
+    ///
+    /// This is the **public** Stage 3.3 entry point a driver can call
+    /// directly when it wants to drain the apply pipeline outside of a
+    /// regular [`step`](Self::step) call (e.g. during shutdown, snapshot
+    /// installation, or after a manual `set_last_log`/`commit_index` repair).
+    /// The standard hot path — leader after a peer ack, follower after a
+    /// `FetchResponse` HW advance, leader after `ClientPropose`,
+    /// `become_leader` cascade on a single-voter cluster — already calls
+    /// the internal helper as part of their action sequence, so the public
+    /// method exists primarily as a manual-trigger / re-entry point.
+    ///
+    /// Stage 5.2: the returned vector also carries an
+    /// [`Action::TakeSnapshot`] when the apply has crossed the snapshot
+    /// threshold (`commit_index - last_snapshot_index >
+    /// max_log_entries_before_compaction`).
+    pub fn apply_committed(&mut self) -> Vec<Action> {
+        self.drain_apply_pipeline()
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 5.2 — Snapshot Coordination (`implementation-plan.md` §5.2)
+    //
+    // The engine itself is still I/O-free: it owns no snapshot bytes, no
+    // state-machine state, and no `SnapshotStore`. The driver does the
+    // actual `state_machine.snapshot()` / `state_machine.restore()` /
+    // `SnapshotStore::save_snapshot` calls and then feeds the resulting
+    // metadata back into the engine via [`Input::SnapshotComplete`] or
+    // [`Input::SnapshotInstalled`]. These handlers update the engine's
+    // view of the most recent durable snapshot and, in the
+    // `SnapshotComplete` case, instruct the driver to compact the now-
+    // redundant log prefix via
+    // [`Action::TruncateLog`](`Action::TruncateLog`) with the
+    // [`LogTruncation::PrefixThroughInclusive`] variant.
+    // ---------------------------------------------------------------------
+
+    /// Handle [`Input::SnapshotComplete`]: the driver finished saving a
+    /// snapshot the engine asked for. Records the snapshot metadata and
+    /// emits an [`Action::TruncateLog`] of the
+    /// [`LogTruncation::PrefixThroughInclusive`] variety so the driver
+    /// can compact the log prefix that is now fully covered by the
+    /// snapshot.
+    fn handle_snapshot_complete(&mut self, metadata: SnapshotMeta) -> Vec<Action> {
+        let through = metadata.last_included_index;
+        // Raise-only update of `last_snapshot_meta`: a same- or
+        // lower-indexed completion (e.g. a stale `Input::SnapshotComplete`
+        // accidentally delivered after a newer snapshot has already been
+        // recorded) must not clobber the fresher anchor. The driver path
+        // never replays older completions in practice, but the engine
+        // enforces the invariant directly so unit tests and any future
+        // alternate driver still see coherent metadata.
+        if Self::is_snapshot_meta_newer(self.last_snapshot_meta.as_ref(), &metadata) {
+            self.last_snapshot_meta = Some(metadata);
+        }
+        // Stage 5.2 trigger debouncer: a previously-emitted
+        // `Action::TakeSnapshot` has now completed; future commit-index
+        // advances may emit another `TakeSnapshot` once the lag re-crosses
+        // the threshold.
+        self.snapshot_in_flight = false;
+        vec![Action::TruncateLog(LogTruncation::PrefixThroughInclusive {
+            through_index_inclusive: through,
+        })]
+    }
+
+    /// Returns `true` when `candidate` should replace `current` as the
+    /// node's `last_snapshot_meta` anchor. The rule is "raise-only on
+    /// `last_included_index`": `None` is always replaced; `Some(prior)`
+    /// is replaced only when `candidate.last_included_index >
+    /// prior.last_included_index`. Combined with the engine's existing
+    /// raise-only updates of `last_applied` / `commit_index` /
+    /// `last_log_*`, this keeps the entire post-snapshot state coherent
+    /// even if a stale completion or install is delivered to the engine.
+    #[inline]
+    fn is_snapshot_meta_newer(current: Option<&SnapshotMeta>, candidate: &SnapshotMeta) -> bool {
+        match current {
+            None => true,
+            Some(prior) => candidate.last_included_index > prior.last_included_index,
+        }
+    }
+
+    /// Handle [`Input::SnapshotInstalled`]: the driver finished
+    /// restoring a leader-supplied snapshot into the state machine and
+    /// persisting it to the [`SnapshotStore`](crate::storage::SnapshotStore).
+    /// Advances `last_applied` and `commit_index` to the snapshot's
+    /// `last_included_index` (no-op if either is already ahead) and
+    /// records the metadata.
+    ///
+    /// The engine deliberately does NOT emit a follow-on
+    /// [`Action::TruncateLog`] here: when the driver writes the snapshot
+    /// it must also already have purged any stale log entries (the
+    /// installed snapshot supersedes them); the engine has no entries
+    /// to enforce truncation against on this side of the pipeline.
+    fn handle_snapshot_installed(&mut self, metadata: SnapshotMeta) -> Vec<Action> {
+        let through = metadata.last_included_index;
+        if through > self.last_applied {
+            self.last_applied = through;
+        }
+        if through > self.commit_index {
+            self.commit_index = through;
+        }
+        // The snapshot encodes the log tip at the time it was taken, so
+        // the engine's in-memory `last_log_*` mirror must be at least
+        // that far along — otherwise a subsequent FetchRequest would
+        // claim a position behind the snapshot's coverage and the leader
+        // would re-send entries the follower has already absorbed.
+        //
+        // This is a raise-only safety net: the driver is the authoritative
+        // reconciler post-install (it calls `set_last_log(effective_log_tip)`
+        // immediately after this `step` returns) and may LOWER `last_log_*`
+        // when a mismatched-term wipe leaves the durable log empty. We
+        // keep the raise here so that direct `Input::SnapshotInstalled`
+        // tests / accidental in-engine callers still get a coherent
+        // `last_log_*` view without depending on the driver path.
+        if through > self.last_log_index {
+            self.last_log_index = through;
+            self.last_log_term = metadata.last_included_term;
+        }
+        // Raise-only update of `last_snapshot_meta`: the driver-side
+        // stale-install guard in `handle_install_snapshot` already
+        // rejects `metadata.last_included_index <= node.last_applied`
+        // before reaching this handler, so this branch is belt-and-
+        // braces — it lets the engine's snapshot anchor stay coherent
+        // even on direct-step unit tests or any future alternate driver
+        // that forgets the install-side guard.
+        if Self::is_snapshot_meta_newer(self.last_snapshot_meta.as_ref(), &metadata) {
+            self.last_snapshot_meta = Some(metadata);
+        }
+        // Stage 5.2 trigger debouncer: a leader-supplied snapshot has
+        // superseded any in-flight local snapshot; clear the flag so the
+        // next threshold crossing can re-emit `Action::TakeSnapshot`.
+        self.snapshot_in_flight = false;
+        Vec::new()
     }
 
     /// Handle a `FetchRequest` received by this (leader) node from a
@@ -1547,10 +1779,8 @@ impl RaftNode {
         }
 
         let mut actions = Vec::new();
-        if self.try_advance_commit_index().is_some()
-            && let Some(apply) = self.maybe_apply()
-        {
-            actions.push(apply);
+        if self.try_advance_commit_index().is_some() {
+            actions.extend(self.drain_apply_pipeline());
         }
         actions
     }
@@ -1690,12 +1920,53 @@ impl RaftNode {
         self.last_leader_contact_tick = Some(self.logical_tick);
         self.election_timer.reset(&mut self.rng);
 
+        // Stage 5.2 (implementation-plan §5.2 step 4) — leader-side
+        // snapshot redirect. The leader has signalled that the
+        // follower's `fetch_offset` is at or below the compacted
+        // prefix; switch to FetchSnapshot to catch up. This branch
+        // runs AFTER all fencing (cluster_id, known leader, term
+        // reconciliation, two-leader fencing, role adoption) and
+        // BEFORE divergence/entries processing per the
+        // `FetchResponse` mutual-exclusivity contract: when a
+        // redirect is present the response carries no entries and
+        // no divergence signal, so we emit the FetchSnapshotRequest
+        // and return immediately.
+        //
+        // The follower asks for the snapshot from offset 0 with
+        // `max_bytes = 0` (no caller-imposed limit; the leader's
+        // chunker decides chunk size). The driver's outbound pipeline
+        // reassembles chunks and dispatches `Action::InstallSnapshot`
+        // with the validated metadata + bytes.
+        if let Some(redirect) = resp.snapshot_redirect {
+            tracing::info!(
+                node_id = %self.id,
+                leader = %resp.leader_id,
+                snapshot_id = %redirect.snapshot_id,
+                last_included_index = %redirect.last_included_index,
+                last_included_term = %redirect.last_included_term,
+                "leader redirected fetch to snapshot install"
+            );
+            actions.push(Action::SendMessage {
+                to: resp.leader_id,
+                message: OutboundMessage::FetchSnapshotRequest(FetchSnapshotRequest {
+                    cluster_id: self.config.cluster_id.clone(),
+                    leader_epoch: self.hard_state.current_term.0,
+                    replica_id: self.id,
+                    snapshot_id: redirect.snapshot_id,
+                    offset: 0,
+                    max_bytes: 0,
+                }),
+            });
+            self.last_fetch_tick = Some(self.logical_tick);
+            return actions;
+        }
+
         // Divergence resolution path.
         if let Some(de) = resp.diverging_epoch {
             let truncate_from = LogIndex(de.end_offset.0.saturating_add(1));
-            actions.push(Action::TruncateLog {
+            actions.push(Action::TruncateLog(LogTruncation::SuffixFromInclusive {
                 from_index_inclusive: truncate_from,
-            });
+            }));
             // Immediate re-fetch using the leader-supplied consistent point.
             // The driver's TruncateLog handler will subsequently call
             // set_last_log with the actual post-truncation values, so
@@ -1773,9 +2044,7 @@ impl RaftNode {
         let new_commit = LogIndex(resp.high_watermark.0.min(self.last_log_index.0));
         if new_commit > self.commit_index {
             self.commit_index = new_commit;
-            if let Some(apply) = self.maybe_apply() {
-                actions.push(apply);
-            }
+            actions.extend(self.drain_apply_pipeline());
         }
 
         actions
@@ -1815,10 +2084,8 @@ impl RaftNode {
         self.last_log_term = new_term;
 
         let mut actions = vec![Action::AppendEntries(vec![entry])];
-        if self.try_advance_commit_index().is_some()
-            && let Some(apply) = self.maybe_apply()
-        {
-            actions.push(apply);
+        if self.try_advance_commit_index().is_some() {
+            actions.extend(self.drain_apply_pipeline());
         }
         actions
     }
@@ -3512,6 +3779,7 @@ port = 6004
             high_watermark: LogIndex(high_watermark),
             entries,
             diverging_epoch,
+            snapshot_redirect: None,
         }
     }
 
@@ -3785,15 +4053,15 @@ port = 6004
         // TruncateLog action with from_index_inclusive = end_offset + 1.
         let trunc = actions
             .iter()
-            .find(|a| matches!(a, Action::TruncateLog { .. }))
+            .find(|a| matches!(a, Action::TruncateLog(_)))
             .expect("TruncateLog action emitted on divergence");
         match trunc {
-            Action::TruncateLog {
+            Action::TruncateLog(LogTruncation::SuffixFromInclusive {
                 from_index_inclusive,
-            } => {
+            }) => {
                 assert_eq!(*from_index_inclusive, LogIndex(8));
             }
-            other => panic!("expected TruncateLog, got {other:?}"),
+            other => panic!("expected TruncateLog(SuffixFromInclusive), got {other:?}"),
         }
 
         // Re-fetch SendMessage with leader-supplied consistent point.
@@ -4758,6 +5026,511 @@ port = 6004
         assert!(
             !any_fetch,
             "back-to-back Ticks must not double-schedule a fetch"
+        );
+    }
+
+    // ---- Stage 5.2 — Snapshot Coordination handlers ---------------------
+
+    /// Build a representative `SnapshotMeta` for the snapshot-coordination
+    /// tests. The id is left empty here because the engine treats it as
+    /// opaque metadata; the driver / store are responsible for normalising
+    /// it on save.
+    fn test_snapshot_meta(index: u64, term: u64) -> SnapshotMeta {
+        SnapshotMeta {
+            id: format!("snapshot-{term:010}-{index:020}"),
+            last_included_index: LogIndex(index),
+            last_included_term: Term(term),
+            voter_set: None,
+            size_bytes: Some(42),
+            checksum: None,
+        }
+    }
+
+    #[test]
+    fn handle_snapshot_complete_records_metadata_and_emits_prefix_truncate() {
+        // Scenario seed: SnapshotComplete with metadata pointing at log
+        // index 10 / term 3 → engine records the metadata and emits a
+        // single `Action::TruncateLog(PrefixThroughInclusive { 10 })`.
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 17).unwrap();
+        assert!(node.last_snapshot_meta.is_none());
+
+        let meta = test_snapshot_meta(10, 3);
+        let actions = node.step(Input::SnapshotComplete {
+            metadata: meta.clone(),
+        });
+
+        // Metadata recorded.
+        assert_eq!(
+            node.last_snapshot_meta.as_ref(),
+            Some(&meta),
+            "last_snapshot_meta must be recorded on SnapshotComplete",
+        );
+
+        // Exactly one Action::TruncateLog(PrefixThroughInclusive).
+        assert_eq!(
+            actions.len(),
+            1,
+            "SnapshotComplete must emit exactly one follow-on action, got {actions:?}",
+        );
+        match &actions[0] {
+            Action::TruncateLog(LogTruncation::PrefixThroughInclusive {
+                through_index_inclusive,
+            }) => {
+                assert_eq!(*through_index_inclusive, LogIndex(10));
+            }
+            other => panic!(
+                "expected TruncateLog(PrefixThroughInclusive {{ through_index_inclusive: 10 }}), got {other:?}",
+            ),
+        }
+    }
+
+    #[test]
+    fn handle_snapshot_installed_advances_apply_and_commit_and_records_metadata() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 31).unwrap();
+        assert_eq!(node.last_applied, LogIndex(0));
+        assert_eq!(node.commit_index, LogIndex(0));
+        assert_eq!(node.last_log_index, LogIndex(0));
+        assert!(node.last_snapshot_meta.is_none());
+
+        let meta = test_snapshot_meta(25, 7);
+        let actions = node.step(Input::SnapshotInstalled {
+            metadata: meta.clone(),
+        });
+
+        assert!(
+            actions.is_empty(),
+            "SnapshotInstalled must NOT emit any follow-on actions (engine has no entries to truncate against)",
+        );
+        assert_eq!(
+            node.last_applied,
+            LogIndex(25),
+            "last_applied must advance to the snapshot's last_included_index",
+        );
+        assert_eq!(
+            node.commit_index,
+            LogIndex(25),
+            "commit_index must advance to the snapshot's last_included_index",
+        );
+        // Engine mirrors must move forward so subsequent FetchRequests
+        // don't claim a position behind the snapshot.
+        assert_eq!(node.last_log_index, LogIndex(25));
+        assert_eq!(node.last_log_term, Term(7));
+        assert_eq!(node.last_snapshot_meta.as_ref(), Some(&meta));
+    }
+
+    #[test]
+    fn handle_snapshot_installed_is_idempotent_when_already_ahead() {
+        // If last_applied / commit_index / last_log_index are already
+        // ahead of the snapshot, installing the snapshot must NOT
+        // regress them — it is a no-op for the indices but still
+        // records metadata.
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 41).unwrap();
+        node.last_applied = LogIndex(30);
+        node.commit_index = LogIndex(30);
+        node.last_log_index = LogIndex(40);
+        node.last_log_term = Term(9);
+
+        let meta = test_snapshot_meta(25, 7);
+        let _ = node.step(Input::SnapshotInstalled {
+            metadata: meta.clone(),
+        });
+
+        assert_eq!(node.last_applied, LogIndex(30));
+        assert_eq!(node.commit_index, LogIndex(30));
+        assert_eq!(node.last_log_index, LogIndex(40));
+        assert_eq!(node.last_log_term, Term(9));
+        assert_eq!(node.last_snapshot_meta.as_ref(), Some(&meta));
+    }
+
+    #[test]
+    fn handle_snapshot_installed_preserves_fresher_last_snapshot_meta() {
+        // Defensive belt-and-braces (Stage 5.2): a stale
+        // `Input::SnapshotInstalled` delivered to the engine (e.g. via
+        // a direct unit-test step, or any future alternate driver that
+        // forgets the driver-side stale-install guard) must NOT clobber
+        // a fresher `last_snapshot_meta`. The engine treats the
+        // snapshot anchor as raise-only on `last_included_index`,
+        // matching the existing raise-only semantics on `last_applied`
+        // / `commit_index` / `last_log_*`.
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 53).unwrap();
+        let fresh = test_snapshot_meta(50, 11);
+        node.last_applied = LogIndex(50);
+        node.commit_index = LogIndex(50);
+        node.last_log_index = LogIndex(50);
+        node.last_log_term = Term(11);
+        node.last_snapshot_meta = Some(fresh.clone());
+
+        let stale = test_snapshot_meta(25, 7);
+        let actions = node.step(Input::SnapshotInstalled {
+            metadata: stale.clone(),
+        });
+
+        assert!(
+            actions.is_empty(),
+            "stale SnapshotInstalled must not emit follow-on actions",
+        );
+        // Indices are unchanged (raise-only guards).
+        assert_eq!(node.last_applied, LogIndex(50));
+        assert_eq!(node.commit_index, LogIndex(50));
+        assert_eq!(node.last_log_index, LogIndex(50));
+        assert_eq!(node.last_log_term, Term(11));
+        // The fresher snapshot anchor must survive.
+        assert_eq!(
+            node.last_snapshot_meta.as_ref(),
+            Some(&fresh),
+            "stale Input::SnapshotInstalled must not clobber a fresher last_snapshot_meta",
+        );
+    }
+
+    #[test]
+    fn handle_snapshot_complete_preserves_fresher_last_snapshot_meta() {
+        // Defensive belt-and-braces (Stage 5.2): a same- or lower-indexed
+        // `Input::SnapshotComplete` (e.g. an out-of-order completion
+        // delivered after a newer snapshot has been recorded via either
+        // `SnapshotComplete` or `SnapshotInstalled`) must NOT clobber the
+        // fresher anchor. The follow-on `Action::TruncateLog` is still
+        // emitted because the driver may still need to compact the log
+        // prefix the completion's `through_index_inclusive` covers, but
+        // the engine's metadata view stays raise-only.
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 67).unwrap();
+        let fresh = test_snapshot_meta(50, 11);
+        node.last_snapshot_meta = Some(fresh.clone());
+
+        let stale = test_snapshot_meta(25, 7);
+        let actions = node.step(Input::SnapshotComplete {
+            metadata: stale.clone(),
+        });
+
+        // TruncateLog is still emitted at the stale through_index (the
+        // driver path will treat it as a no-op compaction if the prefix
+        // is already gone).
+        assert_eq!(actions.len(), 1, "expected one TruncateLog action");
+        match &actions[0] {
+            Action::TruncateLog(LogTruncation::PrefixThroughInclusive {
+                through_index_inclusive,
+            }) => assert_eq!(*through_index_inclusive, LogIndex(25)),
+            other => panic!("expected PrefixThroughInclusive, got {other:?}"),
+        }
+        // The fresher snapshot anchor must survive.
+        assert_eq!(
+            node.last_snapshot_meta.as_ref(),
+            Some(&fresh),
+            "stale Input::SnapshotComplete must not clobber a fresher last_snapshot_meta",
+        );
+        // Debouncer must still clear so the next threshold crossing can
+        // re-emit a TakeSnapshot.
+        assert!(
+            !node.snapshot_in_flight,
+            "snapshot_in_flight must clear even when the completion was stale",
+        );
+    }
+
+    // ---- Stage 5.2 — auto snapshot trigger (`maybe_take_snapshot`) ------
+
+    /// Single-voter config with a custom `max_log_entries_before_compaction`.
+    /// Used to drive the snapshot-trigger threshold on a one-node cluster
+    /// where a `ClientPropose` immediately satisfies quorum.
+    fn single_voter_config_with_snapshot_threshold(threshold: u64) -> ClusterConfig {
+        let toml = format!(
+            r#"
+node_id = 1
+cluster_id = "test"
+listen_addr = "0.0.0.0:6000"
+tick_interval_ms = 10
+election_timeout_min_ms = 100
+election_timeout_max_ms = 200
+max_log_entries_before_compaction = {threshold}
+
+[[voters]]
+node_id = 1
+directory_id = "{uuid}"
+host = "node1"
+port = 6000
+"#,
+            threshold = threshold,
+            uuid = Uuid::new_v4(),
+        );
+        ClusterConfig::from_toml_str(&toml).unwrap()
+    }
+
+    /// Stage 5.2 implementation-plan §5.2 step 1 / scenario
+    /// `auto-snapshot-trigger`: with `max_log_entries_before_compaction = 10`,
+    /// proposing 12 commands on a single-voter cluster (each immediately
+    /// satisfies quorum and advances `commit_index`) must emit exactly one
+    /// `Action::TakeSnapshot` once the threshold is crossed.
+    #[test]
+    fn auto_snapshot_trigger_emits_take_snapshot_when_threshold_crossed() {
+        let cfg = single_voter_config_with_snapshot_threshold(10);
+        let mut node = RaftNode::new_with_seed(cfg, 71).unwrap();
+
+        // Become leader; this appends a no-op (index 1) and (single voter)
+        // commits + applies it. snapshot_in_flight stays false, last_applied=1.
+        node.become_pre_candidate();
+        node.become_candidate();
+        let leader_actions = node.become_leader();
+        // No snapshot trigger yet — last_applied=1, snap_idx=0, lag=1<=10.
+        assert!(
+            !leader_actions
+                .iter()
+                .any(|a| matches!(a, Action::TakeSnapshot { .. })),
+            "no TakeSnapshot expected before threshold crossed; got {leader_actions:?}",
+        );
+        assert!(!node.snapshot_in_flight);
+
+        // Propose entries 2..=11 (10 more commands). After each, a
+        // single-voter commit advances commit_index. Threshold is
+        // commit_index - snap_idx > 10. snap_idx = 0 because no snapshot
+        // has completed yet. So once commit_index reaches 11 the
+        // condition becomes 11 - 0 = 11 > 10 → emit TakeSnapshot.
+        let mut take_snapshot_actions: Vec<Action> = Vec::new();
+        for i in 2..=12 {
+            let actions = node.step(Input::ClientPropose(bytes::Bytes::from(format!("cmd-{i}"))));
+            for a in &actions {
+                if matches!(a, Action::TakeSnapshot { .. }) {
+                    take_snapshot_actions.push(a.clone());
+                }
+            }
+        }
+
+        // Exactly one TakeSnapshot must have been emitted across the
+        // 11 proposals (debouncing keeps the next 10 from re-emitting).
+        assert_eq!(
+            take_snapshot_actions.len(),
+            1,
+            "exactly one Action::TakeSnapshot must be emitted across the threshold-crossing proposals; got {take_snapshot_actions:?}",
+        );
+        match &take_snapshot_actions[0] {
+            Action::TakeSnapshot { through_index } => {
+                assert!(
+                    through_index.0 >= 11,
+                    "through_index must be at or past the threshold-crossing commit (>=11), got {through_index}",
+                );
+            }
+            other => panic!("expected TakeSnapshot, got {other:?}"),
+        }
+
+        // The in-flight flag is set; no further TakeSnapshot can be
+        // emitted until SnapshotComplete clears it.
+        assert!(
+            node.snapshot_in_flight,
+            "snapshot_in_flight must be set after the trigger fires",
+        );
+        let extra = node.step(Input::ClientPropose(bytes::Bytes::from_static(b"another")));
+        assert!(
+            !extra
+                .iter()
+                .any(|a| matches!(a, Action::TakeSnapshot { .. })),
+            "no second TakeSnapshot must be emitted while snapshot_in_flight is true",
+        );
+
+        // Feed back SnapshotComplete; the flag clears and the next
+        // commit advance can re-emit TakeSnapshot once the lag
+        // re-crosses the threshold.
+        let through = node.commit_index;
+        let _ = node.step(Input::SnapshotComplete {
+            metadata: SnapshotMeta {
+                id: String::new(),
+                last_included_index: through,
+                last_included_term: node.last_log_term,
+                voter_set: node.voter_set.clone(),
+                size_bytes: Some(0),
+                checksum: None,
+            },
+        });
+        assert!(
+            !node.snapshot_in_flight,
+            "snapshot_in_flight must clear on SnapshotComplete",
+        );
+
+        // After SnapshotComplete, snap_idx == commit_index, so the lag
+        // resets to 0. The next 11 proposals must re-trigger exactly
+        // one more TakeSnapshot.
+        let mut more: Vec<Action> = Vec::new();
+        for i in 0..12 {
+            let acts = node.step(Input::ClientPropose(bytes::Bytes::from(format!(
+                "post-{i}"
+            ))));
+            for a in acts {
+                if matches!(a, Action::TakeSnapshot { .. }) {
+                    more.push(a);
+                }
+            }
+        }
+        assert_eq!(
+            more.len(),
+            1,
+            "after SnapshotComplete, the next threshold crossing must re-trigger exactly one TakeSnapshot; got {more:?}",
+        );
+    }
+
+    /// `Input::SnapshotInstalled` (the leader-supplied path) must also
+    /// clear `snapshot_in_flight` so a subsequent local threshold
+    /// crossing can re-emit `Action::TakeSnapshot`.
+    #[test]
+    fn snapshot_installed_clears_in_flight_flag() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 73).unwrap();
+        // Force the flag set as if a TakeSnapshot was emitted.
+        node.snapshot_in_flight = true;
+        let _ = node.step(Input::SnapshotInstalled {
+            metadata: test_snapshot_meta(20, 4),
+        });
+        assert!(
+            !node.snapshot_in_flight,
+            "snapshot_in_flight must clear on SnapshotInstalled too (leader-supplied snapshot supersedes any in-flight local snapshot)",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 5.2 (impl-plan §5.2 step 4) — follower-side snapshot
+    // redirect handling
+    // -----------------------------------------------------------------
+    //
+    // When a `FetchResponse` carries a `SnapshotRedirect`, the follower
+    // must:
+    //   1. NOT process entries / divergence (mutual exclusivity).
+    //   2. Emit a `FetchSnapshotRequest` to the leader carrying the
+    //      canonical snapshot id, offset 0, and max_bytes 0.
+    //   3. Stamp `last_fetch_tick` so a duplicate redirect storm is
+    //      damped while the install is in flight.
+
+    fn fetch_response_with_redirect(
+        leader: NodeId,
+        leader_epoch: u64,
+        snapshot_id: &str,
+        last_included_index: u64,
+        last_included_term: u64,
+    ) -> FetchResponse {
+        FetchResponse {
+            cluster_id: "test".into(),
+            leader_epoch,
+            leader_id: leader,
+            high_watermark: LogIndex(last_included_index),
+            entries: Vec::new(),
+            diverging_epoch: None,
+            snapshot_redirect: Some(crate::message::SnapshotRedirect {
+                snapshot_id: snapshot_id.into(),
+                last_included_index: LogIndex(last_included_index),
+                last_included_term: Term(last_included_term),
+            }),
+        }
+    }
+
+    #[test]
+    fn handle_fetch_response_with_redirect_emits_fetch_snapshot_request() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 991).unwrap();
+        // Anchor the follower's view: we know NodeId(2) is the
+        // current-term leader.
+        node.hard_state.current_term = Term(7);
+        node.leader_id = Some(NodeId(2));
+        node.role = NodeRole::Follower;
+
+        let resp = fetch_response_with_redirect(NodeId(2), 7, "snap-follower-redirect-1", 42, 6);
+        let actions = node.handle_fetch_response(resp);
+
+        // Exactly one outbound FetchSnapshotRequest, addressed to the
+        // leader, with the redirect's snapshot_id.
+        assert_eq!(
+            actions.len(),
+            1,
+            "redirect must produce exactly one follow-on action, got {actions:?}",
+        );
+        match &actions[0] {
+            Action::SendMessage { to, message } => {
+                assert_eq!(
+                    *to,
+                    NodeId(2),
+                    "FetchSnapshotRequest must target the leader"
+                );
+                match message {
+                    OutboundMessage::FetchSnapshotRequest(req) => {
+                        assert_eq!(req.snapshot_id, "snap-follower-redirect-1");
+                        assert_eq!(req.cluster_id, "test");
+                        assert_eq!(req.leader_epoch, 7);
+                        assert_eq!(req.replica_id, node.id);
+                        assert_eq!(req.offset, 0);
+                        assert_eq!(req.max_bytes, 0);
+                    }
+                    other => {
+                        panic!("expected FetchSnapshotRequest, got {other:?}")
+                    }
+                }
+            }
+            other => panic!("expected SendMessage(FetchSnapshotRequest), got {other:?}"),
+        }
+        // Election timer reset is an integral part of the leader-contact
+        // pre-fence; assert the redirect path also stamps last_fetch_tick
+        // so duplicate redirects don't storm the leader while the
+        // install is in flight.
+        assert!(
+            node.last_fetch_tick.is_some(),
+            "redirect path must stamp last_fetch_tick (debounce)",
+        );
+    }
+
+    /// Mutual exclusivity (FetchResponse contract): when redirect is
+    /// present, `entries` and `diverging_epoch` are ignored. This guards
+    /// against a misbehaving leader that smuggles entries or a
+    /// divergence signal alongside the redirect — the follower must
+    /// only honour the redirect.
+    #[test]
+    fn handle_fetch_response_redirect_takes_precedence_over_divergence_or_entries() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 1313).unwrap();
+        node.hard_state.current_term = Term(4);
+        node.leader_id = Some(NodeId(2));
+        node.role = NodeRole::Follower;
+        // Snapshot the engine's last-log mirror BEFORE handling the
+        // (would-be) entries so we can prove they were not applied.
+        let baseline_last_index = node.last_log_index;
+        let baseline_last_term = node.last_log_term;
+
+        let resp = FetchResponse {
+            cluster_id: "test".into(),
+            leader_epoch: 4,
+            leader_id: NodeId(2),
+            high_watermark: LogIndex(50),
+            // Smuggle entries — must be ignored.
+            entries: vec![Entry {
+                index: LogIndex(99),
+                term: Term(4),
+                payload: EntryPayload::NoOp,
+            }],
+            // Smuggle a divergence signal — must be ignored.
+            diverging_epoch: Some(DivergingEpoch {
+                epoch: Term(3),
+                end_offset: LogIndex(7),
+            }),
+            snapshot_redirect: Some(crate::message::SnapshotRedirect {
+                snapshot_id: "snap-takes-precedence".into(),
+                last_included_index: LogIndex(50),
+                last_included_term: Term(4),
+            }),
+        };
+
+        let actions = node.handle_fetch_response(resp);
+
+        // Redirect produced exactly one action — no AppendEntries / no
+        // truncation from the divergence path.
+        assert_eq!(
+            actions.len(),
+            1,
+            "exactly one action (the FetchSnapshotRequest) must be emitted; got {actions:?}",
+        );
+        assert!(matches!(
+            &actions[0],
+            Action::SendMessage {
+                message: OutboundMessage::FetchSnapshotRequest(_),
+                ..
+            }
+        ));
+        // Engine state must be unchanged — no entries appended, no
+        // divergence-driven truncation / fetch-pointer reset.
+        assert_eq!(
+            node.last_log_index, baseline_last_index,
+            "redirect must not advance last_log_index via the smuggled entries",
+        );
+        assert_eq!(
+            node.last_log_term, baseline_last_term,
+            "redirect must not advance last_log_term via the smuggled entries",
         );
     }
 }
