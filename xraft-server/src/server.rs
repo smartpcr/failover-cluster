@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use xraft_core::RaftNode;
 use xraft_core::config::{ClusterConfig, NodeConfig};
@@ -604,7 +604,7 @@ where
             Ok(Some(meta))
         }
         None => {
-            warn!(
+            info!(
                 target: "xraft_server::server",
                 "no snapshot to restore — starting from empty state"
             );
