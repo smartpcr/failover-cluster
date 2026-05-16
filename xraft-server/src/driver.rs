@@ -3620,14 +3620,10 @@ where
                     self.resolve_waiters_at(entry.index, Ok(entry.index));
                 }
             }
-            // NOTE (evaluator iter-3 item 1): each match arm above
-            // resolves waiters for `entry.index` exactly once on its
-            // success path; the `Err` arm returns early after failing
-            // the whole pending range. Do NOT add another
-            // `resolve_waiters_at` here — a previous version did, which
-            // was harmless (the second call became a no-op once
-            // `pending.remove` had already drained the entry) but
-            // confusing.
+            // Each match arm above resolves waiters for `entry.index`
+            // exactly once; the Command error arm returns early after
+            // failing the whole pending range, so there is no
+            // post-match resolve here by design.
         }
         Ok(())
     }
