@@ -158,6 +158,48 @@ impl GrpcTransportConfig {
     }
 }
 
+/// Bind a Raft gRPC TCP listener synchronously, accepting either a
+/// literal SocketAddr (`"0.0.0.0:6000"`) OR a hostname
+/// (`"localhost:6000"`).
+///
+/// Delegates to [`std::net::TcpListener::bind`], whose `&str` impl
+/// expands [`std::net::ToSocketAddrs::to_socket_addrs`] and tries each
+/// resolved address until one binds successfully — so a hostname-form
+/// `listen_addr` is accepted without us picking a single address
+/// family up front. Note that exactly ONE resolved address is bound
+/// (whichever `bind` succeeded on); operators who must serve every
+/// interface or both address families should use a literal wildcard
+/// (`"0.0.0.0:N"` / `"[::]:N"`) instead of a hostname.
+///
+/// Returning a `std::net::TcpListener` (already set non-blocking)
+/// is what lets the production `xraft_server::Server::start` bootstrap:
+///
+///   1. bind synchronously (port conflicts / DNS-resolution failures
+///      surface as a hard `Err` BEFORE any task is spawned, satisfying
+///      the iter-2 evaluator's "admin-start leak" finding), then
+///   2. convert to `tokio::net::TcpListener::from_std` and capture
+///      `local_addr()` so an ephemeral `:0` request surfaces the real
+///      bound port to the operator,
+///   3. hand the listener to
+///      [`GrpcTransport::start_server_with_listener`] only after every
+///      adjacent listener (admin HTTP) is bound too.
+///
+/// Shared between [`GrpcTransport::start_server`] and
+/// `xraft_server::Server::start` so the transport-only entry point
+/// (used by integration tests) and the production bootstrap path use
+/// IDENTICAL bind semantics — closing the iter-2 evaluator finding
+/// that `Server::start` still parsed `listen_addr` as `SocketAddr`
+/// before binding and rejected hostname listen addresses.
+pub fn bind_grpc_listener(listen_addr: &str) -> XResult<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(listen_addr).map_err(|e| {
+        XRaftError::Transport(format!("bind gRPC listener on '{listen_addr}': {e}"))
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| XRaftError::Transport(format!("set_nonblocking on gRPC listener: {e}")))?;
+    Ok(listener)
+}
+
 /// Resolve a `NodeId -> URL` routing map from the canonical
 /// [`ClusterConfig`], or return an actionable config error when the
 /// caller has populated the legacy flat `peers: Vec<String>` field but
@@ -332,29 +374,29 @@ impl<H: RaftMessageHandler> Transport for GrpcTransport<H> {
         self: Arc<Self>,
     ) -> impl std::future::Future<Output = XResult<()>> + Send + 'static {
         async move {
-            // Use `tokio::net::TcpListener::bind(&str)` so the listen
-            // address may be either a literal SocketAddr
-            // (`"0.0.0.0:6000"`) OR a hostname (`"localhost:6000"`).
-            // The previous `parse::<SocketAddr>()`-then-bind path
-            // rejected hostnames before any DNS resolution even though
-            // `ClusterConfig::validate_address` accepts them, so a
-            // perfectly valid config such as `listen_addr =
-            // "localhost:6000"` would fail at startup. `bind(&str)`
-            // delegates to `ToSocketAddrs` which walks every resolved
-            // address until one succeeds, so dual-stack hostnames bind
-            // robustly without us picking a single address family up
-            // front. The earlier sync pre-bind cannot be preserved
-            // here because `std::net::TcpListener::bind` on a hostname
-            // would suffer from the same v4/v6 selection issue; tokio's
-            // bind is the canonical fix.
-            let listener = tokio::net::TcpListener::bind(self.config.listen_addr.as_str())
-                .await
-                .map_err(|e| {
-                    XRaftError::Transport(format!(
-                        "bind gRPC listener on '{}': {e}",
-                        self.config.listen_addr
-                    ))
-                })?;
+            // Delegates to the shared [`bind_grpc_listener`] helper so
+            // this transport-only entry point and the production
+            // `xraft_server::Server::start` bootstrap use IDENTICAL
+            // bind semantics — accepting hostname-form `listen_addr`
+            // such as `"localhost:6000"` and literal SocketAddrs like
+            // `"0.0.0.0:6000"`. The previous `parse::<SocketAddr>()`
+            // -then-bind path rejected hostnames before any DNS
+            // resolution even though `ClusterConfig::validate_address`
+            // accepts them.
+            //
+            // Pre-bind is performed via `std::net::TcpListener::bind`
+            // here too (rather than the prior `tokio::net::TcpListener
+            // ::bind(&str)`) so that on the production path — where
+            // `Server::start` calls this same helper synchronously
+            // before spawning — bind failures surface to the caller
+            // BEFORE any spawned task can leak resources. In this
+            // transport-only future, "sync pre-bind" means only that
+            // the bind happens before `serve_inner`, not before the
+            // caller's `tokio::spawn(transport.start_server())`.
+            let std_listener = bind_grpc_listener(&self.config.listen_addr)?;
+            let listener = tokio::net::TcpListener::from_std(std_listener).map_err(|e| {
+                XRaftError::Transport(format!("tokio TcpListener::from_std: {e}"))
+            })?;
             self.serve_inner(listener).await
         }
     }

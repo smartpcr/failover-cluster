@@ -331,10 +331,26 @@ impl RaftGrpcClient {
     }
 
     /// Drop the pooled channel for `peer` so the next `channel_for` call
-    /// rebuilds it.
+    /// rebuilds it. Free-function-style associated helper taking the raw
+    /// pool handle so stream-mid eviction paths (which clone the
+    /// `Arc<RwLock<...>>` to satisfy the `'static` bound on
+    /// [`futures::StreamExt::then`]) can reuse the SAME single
+    /// invalidation primitive as the unary RPC retry paths — no
+    /// duplicated `pool.write().await; remove(&peer)` shape.
+    async fn evict_pooled_channel(
+        pool: &Arc<RwLock<HashMap<NodeId, Channel>>>,
+        peer: NodeId,
+    ) {
+        pool.write().await.remove(&peer);
+    }
+
+    /// Drop the pooled channel for `peer` so the next `channel_for` call
+    /// rebuilds it. Convenience wrapper used by the unary RPC retry
+    /// paths that hold `&self`; defers to
+    /// [`Self::evict_pooled_channel`] so eviction logic lives in
+    /// exactly one place.
     async fn invalidate(&self, peer: NodeId) {
-        let mut pool = self.pool.write().await;
-        pool.remove(&peer);
+        Self::evict_pooled_channel(&self.pool, peer).await;
     }
 
     /// Build a typed RaftService client over a channel with the configured
@@ -558,12 +574,14 @@ impl RaftGrpcClient {
                         // contract documents this and the unary RPC
                         // paths already do so via `invalidate(peer)`
                         // on `is_retriable(&status)`; the streaming
-                        // path must follow the same policy. Non-
-                        // retriable codes leave the cache alone — the
-                        // channel is still healthy at the HTTP/2 layer.
+                        // path shares the SAME
+                        // `Self::evict_pooled_channel` helper so there
+                        // is exactly one invalidation primitive across
+                        // unary + streaming RPC paths. Non-retriable
+                        // codes leave the cache alone — the channel
+                        // is still healthy at the HTTP/2 layer.
                         if Self::is_retriable(&status) {
-                            let mut guard = pool.write().await;
-                            guard.remove(&peer);
+                            Self::evict_pooled_channel(&pool, peer).await;
                         }
                         Err(XRaftError::Transport(format!(
                             "FetchSnapshot stream error: {status}"

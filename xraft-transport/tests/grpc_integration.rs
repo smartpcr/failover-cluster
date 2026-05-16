@@ -51,6 +51,19 @@ fn pick_free_port() -> u16 {
     port
 }
 
+/// Pick a free TCP port by binding `localhost:0` (rather than
+/// `127.0.0.1:0`). On IPv6-preferring systems `localhost:0` may bind
+/// `::1:0`; this picker proves the chosen port is free on the SAME
+/// address family the subsequent `localhost:{port}` bind will pick,
+/// so the hostname-roundtrip test does not race itself across
+/// `127.0.0.1` vs `::1`. Used by `start_server_accepts_hostname_listen_addr`.
+fn pick_free_port_via_hostname() -> u16 {
+    let listener = TcpListener::bind("localhost:0").expect("bind ephemeral localhost port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
 const TEST_CLUSTER_ID: &str = "test-cluster";
 const TEST_LEADER_EPOCH: u64 = 7;
 const SERVER_NODE_ID: u64 = 1;
@@ -257,6 +270,25 @@ async fn wait_for_listening(addr: std::net::SocketAddr, timeout: Duration) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("server at {addr} never started accepting within {timeout:?}");
+}
+
+/// Like [`wait_for_listening`] but accepts a `&str` (hostname or
+/// literal SocketAddr). `tokio::net::TcpStream::connect(&str)` walks
+/// every `ToSocketAddrs`-resolved address until one connects, so on
+/// dual-stack systems where `localhost` may resolve to BOTH `::1` and
+/// `127.0.0.1` (in either order) the probe succeeds as long as ANY
+/// resolved address has a listener. Used by
+/// `start_server_accepts_hostname_listen_addr` so the test does not
+/// race itself across address families.
+async fn wait_for_listening_str(addr: &str, timeout: Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("server at '{addr}' never started accepting within {timeout:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -778,21 +810,22 @@ async fn fetch_snapshot_streaming() {
 
 #[tokio::test]
 async fn start_server_accepts_hostname_listen_addr() {
-    let port = pick_free_port();
-    // Pick an alternative free port for the second voter so the
-    // ClusterConfig validation accepts the literal.
-    let other_port = pick_free_port();
-    // The probe target — uses 127.0.0.1 because the OS DNS resolver
-    // consistently maps `localhost` to that loopback address on test
-    // hosts.
-    let probe_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let endpoint = format!("http://127.0.0.1:{port}");
+    // Pick the port via the SAME hostname bind path the server will
+    // use, so the port is provably free on whichever address family
+    // (`::1` or `127.0.0.1`) the resolver hands us. The previous
+    // version picked a 127.0.0.1-bound port, then asked the server to
+    // bind `localhost:{port}` — on IPv6-preferring systems that
+    // mismatch made the test race itself.
+    let port = pick_free_port_via_hostname();
+    let other_port = pick_free_port_via_hostname();
+    let listen = format!("localhost:{port}");
+    let endpoint = format!("http://localhost:{port}");
 
     let cluster = ClusterConfig {
         cluster_id: TEST_CLUSTER_ID.to_string(),
         node_id: NodeId(SERVER_NODE_ID),
         // Hostname-form listen_addr — the gap the iter-1 evaluator flagged.
-        listen_addr: format!("localhost:{port}"),
+        listen_addr: listen.clone(),
         peers: Vec::new(),
         voters: vec![
             xraft_core::config::VoterConfig {
@@ -840,11 +873,11 @@ async fn start_server_accepts_hostname_listen_addr() {
         Arc::new(GrpcTransport::new(server_cfg, handler.clone()));
     let serve_handle = tokio::spawn(server_transport.clone().start_server());
 
-    // Verify the listener actually bound — i.e., the hostname resolved
-    // and `tokio::net::TcpListener::bind` accepted it. If the prior bug
-    // were still present, the spawned future would have returned a
-    // `Config` error rather than holding open the port.
-    wait_for_listening(probe_addr, Duration::from_secs(3)).await;
+    // Probe via the SAME hostname string; `tokio::net::TcpStream
+    // ::connect(&str)` walks every resolved address family until one
+    // connects, so this is robust regardless of whether the server
+    // bound `::1` or `127.0.0.1` for `localhost`.
+    wait_for_listening_str(&listen, Duration::from_secs(3)).await;
 
     let client = RaftGrpcClient::new(client_config(endpoint));
     let resp = client

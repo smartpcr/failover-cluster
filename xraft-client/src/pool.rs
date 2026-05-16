@@ -432,6 +432,47 @@ mod tests {
     }
 
     #[test]
+    fn from_cluster_config_rejects_legacy_peers_without_voters() {
+        // Iter-2 evaluator finding: the shared
+        // `peer_endpoints_from_cluster_config` helper is exercised
+        // through `GrpcTransportConfig::from_cluster_config` in the
+        // transport integration tests, but there is no DIRECT test
+        // proving the SECOND entry point — `ConnectionPool
+        // ::from_cluster_config` — also surfaces the same misconfig
+        // rather than silently building an unroutable pool.
+        //
+        // This test populates the legacy flat `peers: Vec<String>`
+        // field while leaving the structured `voters` field empty —
+        // the exact misconfig shape the helper guards against —
+        // and asserts:
+        //   1. `ConnectionPool::from_cluster_config` returns Err,
+        //   2. the error message names both `ClusterConfig.peers`
+        //      and `voters` so an operator gets an actionable
+        //      diagnostic at construction time rather than the
+        //      generic "no endpoint configured for peer N" surfaced
+        //      later by the first `send_*` call.
+        let mut cluster = three_node_cluster();
+        cluster.voters.clear();
+        cluster.peers = vec![
+            "10.0.0.2:6000".to_string(),
+            "10.0.0.3:6000".to_string(),
+        ];
+
+        let err = ConnectionPool::from_cluster_config(&cluster).expect_err(
+            "ConnectionPool MUST reject legacy peers without structured voters",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ClusterConfig.peers"),
+            "error must name the offending field: {msg}"
+        );
+        assert!(
+            msg.contains("voters"),
+            "error must point to the fix (populate voters): {msg}"
+        );
+    }
+
+    #[test]
     fn empty_pool_for_single_node_bootstrap() {
         let mut cluster = three_node_cluster();
         cluster.voters.clear();
