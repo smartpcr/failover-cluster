@@ -405,6 +405,13 @@ fn jittered_sleep_duration(base: Duration) -> Duration {
         return base;
     }
     let half = base / 2;
+    // NOTE: `rand::random()` is the `rand` 0.8 thread-local API.
+    // `xraft-client` (and the rest of the workspace) pin rand 0.8 — see
+    // the `rand = { workspace = true }` line in `xraft-client/Cargo.toml`.
+    // On a future workspace bump to rand 0.9, switch this to
+    // `rand::rng().random::<f64>()` (or `rand::random_range(0.0..1.0)`)
+    // and apply the same change to xraft-transport's mirrored
+    // `jittered_sleep_duration` so both retry loops stay aligned.
     let fraction: f64 = rand::random();
     half + half.mul_f64(fraction)
 }
