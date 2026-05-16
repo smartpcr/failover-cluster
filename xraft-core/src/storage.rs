@@ -55,6 +55,57 @@ pub trait LogStore: Send + Sync {
     /// than silently ignoring the request — see Stage 5.3 snapshot
     /// coordination in `implementation-plan.md`.
     fn purge_prefix(&mut self, through_index_inclusive: LogIndex) -> Result<()>;
+
+    /// Stage 7.3 — record the snapshot anchor that supersedes the
+    /// log's compacted prefix.
+    ///
+    /// Called by the driver after a `Action::TakeSnapshot` /
+    /// `Action::InstallSnapshot` completes. The anchor lets the log
+    /// store answer epoch queries for terms whose entries lived in the
+    /// purged range (e.g. [`Self::end_offset_for_epoch`] returning the
+    /// snapshot anchor's index when a follower asks about an epoch
+    /// older than every retained entry).
+    ///
+    /// Default implementation is a no-op so the existing
+    /// [`MemoryLogStore`] / test doubles remain compilable. Concrete
+    /// stores that maintain an epoch checkpoint
+    /// (e.g. `FileLogStore`) override this to update their floor.
+    fn update_snapshot_anchor(&mut self, _term: Term, _index: LogIndex) -> Result<()> {
+        Ok(())
+    }
+
+    /// Stage 7.3 — return the highest log index that belongs to
+    /// `epoch` on this log, or `None` if the leader has never observed
+    /// `epoch`.
+    ///
+    /// Used by the leader's Fetch-divergence path
+    /// (`materialize_fetch_response`) to identify the exact divergence
+    /// point when the follower's `last_fetched_epoch` does not match
+    /// the leader's log at `fetch_offset - 1`. The returned index is
+    /// the canonical "end offset" the follower should resume from
+    /// (its next `fetch_offset` is `end_offset + 1`).
+    ///
+    /// The semantics mirror the Kafka KRaft `leader-epoch-checkpoint`
+    /// lookup:
+    /// - If `epoch` matches an epoch on the leader's log, return the
+    ///   last index in that epoch (i.e. one less than the next
+    ///   epoch's start, or the log tip when `epoch` is the latest).
+    /// - If `epoch` is older than every entry the leader still
+    ///   retains but is at or below the snapshot anchor's term,
+    ///   return the snapshot anchor's index (the floor).
+    /// - If `epoch` is newer than the leader's latest term, return
+    ///   `None` (the leader is behind; the follower must wait or the
+    ///   caller falls back to the legacy divergence anchor).
+    ///
+    /// Default implementation scans every retained entry — correct but
+    /// O(n). [`FileLogStore`](xraft-storage) overrides with an
+    /// O(log n) lookup over an in-memory checkpoint that is rebuilt
+    /// from the WAL on `open()`.
+    fn end_offset_for_epoch(&self, _epoch: Term) -> Result<Option<LogIndex>> {
+        // Default: no checkpoint; caller falls back to the legacy
+        // `term_at(prev)` resolution.
+        Ok(None)
+    }
 }
 
 /// Persistent hard state (term + vote + commit_index) plus the
