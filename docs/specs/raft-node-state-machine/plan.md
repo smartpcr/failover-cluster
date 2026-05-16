@@ -82,6 +82,26 @@ factual git `branch:` value and its explanatory comment; these are
 not dependency anchors and would break the workstream tooling if
 renamed.
 
+### Iter-7 note: scope reaffirmation
+
+Iteration 6 attempted to also commit source-side hardening assertions
+to `xraft-core/src/node.rs::single_voter_cluster_auto_promotes_to_leader`
+(the three Step 2.5 checks: `current_term() == Term(1)`, zero
+`Action::SendMessage`, and the strict `PersistHardState`-first
+ordering). That source-side edit was prepared in the working tree
+but never committed because **the planning brief explicitly forbids
+modifying source files outside `docs/specs/`** ("Do NOT write
+application code, tests, or modify source files outside
+`docs/specs/`"). Iteration 7 reverts the unstaged source-tree
+modification and keeps the iter-5 design narrative as the canonical
+contract; the three Step 2.5 hardening assertions remain
+**implementation-PR obligations** owned by the engineer who lands
+the `step-single-voter-self-quorum-cascade` step, not by this
+planning document. The attribution is tightened in Step 2.5 below
+and in `wit-tree.yaml` under the new
+`implementation_pr_owner` field on every entry of
+`step-single-voter-self-quorum-cascade.test_obligations`.
+
 ## Context and Intent
 
 XRAFT is a Rust implementation of the Raft consensus protocol that follows
@@ -240,7 +260,11 @@ on. Each step here is a self-contained type with its own unit tests.
     armed, `peers` populated from `voter_set` (excluding self) with
     `PeerState::new(true)`.
   - Tests: initial-state assertions and a `new_with_seed`
-    determinism test (same seed → identical timer target).
+    determinism test (same seed → identical timer target). The
+    `last_leader_contact_tick: Option<u64>` field is `None` on
+    construction (a brand-new Follower has not yet observed a
+    leader); `become_follower(_, Some(id))` sets it to
+    `Some(self.logical_tick)` (see Resolved Decisions item 1).
   Files: `xraft-core/src/node.rs`, `xraft-core/src/lib.rs`
   (re-exports for `RaftNode`, `PeerState`, `ElectionTimer`). Budget: 2.
 
@@ -320,7 +344,15 @@ own review windows.
   is an atomic YAML scalar there). The two scenarios and what each
   asserts, separated into what the existing source test already
   covers and what this stage MUST additionally assert when the test
-  is hardened:
+  is hardened. **Attribution: every entry under "Spec hardening
+  assertions Stage 3.1 MUST add" is owned by the implementation PR
+  that lands `step-single-voter-self-quorum-cascade`. These are
+  obligations on the engineer's `xraft-core/src/node.rs` source
+  edit, NOT on this planning document; the brief explicitly
+  forbids modifying source files outside `docs/specs/`, so the
+  planning iteration cannot satisfy them. The corresponding
+  `implementation_pr_owner` field in `wit-tree.yaml` makes this
+  attribution machine-checkable.**
 
   - Scenario `single-voter-cluster-auto-promotes-to-leader` — mirrors
     the existing source test
@@ -521,10 +553,15 @@ branch-name history, documented in the `workstreams.yaml` note.
 
 These were open questions in earlier iterations and are now resolved:
 
-1. **`last_leader_contact_tick` updates.** Stage 3.1 only writes the
-   field from the explicit `become_follower(_, Some(id))` path. Stage
-   3.3 will also bump it on every successful `FetchResponse`. The
-   field is `pub(crate)` so 3.3 can update without re-architecting.
+1. **`last_leader_contact_tick` updates.** The field is
+   `last_leader_contact_tick: Option<u64>` (typed consistently with
+   `docs/stories/failover-cluster-XRAFT/implementation-plan.md`
+   line 156). Initial value is `None` — a brand-new Follower has
+   not yet observed any leader in the current era. Stage 3.1 only
+   writes the field from the explicit `become_follower(_, Some(id))`
+   path, setting it to `Some(self.logical_tick)`. Stage 3.3 will
+   also bump it on every successful `FetchResponse`. The field is
+   `pub(crate)` so 3.3 can update without re-architecting.
 2. **`PreCandidate` counts its own pre-vote.** Following the
    `etcd-raft` convention, the self pre-vote is pre-credited in
    `become_pre_candidate`. Combined with the **single-voter self-
@@ -550,7 +587,9 @@ These were open questions in earlier iterations and are now resolved:
 ## Open Questions
 
 1. **Leftover backup artefacts (`xraft-core/src/node.rs.review-backup`).**
-   Per operator guidance, cleanup of the remaining
+   Per operator guidance (`stage-3-1-leftover-backup-files-cleanup`
+   answered `delete-via-future-workstream`), cleanup of the remaining
    `node.rs.review-backup` is deferred to a dedicated future
    workstream; the four `.iter-snapshot.bak` files are gitignored. No
-   source-tree changes belong in this planning iteration.
+   source-tree changes belong in this planning iteration — the brief
+   forbids modifying source files outside `docs/specs/`.
