@@ -104,6 +104,7 @@ impl RaftMessageHandler for StubHandler {
             high_watermark: LogIndex(prev),
             entries: Vec::new(),
             diverging_epoch: None,
+            snapshot_redirect: None,
         })
     }
 

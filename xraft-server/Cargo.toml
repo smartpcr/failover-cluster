@@ -27,6 +27,7 @@ toml = { workspace = true }
 axum = { workspace = true }
 prometheus-client = { workspace = true }
 bytes = { workspace = true }
+crc32fast = { workspace = true }
 futures-core = "0.3"
 
 [dev-dependencies]
