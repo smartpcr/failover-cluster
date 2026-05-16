@@ -39,13 +39,18 @@
 //! | `FetchResponse`   | `leader_id: NodeId` (always set)  |
 //!
 //! The cache stores the `(NodeId, leader_epoch)` tuple from the last
-//! response that **monotonically** raised the epoch fence. A delayed
-//! response from an older epoch is ignored — without that fence a
-//! late-arriving stale reply could regress the cached hint back to a
-//! deposed leader and silently mis-route the next RPC. The cache is
-//! shared across `PeerClient` clones (an `Arc<RwLock<…>>`), so all
-//! routing decisions made by the server, the admin surface, or
-//! sibling subsystems converge on the same view.
+//! response that **strictly** raised the epoch fence. Both delayed
+//! responses from an older epoch AND same-epoch responses from other
+//! peers are ignored — without that fence a late-arriving stale (or
+//! disagreeing) reply could regress the cached hint back to a
+//! deposed (or incorrect) leader. Same-epoch disagreement should
+//! not arise in a correct cluster (Raft's election-safety property
+//! guarantees at most one leader per term); when it does, the
+//! engine's `NotLeader { leader_hint }` reply is the authoritative
+//! correction path, not this advisory cache. The cache is shared
+//! across `PeerClient` clones (an `Arc<RwLock<…>>`), so all routing
+//! decisions made by the server, the admin surface, or sibling
+//! subsystems converge on the same view.
 //!
 //! Leader-hint cache semantics are explicitly *advisory*: the cache
 //! is a routing hint, not a correctness signal. Callers that need
@@ -68,9 +73,14 @@ use xraft_core::types::NodeId;
 use xraft_transport::grpc_client::RaftGrpcClient;
 
 /// Leader-hint cache entry: `(leader, leader_epoch)`. Updated only
-/// when the incoming response's `leader_epoch` is `>=` the cached
-/// epoch, so a delayed older response cannot regress the hint to a
-/// deposed leader.
+/// when the incoming response's `leader_epoch` is **strictly greater
+/// than** the cached epoch, so neither a delayed older response nor
+/// a disagreeing same-epoch response from another peer can regress
+/// the hint to a deposed (or incorrect) leader. Raft's
+/// election-safety property guarantees at most one leader per term,
+/// so a same-epoch disagreement is by definition stale or buggy and
+/// is rejected — authoritative intra-epoch corrections flow through
+/// the engine's `NotLeader { leader_hint }` reply, not this cache.
 type LeaderHintEntry = (NodeId, u64);
 
 /// Typed per-peer RPC client.
@@ -179,8 +189,14 @@ impl PeerClient {
     }
 
     /// Apply a candidate `(leader, epoch)` to the cache, raising the
-    /// stored entry only when the incoming epoch is at least as
-    /// fresh as the cached one (epoch-fenced last-write-wins).
+    /// stored entry only when the incoming epoch is **strictly
+    /// newer** than the cached one. By Raft's election-safety
+    /// property at most one leader exists per term, so any
+    /// same-epoch disagreement is stale or buggy; rejecting it
+    /// prevents a delayed cross-peer response from silently
+    /// regressing the cached hint to a wrong leader. Authoritative
+    /// intra-epoch corrections must flow through the engine's
+    /// `NotLeader { leader_hint }` reply, not this advisory cache.
     ///
     /// `None` candidates are ignored — a response that does not
     /// carry a hint cannot improve the cache. Returns `true` iff the
@@ -206,19 +222,26 @@ impl PeerClient {
             }
         };
         match *guard {
-            // Empty cache or strictly older epoch → install the
-            // candidate.
+            // Empty cache → install the candidate.
             None => {
                 *guard = Some((leader, epoch));
                 true
             }
-            Some((_, cached_epoch)) if epoch >= cached_epoch => {
+            // Strictly newer epoch → install the candidate. A term
+            // bump is the only signal that can replace the hint:
+            // same-epoch overwrites are rejected (next arm) because
+            // Raft guarantees at most one leader per term, so a
+            // disagreeing same-epoch response is necessarily stale
+            // or buggy and must not be allowed to flip-flop the
+            // cached value.
+            Some((_, cached_epoch)) if epoch > cached_epoch => {
                 *guard = Some((leader, epoch));
                 true
             }
-            // Strictly older response (delayed) — leave the cache
+            // Same-epoch or strictly older response (delayed,
+            // disagreeing, or redundant) — leave the cache
             // untouched so a stale reply cannot regress to a
-            // deposed leader.
+            // deposed (or incorrect) leader.
             Some(_) => false,
         }
     }
@@ -345,15 +368,21 @@ mod tests {
     }
 
     #[test]
-    fn cache_hint_allows_same_epoch_overwrite() {
-        // Same-epoch responses are accepted (epoch-fence is `>=`)
-        // so a leader correction within an epoch (rare; e.g. a
-        // hint refresh from a follower that just learned of the
-        // leader within the same epoch) is allowed.
+    fn cache_hint_rejects_same_epoch_overwrite() {
+        // Same-epoch overwrites are rejected (epoch-fence is `>`).
+        // Raft's election-safety property guarantees at most one
+        // leader per term, so a same-epoch response carrying a
+        // different leader id is necessarily stale or buggy and
+        // must NOT be allowed to flip-flop the cached hint
+        // (e.g. two delayed VoteResponses from the same term but
+        // different peers arriving out of order). Authoritative
+        // intra-epoch corrections flow through the engine's
+        // `NotLeader { leader_hint }` reply, not this cache.
         let c = PeerClient::new(NodeId(2), dummy_client());
         assert!(c.cache_hint(Some(NodeId(1)), 5));
-        assert!(c.cache_hint(Some(NodeId(2)), 5));
-        assert_eq!(c.leader_hint_entry(), Some((NodeId(2), 5)));
+        let updated = c.cache_hint(Some(NodeId(2)), 5);
+        assert!(!updated, "same-epoch overwrite must be rejected");
+        assert_eq!(c.leader_hint_entry(), Some((NodeId(1), 5)));
     }
 
     #[test]
