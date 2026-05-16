@@ -89,6 +89,55 @@ pub enum Input {
         replica_id: NodeId,
         confirmed_offset: LogIndex,
     },
+    /// Driver feedback that an [`Action::TakeSnapshot`] cycle has
+    /// completed: the state machine has serialised its state, the
+    /// `SnapshotStore` has persisted the bytes, and `metadata`
+    /// describes what was saved.
+    ///
+    /// On receiving this the engine records the latest snapshot
+    /// metadata and emits an [`Action::TruncateLog`] of the
+    /// [`LogTruncation::PrefixThroughInclusive`] variety so the
+    /// driver can compact the log prefix that is now fully covered
+    /// by the snapshot. Stage 5.2 wiring — see
+    /// `implementation-plan.md` §5.2.
+    SnapshotComplete {
+        metadata: SnapshotMeta,
+    },
+    /// Driver feedback that an [`Action::InstallSnapshot`] has
+    /// completed: the state machine has been restored from the
+    /// leader-supplied snapshot bytes and the `SnapshotStore` has
+    /// persisted them.
+    ///
+    /// On receiving this the engine advances `last_applied` and
+    /// `commit_index` to `metadata.last_included_index` (no-op if
+    /// already ahead) and records the metadata as the most recent
+    /// snapshot. Stage 5.2 wiring — see `implementation-plan.md`
+    /// §5.2.
+    SnapshotInstalled {
+        metadata: SnapshotMeta,
+    },
+    /// Driver feedback that a `Transport::send_fetch_snapshot` stream
+    /// has been fully reassembled into a `(metadata, data)` tuple.
+    ///
+    /// The driver has applied envelope-level fences (`cluster_id`,
+    /// `leader_epoch`, peer == recognised leader, metadata present)
+    /// before feeding this input. The engine then performs its own
+    /// staleness check (`metadata.last_included_index > last_applied`)
+    /// and emits exactly one [`Action::InstallSnapshot`] for the driver
+    /// to fulfil. A stale snapshot — one whose coverage is at or behind
+    /// the state machine's apply point — emits no action so that the
+    /// driver does not regress the state machine via `restore`.
+    ///
+    /// Stage 5.3 (`implementation-plan.md` §5.2 step 3): this is the
+    /// engine-side handoff that the install_snapshot contract calls
+    /// out — "receiving a FetchSnapshot response produces
+    /// `Action::InstallSnapshot { metadata, data }`". Routing the
+    /// production path through this input ensures the action contract
+    /// is exercised end-to-end (not just by synthetic tests).
+    FetchSnapshotReceived {
+        metadata: SnapshotMeta,
+        data: Vec<u8>,
+    },
 }
 
 /// Side-effects emitted by the Raft state machine.
@@ -118,7 +167,19 @@ pub enum Action {
         from: LogIndex,
         to: LogIndex,
     },
-    TakeSnapshot,
+    /// Instruct the driver to take a snapshot covering all log entries
+    /// up to and including `through_index`.
+    ///
+    /// The driver looks up the term at `through_index` via
+    /// `LogStore::term_at`, calls `StateMachine::snapshot()` to obtain
+    /// the serialised state, persists it via `SnapshotStore::save_snapshot`,
+    /// and feeds [`Input::SnapshotComplete`] back into the engine so it
+    /// can record the new snapshot's metadata and emit the follow-on
+    /// [`Action::TruncateLog`] for prefix compaction. Stage 5.2
+    /// coordination — see `implementation-plan.md` §5.2.
+    TakeSnapshot {
+        through_index: LogIndex,
+    },
     /// Instruct the driver to install a snapshot received from the leader.
     InstallSnapshot {
         metadata: SnapshotMeta,
@@ -149,15 +210,79 @@ pub enum Action {
         fetch_offset: LogIndex,
         last_fetched_epoch: Term,
     },
-    /// Instruct the driver (acting as follower) to truncate its durable log
-    /// from `from_index_inclusive` onward. After truncation the driver MUST
-    /// call [`RaftNode::set_last_log`](crate::node::RaftNode::set_last_log)
-    /// with the actual post-truncation last index/term so the engine's
-    /// in-memory mirror is consistent with durable state. Used by Stage 3.3
-    /// follower divergence resolution.
-    TruncateLog {
-        from_index_inclusive: LogIndex,
+    /// Stage 5.3 (implementation-plan §5.2 step 4) — leader-side snapshot
+    /// redirect emitted by the engine.
+    ///
+    /// `RaftNode::handle_fetch_request` emits this action — instead of
+    /// [`Action::ServeFetch`] — when it detects that the follower's
+    /// `fetch_offset` is at or below the compacted prefix anchored by
+    /// `last_snapshot_meta` (i.e. the snapshot covers entries up to
+    /// `snapshot_metadata.last_included_index` and the follower is asking
+    /// for an index inside that range). The driver materialises an empty
+    /// [`FetchResponse`] carrying
+    /// [`snapshot_redirect: Some(SnapshotRedirect{…})`](FetchResponse::snapshot_redirect)
+    /// and dispatches it to `to`; the follower then issues a
+    /// [`FetchSnapshotRequest`] via the redirect handler in
+    /// [`RaftNode::handle_fetch_response`].
+    ///
+    /// **Mutual exclusivity with `Action::ServeFetch`**: for a single
+    /// inbound `FetchRequest` the engine emits exactly one of the two
+    /// actions, never both. `RedirectToSnapshot` carries no
+    /// `fetch_offset` / `last_fetched_epoch` because the follower is
+    /// behind the compacted prefix — the redirect itself supersedes any
+    /// log-tail comparison.
+    ///
+    /// **No `FetchRequestAcked` follow-up**: the redirect does NOT prove
+    /// the follower has replicated any entry. In fact the opposite —
+    /// the follower is BEHIND the compacted prefix. Driver-side
+    /// peer-progress / high-watermark advancement must not run here
+    /// (this is asserted by
+    /// `redirect_to_snapshot_does_not_advance_peer_progress` in
+    /// `xraft-server`).
+    ///
+    /// All envelope fields are captured at action-emit time, matching
+    /// the [`Action::ServeFetch`] contract so the driver does not race
+    /// against subsequent node mutations (e.g. a step-down between
+    /// `step()` and dispatch).
+    RedirectToSnapshot {
+        to: NodeId,
+        cluster_id: String,
+        leader_epoch: u64,
+        leader_id: NodeId,
+        high_watermark: LogIndex,
+        snapshot_metadata: SnapshotMeta,
     },
+    /// Instruct the driver to mutate its durable log.
+    ///
+    /// Two truncation modes are supported (see [`LogTruncation`]):
+    ///
+    /// - [`LogTruncation::SuffixFromInclusive`]: Stage 3.3 follower
+    ///   divergence resolution — drop entries with `index >= from`
+    ///   so the follower can re-fetch from the leader-supplied
+    ///   consistent point. After truncation the driver MUST call
+    ///   [`RaftNode::set_last_log`](crate::node::RaftNode::set_last_log)
+    ///   with the actual post-truncation last index/term so the
+    ///   engine's in-memory mirror is consistent with durable state.
+    /// - [`LogTruncation::PrefixThroughInclusive`]: Stage 5.2
+    ///   post-snapshot compaction — drop entries with
+    ///   `index <= through` so the log can release the bytes whose
+    ///   semantics are now captured by the most recent snapshot.
+    ///   Drivers without prefix-purge support yet (Stage 5.2 only
+    ///   adds the contract; the segmented-log GC lands in Stage 6.2)
+    ///   may treat this as a logging no-op while the variant flows
+    ///   through the pipeline.
+    TruncateLog(LogTruncation),
+}
+
+/// Direction of an [`Action::TruncateLog`] request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogTruncation {
+    /// Drop entries with `index >= from_index_inclusive` (suffix).
+    /// Stage 3.3 follower divergence resolution.
+    SuffixFromInclusive { from_index_inclusive: LogIndex },
+    /// Drop entries with `index <= through_index_inclusive` (prefix).
+    /// Stage 5.2 post-snapshot log compaction.
+    PrefixThroughInclusive { through_index_inclusive: LogIndex },
 }
 
 /// Messages sent over the network.
@@ -251,9 +376,45 @@ pub struct DivergingEpoch {
     pub end_offset: LogIndex,
 }
 
+/// Returned by the leader on a `FetchResponse` when the follower's
+/// `fetch_offset` falls at or below the leader's compacted prefix
+/// (i.e. `fetch_offset <= last_snapshot_meta.last_included_index`).
+///
+/// Stage 5.2 implementation-plan §5.2 step 4: "when a follower's
+/// `last_fetch_offset` is before the log start (entries were
+/// compacted), respond to the follower's Fetch with a redirect to
+/// `FetchSnapshot`, then stream snapshot chunks". The redirect carries
+/// the snapshot's `id` (so the follower can issue
+/// `FetchSnapshotRequest { snapshot_id, offset: 0, .. }`) plus the
+/// snapshot's `last_included_index` / `last_included_term` (so the
+/// follower can validate the resume point and discover the post-restore
+/// next-fetch offset locally).
+///
+/// Mutual exclusivity contract: when `snapshot_redirect.is_some()`,
+/// `entries` MUST be empty and `diverging_epoch` MUST be `None`. The
+/// follower processes the redirect and returns immediately; no entries
+/// or divergence resolution happens on the same response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotRedirect {
+    /// Canonical snapshot identifier the leader is offering. The
+    /// follower echoes this in `FetchSnapshotRequest::snapshot_id`.
+    pub snapshot_id: String,
+    /// Last log index covered by the offered snapshot.
+    pub last_included_index: LogIndex,
+    /// Term at `last_included_index`.
+    pub last_included_term: Term,
+}
+
 /// Leader's response to a fetch request.
 ///
 /// `leader_epoch` serves as the fencing epoch (no separate `term` field).
+///
+/// Stage 5.2 (implementation-plan §5.2 step 4): `snapshot_redirect`
+/// carries a hand-off to `FetchSnapshot` when the follower's
+/// `fetch_offset` is at or below the leader's compacted prefix.
+/// `entries` and `diverging_epoch` are mutually exclusive with
+/// `snapshot_redirect`: at most one of the three signals is set on
+/// any given response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchResponse {
     pub cluster_id: String,
@@ -263,6 +424,23 @@ pub struct FetchResponse {
     pub entries: Vec<Entry>,
     /// Set when the leader detects the follower's log has diverged.
     pub diverging_epoch: Option<DivergingEpoch>,
+    /// Set when the follower's `fetch_offset` is at or below the
+    /// leader's compacted prefix; instructs the follower to switch to
+    /// `FetchSnapshot` to catch up.
+    pub snapshot_redirect: Option<SnapshotRedirect>,
+    /// Stage 6.2 leader-hint integrity flag (evaluator feedback iter
+    /// 1 item 5). `true` iff the responder is acting as the leader
+    /// at response time — i.e. the response carries authoritative
+    /// leader state (entries / divergence / snapshot redirect served
+    /// from leader role). `false` on the `default_deny_fetch` path
+    /// where the responder echoes `leader_id` as a best-effort hint
+    /// (possibly its own id when no leader is known). Clients
+    /// (`xraft-client::PeerClient`) cache the `(leader_id,
+    /// leader_epoch)` tuple as a routing hint ONLY when this is
+    /// `true`, otherwise a hint sourced from a non-authoritative
+    /// response could pin the cache to a deposed leader or to the
+    /// responder's own id.
+    pub is_leader: bool,
 }
 
 /// Request to fetch a snapshot from the leader (chunked transfer).
@@ -523,6 +701,11 @@ impl TryFrom<&FetchResponse> for proto::FetchResponse {
             high_watermark: r.high_watermark.0,
             entries: entries?,
             diverging_epoch: r.diverging_epoch.as_ref().map(proto::DivergingEpoch::from),
+            snapshot_redirect: r
+                .snapshot_redirect
+                .as_ref()
+                .map(proto::SnapshotRedirect::from),
+            is_leader: r.is_leader,
         })
     }
 }
@@ -540,7 +723,31 @@ impl TryFrom<proto::FetchResponse> for FetchResponse {
             high_watermark: LogIndex(p.high_watermark),
             entries: entries?,
             diverging_epoch: p.diverging_epoch.map(DivergingEpoch::from),
+            snapshot_redirect: p.snapshot_redirect.map(SnapshotRedirect::from),
+            is_leader: p.is_leader,
         })
+    }
+}
+
+// --- SnapshotRedirect ---
+
+impl From<&SnapshotRedirect> for proto::SnapshotRedirect {
+    fn from(r: &SnapshotRedirect) -> Self {
+        Self {
+            snapshot_id: r.snapshot_id.clone(),
+            last_included_index: r.last_included_index.0,
+            last_included_term: r.last_included_term.0,
+        }
+    }
+}
+
+impl From<proto::SnapshotRedirect> for SnapshotRedirect {
+    fn from(p: proto::SnapshotRedirect) -> Self {
+        Self {
+            snapshot_id: p.snapshot_id,
+            last_included_index: LogIndex(p.last_included_index),
+            last_included_term: Term(p.last_included_term),
+        }
     }
 }
 
@@ -957,6 +1164,8 @@ mod tests {
                 epoch: Term(2),
                 end_offset: LogIndex(8),
             }),
+            snapshot_redirect: None,
+            is_leader: true,
         };
         let proto_resp = proto::FetchResponse::try_from(&resp).unwrap();
         let mut buf = Vec::new();
@@ -984,6 +1193,8 @@ mod tests {
             high_watermark: LogIndex(0),
             entries: vec![],
             diverging_epoch: None,
+            snapshot_redirect: None,
+            is_leader: true,
         };
         let proto_resp = proto::FetchResponse::try_from(&resp).unwrap();
         let mut buf = Vec::new();
@@ -992,6 +1203,79 @@ mod tests {
         let rt = FetchResponse::try_from(decoded).unwrap();
         assert!(rt.entries.is_empty());
         assert!(rt.diverging_epoch.is_none());
+        assert!(rt.snapshot_redirect.is_none());
+    }
+
+    /// Stage 5.2 — proto roundtrip with `snapshot_redirect` set.
+    /// Asserts the new field crosses the wire intact under the
+    /// mutual-exclusivity contract (entries empty, diverging_epoch
+    /// None).
+    #[test]
+    fn proto_roundtrip_fetch_response_with_snapshot_redirect() {
+        let resp = FetchResponse {
+            cluster_id: "c".into(),
+            leader_epoch: 9,
+            leader_id: NodeId(7),
+            high_watermark: LogIndex(123),
+            entries: vec![],
+            diverging_epoch: None,
+            snapshot_redirect: Some(SnapshotRedirect {
+                snapshot_id: "snap-roundtrip".into(),
+                last_included_index: LogIndex(123),
+                last_included_term: Term(8),
+            }),
+            is_leader: true,
+        };
+        let proto_resp = proto::FetchResponse::try_from(&resp).unwrap();
+        let mut buf = Vec::new();
+        proto_resp.encode(&mut buf).unwrap();
+        let decoded = proto::FetchResponse::decode(buf.as_slice()).unwrap();
+        let rt = FetchResponse::try_from(decoded).unwrap();
+        assert_eq!(rt.cluster_id, "c");
+        assert_eq!(rt.leader_epoch, 9);
+        assert_eq!(rt.leader_id, NodeId(7));
+        assert_eq!(rt.high_watermark, LogIndex(123));
+        assert!(rt.entries.is_empty(), "entries must roundtrip empty");
+        assert!(
+            rt.diverging_epoch.is_none(),
+            "diverging_epoch must roundtrip None",
+        );
+        let redirect = rt
+            .snapshot_redirect
+            .expect("snapshot_redirect must survive proto roundtrip");
+        assert_eq!(redirect.snapshot_id, "snap-roundtrip");
+        assert_eq!(redirect.last_included_index, LogIndex(123));
+        assert_eq!(redirect.last_included_term, Term(8));
+        assert!(
+            rt.is_leader,
+            "is_leader=true must survive the proto roundtrip"
+        );
+    }
+
+    /// Stage 6.2 (evaluator feedback iter 1 item 5): a non-leader
+    /// responder MUST be able to signal `is_leader=false` on the wire
+    /// so a follower's hint cache does not pin to a deposed leader.
+    #[test]
+    fn proto_roundtrip_fetch_response_default_deny_carries_is_leader_false() {
+        let resp = FetchResponse {
+            cluster_id: "c".into(),
+            leader_epoch: 0,
+            leader_id: NodeId(3),
+            high_watermark: LogIndex(0),
+            entries: vec![],
+            diverging_epoch: None,
+            snapshot_redirect: None,
+            is_leader: false,
+        };
+        let proto_resp = proto::FetchResponse::try_from(&resp).unwrap();
+        let mut buf = Vec::new();
+        proto_resp.encode(&mut buf).unwrap();
+        let decoded = proto::FetchResponse::decode(buf.as_slice()).unwrap();
+        let rt = FetchResponse::try_from(decoded).unwrap();
+        assert!(
+            !rt.is_leader,
+            "non-leader default_deny response must roundtrip is_leader=false"
+        );
     }
 
     #[test]

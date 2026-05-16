@@ -174,7 +174,7 @@ messages onto an async channel; the loop drains the channel, feeds inputs to
                                    │  ┌─ PersistHardState ──► FileHardStateStore
                                    │  ├─ AppendEntries ─────► SegmentedLog
                                    │  ├─ SendMessage ───────► GrpcTransport
-                                   │  ├─ ApplyToStateMachine ► StateMachineCallback
+                                   │  ├─ ApplyToStateMachine ► StateMachine
                                    │  ├─ TakeSnapshot ──────► FileSnapshotStore
                                    │  └─ InstallSnapshot ───► SegmentedLog + FSS
                                    └──────────────────────────┘
@@ -369,10 +369,19 @@ trait Transport: Send + Sync {
 
 trait StateMachine: Send + Sync {
     fn apply(&mut self, index: LogIndex, command: &[u8]) -> Result<Vec<u8>>;
+    fn query(&self, query: &[u8]) -> Result<Vec<u8>>;
     fn snapshot(&self) -> Result<Vec<u8>>;
     fn restore(&mut self, snapshot: &[u8]) -> Result<()>;
 }
 ```
+
+`apply` returns the serialised command result (rather than `Result<()>`) so
+the embedded `read` API in `xraft-server` (§2.4) can satisfy read-after-write
+patterns by surfacing the bytes the state machine produced for the just-
+committed command. `query` is the read-only path the same embedded API uses
+when the caller wants linearizable reads against already-committed state
+without proposing a new log entry; implementations must not mutate state
+from `query`.
 
 ### 4.2 Inter-Crate Dependencies
 
@@ -661,6 +670,9 @@ cluster_id = "xraft-cluster-001"
 listen_addr = "0.0.0.0:6001"
 peers = ["node0.example.com:6000", "node2.example.com:6002"]
 
+# Admin HTTP listen (CLI `--admin-listen` overrides; optional — default 127.0.0.1:6660).
+admin_listen_addr = "127.0.0.1:6660"
+
 # Timing (all have defaults if omitted)
 election_timeout_min_ms = 150
 election_timeout_max_ms = 300
@@ -673,6 +685,28 @@ max_log_entries_before_compaction = 100000
 
 # Storage
 data_dir = "/var/lib/xraft"
+
+# Voter set — REQUIRED (must be non-empty AND must include `node_id`).
+# A single-voter cluster (the bootstrap / development case) MUST still
+# declare itself here; an empty `voters` is rejected at startup because
+# the engine has no quorum to elect from.
+[[voters]]
+node_id = 1
+directory_id = "00000000-0000-0000-0000-000000000001"
+host = "node1.example.com"
+port = 6001
+
+[[voters]]
+node_id = 0
+directory_id = "00000000-0000-0000-0000-000000000000"
+host = "node0.example.com"
+port = 6000
+
+[[voters]]
+node_id = 2
+directory_id = "00000000-0000-0000-0000-000000000002"
+host = "node2.example.com"
+port = 6002
 ```
 
 Environment variable overrides (applied after TOML parsing, before validation):
