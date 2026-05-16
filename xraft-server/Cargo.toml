@@ -27,40 +27,9 @@ toml = { workspace = true }
 axum = { workspace = true }
 prometheus-client = { workspace = true }
 bytes = { workspace = true }
-crc32fast = { workspace = true }
 futures-core = "0.3"
-
-[target.'cfg(unix)'.dependencies]
-# `tokio::signal::unix` requires the `signal` feature, which is included in
-# the workspace `tokio = { features = ["full"] }` default. The dependency
-# is restated here explicitly so platform-specific call sites compile on
-# Windows builds where the `unix` module is absent.
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util", "macros"] }
 uuid = { workspace = true }
-# `oneshot` extension on `axum::Router` (route a `Request` without binding
-# a socket) requires the `tower` `ServiceExt` trait in scope. Pin a recent
-# 0.5 minor release without enabling any extra features.
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
-
-[target.'cfg(unix)'.dev-dependencies]
-# `nix` is only used by the Unix integration test that exercises the real
-# binary + SIGTERM signal path. `signal` enables `nix::sys::signal::kill`;
-# the `process` feature is needed for the `Pid::from_raw` conversion that
-# turns a `std::process::Child::id()` into the value `kill` expects.
-nix = { version = "0.30", features = ["signal", "process"] }
-
-[target.'cfg(windows)'.dev-dependencies]
-# Used exclusively by the Windows integration test
-# (`binary_responds_to_ctrl_break_and_serves_health`) so we can deliver
-# a real CTRL_BREAK_EVENT to a child spawned with
-# `CREATE_NEW_PROCESS_GROUP`. CTRL_C does NOT propagate to such a child
-# from the parent process, so CTRL_BREAK is the only correct signal
-# path to test graceful shutdown on Windows.
-windows-sys = { version = "0.59", features = [
-    "Win32_System_Console",
-    "Win32_Foundation",
-] }

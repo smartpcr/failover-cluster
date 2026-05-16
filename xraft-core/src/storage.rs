@@ -74,7 +74,14 @@ pub struct SnapshotChunkItem {
     pub chunk_index: u64,
     /// Raw payload bytes for this chunk.
     pub data: Vec<u8>,
-    /// `true` when this is the final chunk.
+    /// `true` when this is the final chunk **of the entire snapshot
+    /// payload** (i.e. the reader has exhausted the underlying
+    /// snapshot data). When the caller specified a bounded
+    /// `max_bytes` window via
+    /// [`SnapshotStore::snapshot_reader_from_offset`] and that window
+    /// does not cover the snapshot tail, the last chunk of the
+    /// window carries `done = false`; the caller resumes by reading
+    /// from a higher `offset`.
     pub done: bool,
     /// Present only on the first chunk (`chunk_index == 0`).
     pub metadata: Option<SnapshotMeta>,

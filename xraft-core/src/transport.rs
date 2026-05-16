@@ -66,8 +66,18 @@ pub trait RaftMessageHandler: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<FetchResponse>> + Send;
 
     /// Handle an inbound `FetchSnapshotRequest` and return a server-streaming
-    /// chunk stream. The first chunk MUST carry `SnapshotMeta`; the final
-    /// chunk MUST set `done = true`.
+    /// chunk stream. The first chunk MUST carry `SnapshotMeta`.
+    ///
+    /// The terminal-chunk marker `done = true` indicates the **entire
+    /// snapshot payload** has been delivered. A bounded request
+    /// (`FetchSnapshotRequest.max_bytes > 0`) that does not cover the
+    /// snapshot tail legitimately ends with the final chunk carrying
+    /// `done = false` — the caller resumes via a follow-up
+    /// `FetchSnapshotRequest` at `offset = request.offset + bytes_received`
+    /// (see [`SnapshotStore::snapshot_reader_from_offset`](crate::storage::SnapshotStore::snapshot_reader_from_offset)).
+    /// Servers MUST NOT exceed `request.max_bytes` total payload across
+    /// the response window when `max_bytes > 0`; over-served streams
+    /// are treated by callers as a protocol violation.
     fn handle_fetch_snapshot(
         &self,
         request: FetchSnapshotRequest,
@@ -113,7 +123,21 @@ pub trait Transport: Send + Sync {
     ///
     /// The first chunk carries [`SnapshotMeta`](crate::storage::SnapshotMeta)
     /// in its `metadata` field; subsequent chunks carry only payload data.
-    /// The final chunk has `done = true`.
+    ///
+    /// The `done = true` marker indicates the **entire snapshot
+    /// payload** has been delivered. When the request specifies a
+    /// bounded window (`FetchSnapshotRequest.max_bytes > 0`) and that
+    /// window does **not** cover the snapshot tail, the final chunk
+    /// of the response legitimately carries `done = false` and
+    /// `bytes_received` will equal `request.max_bytes` — the caller
+    /// is expected to resume by issuing a follow-up request at
+    /// `offset = request.offset + bytes_received`. This resumable
+    /// bounded-window contract is enforced by
+    /// [`SnapshotStore::snapshot_reader_from_offset`](crate::storage::SnapshotStore::snapshot_reader_from_offset)
+    /// on the leader and by `MessageRouter` on the follower.
+    /// Peers MUST NOT exceed `request.max_bytes` total payload bytes
+    /// across the streamed response window; over-served streams are
+    /// treated by callers as a protocol violation.
     fn send_fetch_snapshot(
         &self,
         to: NodeId,
