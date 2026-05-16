@@ -112,6 +112,30 @@ impl StateMachine for NoOpStateMachine {
     }
 }
 
+// Blanket impl so `Box<dyn StateMachine + Send + Sync>` itself satisfies the
+// `StateMachine` bound used by the driver (`SM: StateMachine + Send + Sync +
+// 'static`). Without this, the trait is only object-safe in the compile-time
+// sense — downstream consumers that want runtime dispatch (e.g. selecting a
+// state machine from configuration at startup) cannot plug a boxed
+// implementation into the driver's generic API.
+impl<T: StateMachine + ?Sized> StateMachine for Box<T> {
+    fn apply(&mut self, index: LogIndex, command: &[u8]) -> Result<Vec<u8>> {
+        (**self).apply(index, command)
+    }
+
+    fn query(&self, query: &[u8]) -> Result<Vec<u8>> {
+        (**self).query(query)
+    }
+
+    fn snapshot(&self) -> Result<Vec<u8>> {
+        (**self).snapshot()
+    }
+
+    fn restore(&mut self, snapshot: &[u8]) -> Result<()> {
+        (**self).restore(snapshot)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,7 +315,10 @@ mod tests {
         // After two snapshot→restore hops the third instance must answer
         // queries identically to the first and the snapshot bytes must be
         // byte-stable across hops.
-        assert_eq!(snap_a, snap_b, "snapshot bytes must be stable across cycles");
+        assert_eq!(
+            snap_a, snap_b,
+            "snapshot bytes must be stable across cycles"
+        );
         for key in ["k1", "k2", "missing"] {
             assert_eq!(
                 original.query(key.as_bytes()).unwrap(),
@@ -344,7 +371,9 @@ mod tests {
         let snap = donor.snapshot().unwrap();
 
         let mut target = KvStateMachine::default();
-        target.apply(LogIndex(99), b"stale_key=stale_value").unwrap();
+        target
+            .apply(LogIndex(99), b"stale_key=stale_value")
+            .unwrap();
         target.restore(&snap).expect("restore must not fail");
 
         assert_eq!(
@@ -372,5 +401,61 @@ mod tests {
         let mut sm = NoOpStateMachine;
         let out = sm.apply(LogIndex(1), &[]).expect("apply must accept empty");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn boxed_dyn_state_machine_implements_state_machine() {
+        // The blanket `impl<T: StateMachine + ?Sized> StateMachine for Box<T>`
+        // must let a `Box<dyn StateMachine + Send + Sync>` itself satisfy the
+        // `StateMachine` bound the driver uses (`SM: StateMachine + Send +
+        // Sync + 'static`). This is what makes the trait usable for runtime
+        // dispatch by downstream consumers (e.g. picking the implementation
+        // at startup from configuration), not just the object-safety check
+        // in `state_machine_trait_is_object_safe`.
+        fn accepts_state_machine<SM: StateMachine + Send + Sync + 'static>(
+            mut sm: SM,
+        ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+            let applied = sm.apply(LogIndex(7), b"k=v").expect("boxed apply");
+            let queried = sm.query(b"k").expect("boxed query");
+            let snap = sm.snapshot().expect("boxed snapshot");
+            sm.restore(&snap).expect("boxed restore");
+            (applied, queried, snap)
+        }
+
+        let boxed: Box<dyn StateMachine + Send + Sync> = Box::new(KvStateMachine::default());
+        let (applied, _queried, snap) = accepts_state_machine(boxed);
+        // KvStateMachine returns the value bytes from apply.
+        assert_eq!(applied, b"v");
+        // Snapshot must be non-empty since we inserted one key before restore.
+        assert!(!snap.is_empty());
+    }
+
+    #[test]
+    fn boxed_dyn_state_machine_forwards_to_inner_impl() {
+        // Verify the blanket impl actually forwards each method to the inner
+        // T rather than silently no-op'ing. We use a stateful KvStateMachine
+        // wrapped in Box<dyn> and confirm apply mutates the inner state and
+        // query observes the mutation through the box.
+        let mut boxed: Box<dyn StateMachine + Send + Sync> = Box::new(KvStateMachine::default());
+        let applied = boxed.apply(LogIndex(1), b"alpha=one").expect("apply");
+        assert_eq!(
+            applied, b"one",
+            "blanket impl must surface inner apply result"
+        );
+
+        let queried = boxed.query(b"alpha").expect("query");
+        assert_eq!(
+            queried, b"one",
+            "blanket impl must route query to inner state"
+        );
+
+        let snap = boxed.snapshot().expect("snapshot");
+        let mut fresh: Box<dyn StateMachine + Send + Sync> = Box::new(KvStateMachine::default());
+        fresh.restore(&snap).expect("restore");
+        assert_eq!(
+            fresh.query(b"alpha").expect("query fresh"),
+            b"one",
+            "restore through Box must repopulate the inner state machine"
+        );
     }
 }
