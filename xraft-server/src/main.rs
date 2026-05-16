@@ -1,6 +1,9 @@
 //! XRAFT server binary entry point.
 //!
-//! Stage 6.1 wires up the production lifecycle:
+//! Stage 6.1 wires up the production lifecycle (see
+//! `docs/stories/failover-cluster-XRAFT/implementation-plan.md`
+//! §"Stage 6.1: Server Bootstrap and Lifecycle" for the
+//! canonical step list):
 //!
 //! 1. Parse CLI args (`--config`, `--node-id`, `--admin-listen`).
 //! 2. Initialise structured (JSON) tracing — log level controlled
@@ -112,7 +115,7 @@ fn main() -> ExitCode {
     }
 }
 
-async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
+async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     let reload_handle = init_tracing();
@@ -168,13 +171,29 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     let config_state = Arc::new(RwLock::new(node_cfg));
 
+    // Capture the startup `--node-id` CLI override (if any) so the
+    // SIGHUP reload path can re-apply it after re-reading the TOML.
+    // Without this, a node started from a shared config template
+    // with `--node-id 42` would silently revert to the file's
+    // `node_id` on reload — losing the running node's identity in
+    // both the cached snapshot and the log diff output.
     #[cfg(unix)]
-    wait_for_shutdown_signal(cli.config.clone(), config_state, reload_handle, &handle).await;
+    let cli_node_id_override = cli.node_id;
+
+    #[cfg(unix)]
+    wait_for_shutdown_signal(
+        cli.config.clone(),
+        config_state,
+        cli_node_id_override,
+        reload_handle,
+        &handle,
+    )
+    .await?;
 
     #[cfg(not(unix))]
     {
         let _ = reload_handle;
-        wait_for_shutdown_signal().await;
+        wait_for_shutdown_signal().await?;
     }
 
     info!(target: "xraft_server::main", "shutdown signal received — draining");
@@ -251,10 +270,11 @@ fn init_tracing() -> Option<LogFilterReloadHandle> {
 async fn reload_config(
     path: &Path,
     state: &Arc<RwLock<NodeConfig>>,
+    cli_node_id_override: Option<u64>,
     reload_handle: &Option<LogFilterReloadHandle>,
     server: &ServerHandle,
 ) {
-    let new_cfg = match NodeConfig::load(path) {
+    let mut new_cfg = match NodeConfig::load(path) {
         Ok(c) => c,
         Err(e) => {
             error!(
@@ -266,6 +286,37 @@ async fn reload_config(
             return;
         }
     };
+
+    // Re-apply the startup `--node-id` CLI override so the reloaded
+    // snapshot reflects the running node's actual identity, not the
+    // file's possibly-template `node_id`. The override is also
+    // re-validated (`NodeConfig::validate()` is called via the
+    // explicit `validate()` below) so a hot-edited config that
+    // dropped this node from the voter/observer set is rejected at
+    // reload time — preserving the same membership invariant
+    // enforced at startup in `async_main`.
+    if let Some(id_override) = cli_node_id_override {
+        let file_node_id = new_cfg.cluster.node_id.0;
+        if file_node_id != id_override {
+            info!(
+                target: "xraft_server::main",
+                file_node_id,
+                cli_override = id_override,
+                "SIGHUP reload: re-applying startup --node-id CLI override on top of reloaded config"
+            );
+        }
+        new_cfg.cluster.node_id = xraft_core::types::NodeId(id_override);
+        if let Err(e) = new_cfg.validate() {
+            error!(
+                target: "xraft_server::main",
+                error = %e,
+                cli_override = id_override,
+                "SIGHUP reload: --node-id CLI override is no longer valid against the reloaded \
+                 config (e.g. node was removed from voters/observers); keeping previous snapshot"
+            );
+            return;
+        }
+    }
 
     // Diff against the previous snapshot so operators can see
     // which non-hot-reloadable fields they tried to change.
@@ -411,39 +462,41 @@ async fn reload_config(
 /// Block until a graceful-shutdown signal arrives.
 ///
 /// On Unix this races `SIGTERM`, `SIGINT`, and `SIGHUP`.
-/// `SIGTERM` / `SIGINT` return so the caller can drain and exit.
-/// `SIGHUP` triggers an in-place [`reload_config`] and loops back
-/// to wait for the next signal — the server keeps running.
+/// `SIGTERM` / `SIGINT` return `Ok(())` so the caller can drain
+/// and exit with status 0. `SIGHUP` triggers an in-place
+/// [`reload_config`] and loops back to wait for the next signal
+/// — the server keeps running.
+///
+/// **Error propagation:** failure to install ANY of the three
+/// signal handlers (`SIGTERM` / `SIGINT` / `SIGHUP`) returns an
+/// `Err`, NOT a silent `Ok(())`. This is critical: if the
+/// handlers cannot be installed, the binary is unable to honour
+/// graceful shutdown, and `async_main` must exit non-zero so
+/// orchestrators (systemd, k8s, our test harness) treat the
+/// process as failed rather than as having shut down cleanly on
+/// operator request.
 #[cfg(unix)]
 async fn wait_for_shutdown_signal(
     config_path: PathBuf,
     config_state: Arc<RwLock<NodeConfig>>,
+    cli_node_id_override: Option<u64>,
     reload_handle: Option<LogFilterReloadHandle>,
     server: &ServerHandle,
-) {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            error!(target: "xraft_server::main", error = %e, "failed to install SIGTERM handler");
-            return;
-        }
-    };
-    let mut sigint = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(e) => {
-            error!(target: "xraft_server::main", error = %e, "failed to install SIGINT handler");
-            return;
-        }
-    };
-    let mut sighup = match signal(SignalKind::hangup()) {
-        Ok(s) => s,
-        Err(e) => {
-            error!(target: "xraft_server::main", error = %e, "failed to install SIGHUP handler");
-            return;
-        }
-    };
+    let mut sigterm = signal(SignalKind::terminate()).map_err(|e| {
+        error!(target: "xraft_server::main", error = %e, "failed to install SIGTERM handler");
+        format!("install SIGTERM handler: {e}")
+    })?;
+    let mut sigint = signal(SignalKind::interrupt()).map_err(|e| {
+        error!(target: "xraft_server::main", error = %e, "failed to install SIGINT handler");
+        format!("install SIGINT handler: {e}")
+    })?;
+    let mut sighup = signal(SignalKind::hangup()).map_err(|e| {
+        error!(target: "xraft_server::main", error = %e, "failed to install SIGHUP handler");
+        format!("install SIGHUP handler: {e}")
+    })?;
 
     loop {
         tokio::select! {
@@ -461,11 +514,19 @@ async fn wait_for_shutdown_signal(
                     signal = "SIGHUP",
                     "reload requested — re-reading config and refreshing log filter"
                 );
-                reload_config(&config_path, &config_state, &reload_handle, server).await;
+                reload_config(
+                    &config_path,
+                    &config_state,
+                    cli_node_id_override,
+                    &reload_handle,
+                    server,
+                )
+                .await;
                 continue;
             }
         }
     }
+    Ok(())
 }
 
 /// Windows (and any non-Unix target): race `Ctrl-C` and (on
@@ -475,25 +536,24 @@ async fn wait_for_shutdown_signal(
 /// pid)`. `Ctrl-C` does NOT propagate to a child in a new
 /// process group, so the integration test harness MUST use
 /// `Ctrl-Break` — the binary therefore must subscribe to it.
+///
+/// Mirrors the Unix variant's error contract: signal-handler
+/// installation failures return `Err` (NOT a silent `Ok(())`)
+/// so `async_main` exits non-zero rather than masquerading as a
+/// graceful operator-requested shutdown.
 #[cfg(not(unix))]
-async fn wait_for_shutdown_signal() {
+async fn wait_for_shutdown_signal() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(windows)]
     {
         use tokio::signal::windows::{ctrl_break, ctrl_c};
-        let mut c = match ctrl_c() {
-            Ok(s) => s,
-            Err(e) => {
-                error!(target: "xraft_server::main", error = %e, "ctrl_c handler install failed");
-                return;
-            }
-        };
-        let mut b = match ctrl_break() {
-            Ok(s) => s,
-            Err(e) => {
-                error!(target: "xraft_server::main", error = %e, "ctrl_break handler install failed");
-                return;
-            }
-        };
+        let mut c = ctrl_c().map_err(|e| {
+            error!(target: "xraft_server::main", error = %e, "ctrl_c handler install failed");
+            format!("install ctrl_c handler: {e}")
+        })?;
+        let mut b = ctrl_break().map_err(|e| {
+            error!(target: "xraft_server::main", error = %e, "ctrl_break handler install failed");
+            format!("install ctrl_break handler: {e}")
+        })?;
         tokio::select! {
             _ = c.recv() => {
                 info!(target: "xraft_server::main", signal = "ctrl_c", "shutdown signal");
@@ -505,9 +565,11 @@ async fn wait_for_shutdown_signal() {
     }
     #[cfg(not(windows))]
     {
-        if let Err(e) = tokio::signal::ctrl_c().await {
+        tokio::signal::ctrl_c().await.map_err(|e| {
             error!(target: "xraft_server::main", error = %e, "ctrl_c handler failed");
-        }
+            format!("install ctrl_c handler: {e}")
+        })?;
         info!(target: "xraft_server::main", signal = "ctrl_c", "shutdown signal");
     }
+    Ok(())
 }

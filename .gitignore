@@ -3,3 +3,6 @@
 *.swo
 *~
 .DS_Store
+
+# Forge per-iter agent notes — never committed.
+.forge/
