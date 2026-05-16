@@ -241,4 +241,136 @@ mod tests {
         let result = sm.apply(LogIndex(1), b"k=v").expect("apply must not fail");
         assert_eq!(result, b"v");
     }
+
+    #[test]
+    fn state_machine_trait_is_object_safe() {
+        // The driver dispatches on a generic `SM: StateMachine` today, but
+        // downstream consumers (e.g. a host that needs to pick the state
+        // machine at runtime from configuration) must be able to hold the
+        // implementation behind `Box<dyn StateMachine + Send + Sync>`.
+        // This test fails to compile if a future trait change accidentally
+        // breaks object safety (e.g. adding a generic method or `Self`-by-
+        // value receiver).
+        let mut boxed: Box<dyn StateMachine + Send + Sync> = Box::new(NoOpStateMachine);
+        let _ = boxed.apply(LogIndex(1), b"cmd").expect("apply via dyn");
+        let _ = boxed.query(b"q").expect("query via dyn");
+        let snap = boxed.snapshot().expect("snapshot via dyn");
+        boxed.restore(&snap).expect("restore via dyn");
+    }
+
+    #[test]
+    fn noop_state_machine_satisfies_send_and_sync_bounds() {
+        // Compile-time check: NoOpStateMachine must satisfy the supertrait
+        // bounds (`Send + Sync`) declared on `StateMachine`. The driver
+        // crosses tokio task boundaries and would fail to bind a non-Send
+        // implementation; catch that regression here rather than in the
+        // server crate's downstream tests.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NoOpStateMachine>();
+    }
+
+    #[test]
+    fn snapshot_restore_is_idempotent_across_multiple_cycles() {
+        // Beyond the single-pass roundtrip, a state machine must remain
+        // equivalent after repeated snapshot→restore cycles. This catches
+        // bugs where `snapshot` leaks transient state (e.g. an apply cursor)
+        // or `restore` fails to clear prior state on a non-fresh instance.
+        let mut original = KvStateMachine::default();
+        original.apply(LogIndex(1), b"k1=v1").unwrap();
+        original.apply(LogIndex(2), b"k2=v2").unwrap();
+
+        let snap_a = original.snapshot().expect("snap A");
+
+        let mut hop = KvStateMachine::default();
+        hop.restore(&snap_a).expect("restore A");
+        let snap_b = hop.snapshot().expect("snap B");
+
+        let mut final_sm = KvStateMachine::default();
+        final_sm.restore(&snap_b).expect("restore B");
+
+        // After two snapshot→restore hops the third instance must answer
+        // queries identically to the first and the snapshot bytes must be
+        // byte-stable across hops.
+        assert_eq!(snap_a, snap_b, "snapshot bytes must be stable across cycles");
+        for key in ["k1", "k2", "missing"] {
+            assert_eq!(
+                original.query(key.as_bytes()).unwrap(),
+                final_sm.query(key.as_bytes()).unwrap(),
+                "query mismatch after multi-cycle restore for {key}"
+            );
+        }
+        assert_eq!(original.last_applied, final_sm.last_applied);
+    }
+
+    #[test]
+    fn apply_sequence_is_deterministic_across_independent_instances() {
+        // Determinism is a Raft safety prerequisite (see trait docstring):
+        // two replicas given the same apply sequence from the same starting
+        // state must produce identical internal state. Exercise that with
+        // independent KvStateMachine instances and compare their snapshots.
+        let commands: &[(u64, &[u8])] = &[
+            (1, b"alpha=1"),
+            (2, b"beta=2"),
+            (3, b"alpha=overwrite"),
+            (4, b"gamma=3"),
+        ];
+
+        let mut a = KvStateMachine::default();
+        let mut b = KvStateMachine::default();
+        let mut results_a = Vec::new();
+        let mut results_b = Vec::new();
+        for (idx, cmd) in commands {
+            results_a.push(a.apply(LogIndex(*idx), cmd).unwrap());
+            results_b.push(b.apply(LogIndex(*idx), cmd).unwrap());
+        }
+
+        assert_eq!(results_a, results_b, "apply results must be deterministic");
+        assert_eq!(
+            a.snapshot().unwrap(),
+            b.snapshot().unwrap(),
+            "snapshots of equivalent states must be byte-equal"
+        );
+    }
+
+    #[test]
+    fn restore_replaces_prior_state_rather_than_merging() {
+        // `restore` semantics from the trait docstring: after the call the
+        // state machine must behave as if only the captured snapshot's
+        // entries had been applied. Any data the target instance had before
+        // the restore must be wiped — guard against a merge-style restore
+        // that would silently corrupt cluster state.
+        let mut donor = KvStateMachine::default();
+        donor.apply(LogIndex(1), b"donor_key=donor_value").unwrap();
+        let snap = donor.snapshot().unwrap();
+
+        let mut target = KvStateMachine::default();
+        target.apply(LogIndex(99), b"stale_key=stale_value").unwrap();
+        target.restore(&snap).expect("restore must not fail");
+
+        assert_eq!(
+            target.query(b"stale_key").unwrap(),
+            Vec::<u8>::new(),
+            "restore must drop stale_key, not merge it"
+        );
+        assert_eq!(
+            target.query(b"donor_key").unwrap(),
+            b"donor_value",
+            "restore must populate keys from the snapshot"
+        );
+        assert_eq!(
+            target.last_applied,
+            LogIndex(1),
+            "last_applied must reflect the snapshot, not the prior local value"
+        );
+    }
+
+    #[test]
+    fn noop_apply_accepts_empty_command_bytes() {
+        // Edge case: the driver may emit a zero-byte command (e.g. a no-op
+        // entry committed for leader-lease purposes). `apply` must accept
+        // an empty slice without panic and still return Ok(empty).
+        let mut sm = NoOpStateMachine;
+        let out = sm.apply(LogIndex(1), &[]).expect("apply must accept empty");
+        assert!(out.is_empty());
+    }
 }
