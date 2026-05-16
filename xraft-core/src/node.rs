@@ -474,6 +474,9 @@ impl RaftNode {
             } => self.handle_fetch_request_acked(replica_id, confirmed_offset),
             Input::SnapshotComplete { metadata } => self.handle_snapshot_complete(metadata),
             Input::SnapshotInstalled { metadata } => self.handle_snapshot_installed(metadata),
+            Input::FetchSnapshotReceived { metadata, data } => {
+                self.handle_fetch_snapshot_received(metadata, data)
+            }
         }
     }
 
@@ -1638,6 +1641,48 @@ impl RaftNode {
         // next threshold crossing can re-emit `Action::TakeSnapshot`.
         self.snapshot_in_flight = false;
         Vec::new()
+    }
+
+    /// Handle [`Input::FetchSnapshotReceived`]: the driver has
+    /// reassembled a `FetchSnapshot` stream into `(metadata, data)`
+    /// and applied the envelope-level fences (cluster_id, leader_epoch,
+    /// peer-is-leader, metadata-present). The engine emits exactly one
+    /// [`Action::InstallSnapshot`] for the driver to fulfil, OR no
+    /// action when the snapshot is stale (its coverage does not advance
+    /// `last_applied`).
+    ///
+    /// **Why route through the engine?** The Stage 5.3 contract
+    /// (`implementation-plan.md` §5.2 step 3) requires that "receiving
+    /// a FetchSnapshot response produces `Action::InstallSnapshot
+    /// { metadata, data }`". By emitting the action here — rather than
+    /// having the driver call its install handler directly — the
+    /// production path exercises the same action contract as
+    /// synthetic / test-injected callers, so a contract regression in
+    /// the action arm cannot ship undetected.
+    ///
+    /// **Engine staleness guard.** The engine refuses to regress
+    /// `last_applied` / `commit_index` (see [`handle_snapshot_installed`]),
+    /// so a stale snapshot that did reach `state_machine.restore`
+    /// would diverge the state machine (older view) from the engine
+    /// (newer applied position). Reject those here so the action is
+    /// never emitted; the driver's install handler also keeps a
+    /// belt-and-braces stale guard for direct `Action::InstallSnapshot`
+    /// callers.
+    fn handle_fetch_snapshot_received(
+        &mut self,
+        metadata: SnapshotMeta,
+        data: Vec<u8>,
+    ) -> Vec<Action> {
+        if metadata.last_included_index <= self.last_applied {
+            tracing::debug!(
+                node_id = %self.id,
+                stale_index = %metadata.last_included_index,
+                current_last_applied = %self.last_applied,
+                "Input::FetchSnapshotReceived ignored: not newer than last_applied"
+            );
+            return Vec::new();
+        }
+        vec![Action::InstallSnapshot { metadata, data }]
     }
 
     /// Handle a `FetchRequest` received by this (leader) node from a
@@ -5318,6 +5363,100 @@ port = 6004
             !node.snapshot_in_flight,
             "snapshot_in_flight must clear even when the completion was stale",
         );
+    }
+
+    // ---- Stage 5.3 — `Input::FetchSnapshotReceived` action contract -----
+
+    /// Stage 5.3 implementation-plan §5.2 step 3: the driver-side
+    /// `OutboundResult::FetchSnapshot` handler feeds the reassembled
+    /// `(metadata, data)` into the engine as
+    /// `Input::FetchSnapshotReceived`. When the snapshot strictly
+    /// advances `last_applied`, the engine MUST emit exactly one
+    /// `Action::InstallSnapshot { metadata, data }` so the driver
+    /// fulfils it via the same arm synthetic / test-injected actions
+    /// flow through.
+    #[test]
+    fn handle_fetch_snapshot_received_emits_install_snapshot_when_fresh() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 91).unwrap();
+        assert_eq!(node.last_applied, LogIndex(0));
+
+        let meta = test_snapshot_meta(50, 7);
+        let data = b"fresh-snapshot-bytes".to_vec();
+        let actions = node.step(Input::FetchSnapshotReceived {
+            metadata: meta.clone(),
+            data: data.clone(),
+        });
+
+        assert_eq!(
+            actions.len(),
+            1,
+            "fresh FetchSnapshotReceived must emit exactly one action, got {actions:?}",
+        );
+        match &actions[0] {
+            Action::InstallSnapshot {
+                metadata: emitted_meta,
+                data: emitted_data,
+            } => {
+                assert_eq!(emitted_meta, &meta);
+                assert_eq!(emitted_data, &data);
+            }
+            other => {
+                panic!("expected Action::InstallSnapshot {{ metadata, data }}, got {other:?}",)
+            }
+        }
+
+        // Engine indices must NOT advance until the driver completes
+        // the install and feeds Input::SnapshotInstalled back — keeping
+        // the "engine is I/O-free" contract: the snapshot is not yet
+        // durable when we emit the action.
+        assert_eq!(
+            node.last_applied,
+            LogIndex(0),
+            "last_applied must not advance on the receive-side action emission",
+        );
+        assert_eq!(
+            node.commit_index,
+            LogIndex(0),
+            "commit_index must not advance on the receive-side action emission",
+        );
+    }
+
+    /// Stale snapshots (coverage at or behind `last_applied`) must not
+    /// produce an `Action::InstallSnapshot`. Restoring an older state-
+    /// machine view would diverge the state machine (older) from the
+    /// engine (newer applied position), since `handle_snapshot_installed`
+    /// refuses to lower `last_applied`.
+    #[test]
+    fn handle_fetch_snapshot_received_drops_stale_snapshot() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 92).unwrap();
+        node.last_applied = LogIndex(100);
+        node.commit_index = LogIndex(100);
+
+        // Snapshot covers strictly less than last_applied — stale.
+        let stale_below = test_snapshot_meta(50, 7);
+        let actions = node.step(Input::FetchSnapshotReceived {
+            metadata: stale_below.clone(),
+            data: b"stale-below".to_vec(),
+        });
+        assert!(
+            actions.is_empty(),
+            "FetchSnapshotReceived with metadata.last_included_index < last_applied must emit no actions, got {actions:?}",
+        );
+
+        // Snapshot covers exactly last_applied — still stale (no advance).
+        let stale_equal = test_snapshot_meta(100, 9);
+        let actions = node.step(Input::FetchSnapshotReceived {
+            metadata: stale_equal,
+            data: b"stale-equal".to_vec(),
+        });
+        assert!(
+            actions.is_empty(),
+            "FetchSnapshotReceived with metadata.last_included_index == last_applied must emit no actions, got {actions:?}",
+        );
+
+        // Indices must not move on stale receive.
+        assert_eq!(node.last_applied, LogIndex(100));
+        assert_eq!(node.commit_index, LogIndex(100));
     }
 
     // ---- Stage 5.2 — auto snapshot trigger (`maybe_take_snapshot`) ------

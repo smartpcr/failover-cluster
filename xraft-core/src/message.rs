@@ -116,6 +116,28 @@ pub enum Input {
     SnapshotInstalled {
         metadata: SnapshotMeta,
     },
+    /// Driver feedback that a `Transport::send_fetch_snapshot` stream
+    /// has been fully reassembled into a `(metadata, data)` tuple.
+    ///
+    /// The driver has applied envelope-level fences (`cluster_id`,
+    /// `leader_epoch`, peer == recognised leader, metadata present)
+    /// before feeding this input. The engine then performs its own
+    /// staleness check (`metadata.last_included_index > last_applied`)
+    /// and emits exactly one [`Action::InstallSnapshot`] for the driver
+    /// to fulfil. A stale snapshot — one whose coverage is at or behind
+    /// the state machine's apply point — emits no action so that the
+    /// driver does not regress the state machine via `restore`.
+    ///
+    /// Stage 5.3 (`implementation-plan.md` §5.2 step 3): this is the
+    /// engine-side handoff that the install_snapshot contract calls
+    /// out — "receiving a FetchSnapshot response produces
+    /// `Action::InstallSnapshot { metadata, data }`". Routing the
+    /// production path through this input ensures the action contract
+    /// is exercised end-to-end (not just by synthetic tests).
+    FetchSnapshotReceived {
+        metadata: SnapshotMeta,
+        data: Vec<u8>,
+    },
 }
 
 /// Side-effects emitted by the Raft state machine.
