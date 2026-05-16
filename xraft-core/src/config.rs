@@ -122,6 +122,59 @@ pub struct ClusterConfig {
     /// tonic's default 4 MiB limit. Applied to both client and server.
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
+
+    /// Node IDs that participate in the cluster as **observers** —
+    /// they replicate the log and answer reads but DO NOT vote in
+    /// elections. When this node's `node_id` appears in this list the
+    /// engine starts in [`NodeRole::Observer`](crate::types::NodeRole::Observer)
+    /// instead of [`NodeRole::Follower`](crate::types::NodeRole::Follower).
+    /// Empty by default (a node not in this list participates as a
+    /// regular voter / follower per the voters set).
+    #[serde(default)]
+    pub observers: Vec<u64>,
+
+    // -----------------------------------------------------------------------
+    // Stage 7.1 — Check Quorum and Leader Lease
+    // -----------------------------------------------------------------------
+    /// Whether the leader should periodically verify it can still reach a
+    /// majority of voters, stepping down to follower if it cannot. Defaults
+    /// to `true` per `architecture.md` §2.1 / §9 ("Pre-Vote + Check-Quorum
+    /// by default") and the Stage 7.1 brief. Disable only for testing the
+    /// "no Check Quorum" baseline; production deployments should leave this
+    /// on so a partitioned leader does not continue to accept proposals
+    /// that it can never commit.
+    #[serde(default = "default_enable_check_quorum")]
+    pub enable_check_quorum: bool,
+    /// Whether the leader may treat itself as holding a valid read lease
+    /// after hearing from a majority of voters within
+    /// `check_quorum_interval_ms`. Defaults to `false` per the Stage 7.1
+    /// brief; consumers that need lease-backed local reads must opt in.
+    /// **Internal optimization only:** XRAFT v1 does not expose an
+    /// external client read API (see `tech-spec.md` §2.5); the lease flag
+    /// gates an internal optimisation that lets admin status queries and
+    /// `StateMachine`-based lookups skip an extra commit-index
+    /// confirmation round-trip when the leader has recent majority
+    /// contact via incoming Fetch RPCs.
+    #[serde(default = "default_enable_leader_lease")]
+    pub enable_leader_lease: bool,
+    /// Wall-clock window in milliseconds within which the leader counts
+    /// peer Fetch RPCs toward the Check-Quorum and Leader-Lease majority
+    /// reachability check. `None` means "derive from
+    /// `2 * election_timeout_max_ms`" per `architecture.md` §2.1 — that
+    /// is, the default check interval is twice the upper bound of the
+    /// election timeout so a transient stall in fetch traffic does not
+    /// spuriously step the leader down. Explicit values override the
+    /// derived default; consult [`effective_check_quorum_interval_ms`]
+    /// rather than reading this field directly.
+    #[serde(default)]
+    pub check_quorum_interval_ms: Option<u64>,
+}
+
+fn default_enable_check_quorum() -> bool {
+    true
+}
+fn default_enable_leader_lease() -> bool {
+    false
 }
 
 fn default_election_timeout_min() -> u64 {
@@ -152,7 +205,13 @@ fn default_connect_timeout_ms() -> u64 {
     5_000
 }
 fn default_rpc_timeout_ms() -> u64 {
-    10_000
+    // 30s end-to-end per-attempt budget. Picked to match the Stage 6.2
+    // workstream brief ("request: 30s") and to cover the slowest known
+    // operation (`FetchSnapshot` streaming a multi-MB snapshot over a
+    // congested WAN link). Each retry attempt gets the full budget;
+    // total time-on-the-wire for an RPC that exhausts `max_rpc_retries`
+    // is bounded by `rpc_timeout_ms * (max_rpc_retries + 1) + Σ backoff`.
+    30_000
 }
 fn default_max_rpc_retries() -> usize {
     3
@@ -165,6 +224,20 @@ fn default_retry_max_backoff_ms() -> u64 {
 }
 fn default_max_message_size() -> usize {
     64 * 1024 * 1024
+}
+
+/// Parse a boolean string from an env override. Accepts `true`/`false`,
+/// `1`/`0`, `yes`/`no`, `on`/`off` (case-insensitive). Used for the
+/// Stage 7.1 `XRAFT_ENABLE_CHECK_QUORUM` / `XRAFT_ENABLE_LEADER_LEASE`
+/// overrides so operators don't have to remember a specific spelling.
+fn parse_bool_env(val: &str, var_name: &str) -> Result<bool, XRaftError> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        other => Err(XRaftError::Config(format!(
+            "{var_name}: invalid boolean value '{other}' (expected true|false|1|0|yes|no|on|off)"
+        ))),
+    }
 }
 
 impl ClusterConfig {
@@ -515,7 +588,37 @@ impl ClusterConfig {
         if self.max_message_size == 0 {
             return Err(XRaftError::Config("max_message_size must be > 0".into()));
         }
+
+        // Stage 7.1 — Check Quorum interval validation.
+        // The derived default is `2 * election_timeout_max_ms`; reject an
+        // explicit zero so misconfigured operators do not accidentally
+        // collapse the Check Quorum window to a tight loop that fires on
+        // every leader tick.
+        if let Some(v) = self.check_quorum_interval_ms
+            && v == 0
+        {
+            return Err(XRaftError::Config(
+                "check_quorum_interval_ms must be > 0 when set; omit the field to use the default \
+                 (2 * election_timeout_max_ms)"
+                    .into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Effective Check-Quorum / Leader-Lease window in milliseconds.
+    ///
+    /// Returns the explicit [`Self::check_quorum_interval_ms`] when set;
+    /// otherwise derives the default as `2 * election_timeout_max_ms`
+    /// per `architecture.md` §2.1 — the doubled interval gives the
+    /// leader headroom for one election-timeout's worth of fetch stall
+    /// before stepping down. Uses [`u64::saturating_mul`] so the derived
+    /// value never overflows.
+    pub fn effective_check_quorum_interval_ms(&self) -> u64 {
+        match self.check_quorum_interval_ms {
+            Some(v) => v,
+            None => self.election_timeout_max_ms.saturating_mul(2),
+        }
     }
 
     /// Resolve a peer's URL from the structured `voters` configuration.
@@ -1693,7 +1796,7 @@ port = 6000
         assert!(cfg.tls_ca_path.is_none());
         assert!(cfg.tls_domain_name.is_none());
         assert_eq!(cfg.connect_timeout_ms, 5_000);
-        assert_eq!(cfg.rpc_timeout_ms, 10_000);
+        assert_eq!(cfg.rpc_timeout_ms, 30_000);
         assert_eq!(cfg.max_rpc_retries, 3);
         assert_eq!(cfg.retry_initial_backoff_ms, 100);
         assert_eq!(cfg.retry_max_backoff_ms, 5_000);
@@ -1966,5 +2069,272 @@ port = 6002
         assert!(!map.contains_key(&NodeId(1)), "self not present");
         assert_eq!(map.get(&NodeId(2)).unwrap(), "https://10.0.0.2:6001");
         assert_eq!(map.get(&NodeId(3)).unwrap(), "https://10.0.0.3:6002");
+    }
+
+    // -----------------------------------------------------------------------
+    // NodeConfig tests (Stage 6.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn node_config_round_trips_existing_cluster_toml_unchanged() {
+        // A `full_toml()`-shaped config (engine-only fields) plus a
+        // single `[[voters]]` block for the local node still loads
+        // as `NodeConfig` and yields the same engine-facing
+        // `ClusterConfig` via `into_cluster_config()`. `[[voters]]`
+        // is now required (see `validate_membership`).
+        let toml = format!(
+            r#"{full}
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440002"
+host = "10.0.0.2"
+port = 7000
+"#,
+            full = full_toml()
+        );
+        let cfg = NodeConfig::from_toml_str(&toml).expect("must parse");
+        assert!(
+            cfg.cluster.observers.is_empty(),
+            "default observers is empty"
+        );
+        assert!(
+            cfg.admin_listen_addr.is_none(),
+            "admin_listen_addr is optional, defaults to None"
+        );
+        let cluster = cfg.into_cluster_config();
+        assert_eq!(cluster.node_id, NodeId(2));
+        assert_eq!(cluster.cluster_id, "prod-cluster");
+        assert_eq!(cluster.listen_addr, "10.0.0.2:7000");
+    }
+
+    #[test]
+    fn node_config_admin_listen_addr_round_trip_from_toml() {
+        // Operator-supplied `admin_listen_addr` in the TOML lands
+        // on `NodeConfig` (server-only field; engine `ClusterConfig`
+        // never sees it). The default is `None` (the binary then
+        // falls back to `DEFAULT_ADMIN_LISTEN_ADDR`).
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "10.0.0.1:6000"
+admin_listen_addr = "0.0.0.0:9001"
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+"#;
+        let cfg = NodeConfig::from_toml_str(toml).expect("must parse");
+        assert_eq!(
+            cfg.admin_listen_addr.as_deref(),
+            Some("0.0.0.0:9001"),
+            "admin_listen_addr deserialises off the top-level TOML key"
+        );
+    }
+
+    #[test]
+    fn node_config_flatten_works_with_voters_array() {
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "10.0.0.1:6000"
+observers = [4, 5]
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440001"
+host = "10.0.0.2"
+port = 6000
+"#;
+        let cfg = NodeConfig::from_toml_str(toml).expect("must parse");
+        assert_eq!(cfg.cluster.observers, vec![4, 5]);
+        assert_eq!(cfg.cluster.voters.len(), 2);
+        assert_eq!(cfg.cluster.voters[0].host, "10.0.0.1");
+    }
+
+    #[test]
+    fn node_config_rejects_empty_voters() {
+        // Stage 6.1 hardening: empty `voters` was previously accepted
+        // as an "implicit single-node bootstrap", but that left the
+        // engine with no `voter_set`, so `has_election_quorum` always
+        // returned false and the cluster could never elect a leader.
+        // The contract is now: every cluster MUST declare at least one
+        // structured `[[voters]]` entry (even single-node clusters).
+        let toml = r#"
+node_id = 99
+cluster_id = "c"
+listen_addr = "127.0.0.1:6000"
+"#;
+        let err = NodeConfig::from_toml_str(toml).expect_err("empty voters must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("[[voters]]"),
+            "error must guide operator to add [[voters]]: {msg}"
+        );
+        assert!(
+            msg.contains("at least one"),
+            "error must explain the at-least-one rule: {msg}"
+        );
+    }
+
+    #[test]
+    fn node_config_rejects_observer_only_without_voters() {
+        // Observers cannot stand in for voters because an observer-
+        // only cluster has nobody who can win an election. Configuring
+        // `observers = [...]` without `[[voters]]` is rejected for the
+        // same reason as empty voters/observers.
+        let toml = r#"
+node_id = 5
+cluster_id = "c"
+listen_addr = "127.0.0.1:6000"
+observers = [5]
+"#;
+        let err = NodeConfig::from_toml_str(toml)
+            .expect_err("observer-only (no voters) must be rejected");
+        assert!(format!("{err}").contains("[[voters]]"));
+    }
+
+    #[test]
+    fn node_config_membership_rejects_node_outside_voter_set() {
+        let toml = r#"
+node_id = 99
+cluster_id = "c"
+listen_addr = "10.0.0.9:6000"
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440001"
+host = "10.0.0.2"
+port = 6000
+"#;
+        let err = NodeConfig::from_toml_str(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("node_id 99"),
+            "error must name the missing node_id: {msg}"
+        );
+        assert!(
+            msg.contains("not present"),
+            "error must say not present: {msg}"
+        );
+    }
+
+    #[test]
+    fn node_config_membership_accepts_node_in_voter_set() {
+        let toml = r#"
+node_id = 2
+cluster_id = "c"
+listen_addr = "10.0.0.2:6000"
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440001"
+host = "10.0.0.2"
+port = 6000
+"#;
+        NodeConfig::from_toml_str(toml).expect("voter membership valid");
+    }
+
+    #[test]
+    fn node_config_membership_accepts_node_in_observer_set() {
+        let toml = r#"
+node_id = 5
+cluster_id = "c"
+listen_addr = "10.0.0.5:6000"
+observers = [5, 6]
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+"#;
+        let cfg = NodeConfig::from_toml_str(toml).expect("observer membership valid");
+        assert_eq!(cfg.cluster.observers, vec![5, 6]);
+    }
+
+    #[test]
+    fn node_config_membership_rejects_both_voter_and_observer() {
+        // A node MUST NOT be a voter AND an observer simultaneously.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "10.0.0.1:6000"
+observers = [1]
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+"#;
+        let err = NodeConfig::from_toml_str(toml).unwrap_err();
+        assert!(format!("{err}").contains("BOTH"));
+    }
+
+    #[test]
+    fn node_config_into_cluster_config_preserves_observers() {
+        // Observers now live on ClusterConfig directly, so the
+        // conversion is lossless. The engine consults
+        // `cluster.observers` to seed `NodeRole::Observer` when
+        // applicable (see `RaftNode::new_inner`).
+        let mut cluster = ClusterConfig::from_toml_str(valid_toml()).unwrap();
+        cluster.observers = vec![10, 11];
+        // Add a [[voters]] entry programmatically — the tightened
+        // `validate_membership` requires at least one voter and we
+        // need the local node_id to be a member somewhere.
+        cluster.voters = vec![VoterConfig {
+            node_id: cluster.node_id.0,
+            directory_id: "550e8400-e29b-41d4-a716-446655440003".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 6001,
+        }];
+        let cfg = NodeConfig {
+            cluster,
+            admin_listen_addr: None,
+        };
+        cfg.validate().expect("populated cfg must validate");
+        let cluster = cfg.into_cluster_config();
+        assert_eq!(cluster.node_id, NodeId(1));
+        assert_eq!(cluster.observers, vec![10, 11]);
+    }
+
+    #[test]
+    fn node_config_validate_re_runs_membership_after_mutation() {
+        // Models the main.rs CLI `--node-id` override path:
+        // load, mutate node_id, re-validate.
+        let toml = r#"
+node_id = 1
+cluster_id = "c"
+listen_addr = "10.0.0.1:6000"
+[[voters]]
+node_id = 1
+directory_id = "550e8400-e29b-41d4-a716-446655440000"
+host = "10.0.0.1"
+port = 6000
+[[voters]]
+node_id = 2
+directory_id = "550e8400-e29b-41d4-a716-446655440001"
+host = "10.0.0.2"
+port = 6000
+"#;
+        let mut cfg = NodeConfig::from_toml_str(toml).expect("initial valid");
+        // Override node_id to a non-member ⇒ re-validate must error.
+        cfg.cluster.node_id = NodeId(7);
+        let err = cfg.validate().unwrap_err();
+        assert!(format!("{err}").contains("node_id 7"));
+        // Override to a valid voter ⇒ re-validate must succeed.
+        cfg.cluster.node_id = NodeId(2);
+        cfg.validate().expect("override to valid voter must pass");
     }
 }

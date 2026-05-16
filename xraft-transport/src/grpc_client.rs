@@ -241,15 +241,11 @@ impl RaftGrpcClient {
         // Per-peer connect serialisation. Look up the peer's mutex; an
         // unknown peer is a configuration error (matches the original
         // behaviour of returning `Misconfigured` before any connect).
-        let connect_lock = self
-            .connect_locks
-            .get(&peer)
-            .cloned()
-            .ok_or_else(|| {
-                ChannelError::Misconfigured(XRaftError::Transport(format!(
-                    "no endpoint configured for peer {peer:?}; check ClusterConfig.voters"
-                )))
-            })?;
+        let connect_lock = self.connect_locks.get(&peer).cloned().ok_or_else(|| {
+            ChannelError::Misconfigured(XRaftError::Transport(format!(
+                "no endpoint configured for peer {peer:?}; check ClusterConfig.voters"
+            )))
+        })?;
 
         // Hold the per-peer guard across the entire connect + insert
         // critical section so that concurrent tasks for *this* peer
@@ -613,7 +609,8 @@ mod tests {
 
     #[test]
     fn channel_error_connect_wraps_message_in_transport() {
-        let err: XRaftError = ChannelError::Connect("connect to peer 7: refused".to_string()).into();
+        let err: XRaftError =
+            ChannelError::Connect("connect to peer 7: refused".to_string()).into();
         match err {
             XRaftError::Transport(msg) => {
                 assert!(msg.contains("connect to peer 7"), "got: {msg}");
