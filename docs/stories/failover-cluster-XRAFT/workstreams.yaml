@@ -40,6 +40,20 @@
   workstreamId: "ws-failover-cluster-xraft-phase-persistent-storage-stage-snapshot-storage"
   branch: "ws/failover-cluster-XRAFT/phase-persistent-storage-stage-snapshot-storage"
   status: "pending"
+- title: "Raft Node State Machine"
+  description: "I/O-free consensus engine: ElectionTimer, PeerState, RaftNode, role transitions (Follower / PreCandidate / Candidate / Leader), step() input dispatcher with Tick handling, and visible RejectUnsupportedInput fence for the eight handlers deferred to Stage 3.2 (Leader Election) and Stage 3.3 (Log Replication). Foundation that stage-leader-election and stage-log-replication build on."
+  anchor: "stage-raft-node-state-machine"
+  contentHash: ""
+  workstreamId: "ws-failover-cluster-xraft-phase-consensus-engine-stage-raft-node-state-machine"
+  # NOTE: branch prefix is `phase-raft-consensus-engine-...` not
+  # `phase-consensus-engine-...` (sibling pattern) because that is the
+  # actual git branch this workstream's iterations were created on.
+  # The canonical anchor + workstreamId still use `phase-consensus-engine`
+  # per the workstreams.yaml convention; the branch name preserves the
+  # historical iteration prefix to avoid breaking automation that
+  # tracks the live branch.
+  branch: "ws/failover-cluster-XRAFT/phase-raft-consensus-engine-stage-raft-node-state-machine"
+  status: "in_progress"
 - title: "Leader Election"
   description: "Implement Pre-Vote, RequestVote, term management, and leader transition logic"
   anchor: "stage-leader-election"

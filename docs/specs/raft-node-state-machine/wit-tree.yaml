@@ -10,15 +10,16 @@
 #   step  -> file set  : <= 20 changed files
 #
 # Counts here:
-#   1 phase, 3 stages, 11 steps. Max files-per-step = 2. Well within budget.
+#   1 phase, 3 stages, 12 steps. Max files-per-step = 2. Well within budget.
 #
-# Anchor note: `stage-raft-node-state-machine` is a NEW stage inserted
-# before `stage-leader-election` in the existing
-# `docs/stories/failover-cluster-XRAFT/workstreams.yaml`. It lives under
-# the existing `phase-consensus-engine` parent (NOT
+# Anchor note: `stage-raft-node-state-machine` is added to
+# `docs/stories/failover-cluster-XRAFT/workstreams.yaml` in the same
+# commit that lands this WIT, inserted before `stage-leader-election`
+# under the existing `phase-consensus-engine` parent (NOT
 # `phase-raft-consensus-engine`, which is only the per-iteration branch
-# prefix). The stage is the structural foundation that
-# `stage-leader-election` and `stage-log-replication` later build on.
+# prefix used by this workstream's iteration branch). The stage is the
+# structural foundation that `stage-leader-election` and
+# `stage-log-replication` later build on.
 
 feature: "Raft Node State Machine"
 slug: "raft-node-state-machine"
@@ -137,10 +138,15 @@ phases:
               role=PreCandidate, installs a fresh pre_votes_received
               (VoteGrantedSet) pre-credited with the self pre-vote,
               resets the election timer with a fresh random target,
-              returns Action::SendMessage(PreVoteRequest) fan-out to
-              every voter peer. Tests assert term and voted_for are
+              returns one Action::SendMessage { to: NodeId, message:
+              OutboundMessage::PreVoteRequest(..) } per voter peer
+              (field is named `to`, matching the existing
+              xraft-core/src/message.rs::Action::SendMessage
+              declaration). Tests assert term and voted_for are
               unchanged, self-pre-vote is the only initial entry, and
-              one SendMessage per peer is emitted.
+              one SendMessage per peer is emitted. Single-voter self-
+              quorum cascade lives in step-single-voter-self-quorum-
+              cascade.
             files:
               - "xraft-core/src/node.rs"
             expectedFileChanges: 1
@@ -151,10 +157,14 @@ phases:
               voted_for = Some(self.id), installs a fresh
               votes_received pre-credited with the self vote, resets
               election timer, emits PersistHardState (term/vote must
-              be durable before any RPC) followed by
-              Action::SendMessage(VoteRequest) fan-out. Tests assert
-              the term bump magnitude, self-vote presence, and the
+              be durable before any RPC) followed by one
+              Action::SendMessage { to: NodeId, message:
+              OutboundMessage::VoteRequest(..) } per voter peer
+              (field is `to`, NOT `target`). Tests assert the term
+              bump magnitude, self-vote presence, and the
               PersistHardState-before-SendMessage action ordering.
+              Single-voter self-quorum cascade lives in step-single-
+              voter-self-quorum-cascade.
             files:
               - "xraft-core/src/node.rs"
             expectedFileChanges: 1
@@ -171,6 +181,36 @@ phases:
               no-op entry uses current_term, peers are fully
               initialised, and the action ordering is
               BecomeLeader -> AppendEntries.
+            files:
+              - "xraft-core/src/node.rs"
+            expectedFileChanges: 1
+          - id: "step-single-voter-self-quorum-cascade"
+            title: "Single-voter self-quorum cascade in become_pre_candidate / become_candidate"
+            description: >-
+              In a cluster whose voter_set has size 1, the self pre-
+              vote alone is already a pre-election quorum and the
+              self vote alone is already an election quorum. There is
+              no peer PreVoteResponse or VoteResponse to drive
+              promotion through Stage 3.2 handlers, so the engine
+              MUST short-circuit. At the end of become_pre_candidate,
+              if pre_votes_received already reaches
+              voter_set.quorum_size() (true iff voter_set has size 1),
+              append the actions returned by an immediate call to
+              become_candidate() to the return buffer. At the end of
+              become_candidate, if votes_received already reaches
+              quorum, append the actions returned by an immediate
+              call to become_leader() to the return buffer. Required
+              for correctness because no asynchronous response would
+              otherwise wake a one-voter cluster. Tests:
+              (a) scenario single-voter-pre-candidate-cascades-to-
+              leader: a one-voter cluster returns the action sequence
+              PersistHardState -> BecomeLeader -> AppendEntries(no-op)
+              from a single become_pre_candidate() call, ends in role
+              Leader, term 1, and emits zero SendMessage actions;
+              (b) scenario single-voter-election-via-tick: a one-
+              voter cluster ticked past the election timeout reaches
+              role Leader with current_term == 1 and
+              last_log_index == 1 within the same tick window.
             files:
               - "xraft-core/src/node.rs"
             expectedFileChanges: 1
@@ -191,10 +231,22 @@ phases:
               Stage-3.3-deferred variants (ClientPropose,
               FetchRequest, FetchResponse, FetchRequestAcked). Action
               surface adds PersistHardState, AppendEntries,
-              SendMessage { target, message: OutboundMessage },
-              BecomeLeader, StepDown, RejectUnsupportedInput {
-              input_kind: &'static str, reason: String }. Re-export
-              Input, Action, OutboundMessage through lib.rs.
+              SendMessage { to: NodeId, message: OutboundMessage }
+              (the field is named `to`, NOT `target` - must match the
+              existing xraft-core/src/message.rs::Action::SendMessage
+              struct variant; downstream code that follows the
+              `target` name would not compile against the crate
+              surface), BecomeLeader, StepDown,
+              RejectUnsupportedInput { input_kind: &'static str,
+              reason: String }. Stage-3.3-only Action variants are
+              ALSO declared in 3.1 so the action enum is closed and
+              the driver can pattern-match exhaustively, even though
+              3.1 never emits them: ApplyToStateMachine { from, to },
+              TakeSnapshot, InstallSnapshot { metadata, data },
+              ServeFetch { to, cluster_id, leader_epoch, leader_id,
+              high_watermark, fetch_offset, last_fetched_epoch },
+              TruncateLog { from_index_inclusive }. Re-export Input,
+              Action, OutboundMessage through lib.rs.
             files:
               - "xraft-core/src/message.rs"
               - "xraft-core/src/lib.rs"

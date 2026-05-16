@@ -10,6 +10,41 @@ status: "planned"
 
 # Raft Node State Machine — Design Narrative
 
+## Prior Feedback Resolution (iteration 3)
+
+This iteration closes the four "What still needs work" items called out
+by the iteration-2 evaluator (score 82). Each is marked `ADDRESSED`:
+
+1. `ADDRESSED` — `Action::SendMessage { target, message }` is corrected
+   to the actual public API `SendMessage { to: NodeId, message:
+   OutboundMessage }` in both `plan.md` Step 3.1 (and the surrounding
+   Step 2.2 / 2.3 narrative) and `wit-tree.yaml`
+   `step-input-action-enum-surface` / `step-become-pre-candidate` /
+   `step-become-candidate`. The field name `to` matches the existing
+   `xraft-core/src/message.rs::Action::SendMessage` declaration.
+2. `ADDRESSED` — `stage-raft-node-state-machine` is inserted into
+   `docs/stories/failover-cluster-XRAFT/workstreams.yaml`, immediately
+   after `stage-snapshot-storage` and before `stage-leader-election`,
+   with the canonical workstreamId
+   `ws-failover-cluster-xraft-phase-consensus-engine-stage-raft-node-state-machine`.
+   The anchor now exists in the workstreams file rather than being
+   only a "requested insertion" in the plan.
+3. `ADDRESSED` — `docs/stories/failover-cluster-XRAFT/implementation-plan.md`
+   Stage 3.1 is updated so the election-timeout step routes through
+   the Pre-Vote-first path, and the test scenario
+   `election-timeout-triggers-candidacy` is rewritten as
+   `election-timeout-triggers-pre-candidacy` (term unchanged). The
+   stale "increments term on timeout" acceptance criterion is
+   removed; full term-bump promotion is deferred to Stage 3.2 with
+   the explicit cross-reference.
+4. `ADDRESSED` — Single-voter self-quorum cascade is promoted from
+   "open question" to a concrete deliverable: new Stage 2 Step 2.5
+   (`step-single-voter-self-quorum-cascade` in the WIT) with two
+   named test scenarios (`single-voter-pre-candidate-cascades-to-
+   leader` and `single-voter-election-via-tick`). The same two
+   scenarios are mirrored into the implementation-plan.md Stage 3.1
+   test list for cross-doc consistency.
+
 ## Context and Intent
 
 XRAFT is a Rust implementation of the Raft consensus protocol that follows
@@ -193,20 +228,25 @@ own review windows.
   `current_term` or `voted_for`; sets `role = PreCandidate`,
   installs a fresh `pre_votes_received` (`VoteGrantedSet`) pre-credited
   with a self-pre-vote, resets the election timer with a fresh
-  random target, and returns the `Action::SendMessage(PreVoteRequest)`
-  fan-out to every voter peer. Tests assert term and `voted_for` are
-  unchanged, the self pre-vote is the sole entry, and one
-  `SendMessage` per peer is emitted. Files: `xraft-core/src/node.rs`.
-  Budget: 1.
+  random target, and returns one
+  `Action::SendMessage { to: <peer>, message:
+  OutboundMessage::PreVoteRequest(..) }` per voter peer (the field
+  name is `to`, matching `xraft-core/src/message.rs::Action`). Tests
+  assert term and `voted_for` are unchanged, the self pre-vote is the
+  sole entry, and one `SendMessage` per peer is emitted. The single-
+  voter self-quorum cascade lives in Step 2.5. Files:
+  `xraft-core/src/node.rs`. Budget: 1.
 - Step 2.3 — `become_candidate()`: increments `current_term` by
   exactly one, sets `voted_for = Some(self.id)`, installs a fresh
   `votes_received` pre-credited with a self-vote, resets the
   election timer, emits `Action::PersistHardState` (term/vote bump
-  must be durable before any RPC) followed by the
-  `Action::SendMessage(VoteRequest)` fan-out. Tests assert the term
-  bump magnitude, self-vote presence, and `PersistHardState` ordering
-  before any `SendMessage`. Files: `xraft-core/src/node.rs`.
-  Budget: 1.
+  must be durable before any RPC) followed by one
+  `Action::SendMessage { to: <peer>, message:
+  OutboundMessage::VoteRequest(..) }` per voter peer. Tests assert
+  the term bump magnitude, self-vote presence, and `PersistHardState`
+  ordering before any `SendMessage`. The single-voter self-quorum
+  cascade lives in Step 2.5. Files: `xraft-core/src/node.rs`. Budget:
+  1.
 - Step 2.4 — `become_leader()`: initialises the `peers` map (one
   `PeerState` per voter except self, `last_fetch_offset = LogIndex(0)`,
   `last_fetch_time = self.logical_tick`,
@@ -217,6 +257,36 @@ own review windows.
   `current_term`, peers are fully initialised, and the action ordering
   is `BecomeLeader → AppendEntries`. Files: `xraft-core/src/node.rs`.
   Budget: 1.
+- Step 2.5 — Single-voter self-quorum cascade. In a cluster whose
+  `voter_set` has size 1 (this node only), the self pre-vote alone is
+  already a pre-election quorum and the self vote alone is already an
+  election quorum. There is no peer `PreVoteResponse` or `VoteResponse`
+  to drive promotion through the Stage 3.2 handlers, so the engine
+  MUST short-circuit inside `become_pre_candidate` and
+  `become_candidate`:
+  - At the end of `become_pre_candidate`, if `pre_votes_received` has
+    already reached `voter_set.quorum_size()` (true iff `voter_set`
+    has size 1), the method appends the actions returned by an
+    immediate call to `become_candidate()` to its own return buffer
+    instead of stopping at the fan-out.
+  - At the end of `become_candidate`, if `votes_received` has already
+    reached quorum, the method appends the actions returned by an
+    immediate call to `become_leader()` to its own return buffer.
+  This is the only place a Stage 3.1 transition emits the actions of a
+  later transition; the cascade is contained, deterministic, and
+  required for correctness because no asynchronous response would
+  otherwise wake the node. Test obligations:
+  - Scenario `single-voter-pre-candidate-cascades-to-leader`: a one-
+    voter cluster constructed with `new_with_seed`, when a single
+    `become_pre_candidate()` is invoked, returns the action sequence
+    `PersistHardState → BecomeLeader → AppendEntries(no-op)` in that
+    order, ends in role `Leader`, term 1, and emits zero
+    `SendMessage`s (no peers).
+  - Scenario `single-voter-election-via-tick`: a one-voter cluster
+    that has been ticked past the election timeout reaches role
+    `Leader` with `current_term == 1` and `last_log_index == 1`
+    within the same tick window.
+  Files: `xraft-core/src/node.rs`. Budget: 1.
 
 #### Stage 3: Input Dispatcher and Tick Handler
 
@@ -234,7 +304,9 @@ the contract boundary with 3.2/3.3.
     driver can compile against the full surface; their handlers are
     placeholder `RejectUnsupportedInput` arms (see Step 3.3).
   - `Action` surface adds `PersistHardState`, `AppendEntries`,
-    `SendMessage { target, message: OutboundMessage }`,
+    `SendMessage { to: NodeId, message: OutboundMessage }` (the field
+    is named `to`, NOT `target` — must match the existing
+    `xraft-core/src/message.rs::Action::SendMessage` declaration),
     `BecomeLeader`, `StepDown`, `RejectUnsupportedInput {
     input_kind: &'static str, reason: String }`. Stage-3.3-only
     actions (`ApplyToStateMachine`, `TakeSnapshot`,
@@ -328,26 +400,57 @@ the contract boundary with 3.2/3.3.
 - **Admin HTTP and metrics.** Integration phase
   (`stage-admin-api-and-observability`).
 
-## Open Questions
+## Cross-Document Supersedes
 
-1. **Where should `last_leader_contact_tick` updates land?**
-   Stage 3.1 only updates this field from the explicit
-   `become_follower(_, Some(id))` path. Stage 3.3 will also bump it
-   on every successful `FetchResponse`. We resolve this by leaving
-   the field `pub` within the crate so 3.3 can update without
-   re-architecting.
-2. **Should `PreCandidate` count its own pre-vote?** We follow the
-   `etcd-raft` convention: yes, self-pre-vote is pre-credited so a
-   single-node cluster can self-promote. Documented in
-   `become_pre_candidate` doc comment.
+`docs/stories/failover-cluster-XRAFT/implementation-plan.md` Stage 3.1
+predates the explicit Pre-Vote safety decision recorded in this plan
+(architecture.md §5.1). Its old acceptance criteria are updated in the
+same iteration that lands this design — specifically:
+
+- Old impl-step #5 ("trigger candidacy if [election timer] expired")
+  is rewritten so the Follower-timeout path enters `PreCandidate`,
+  not `Candidate`, and term is not bumped without pre-vote quorum.
+- Old test scenario `election-timeout-triggers-candidacy` ("transitions
+  to Candidate and increments term") is rewritten as
+  `election-timeout-triggers-pre-candidacy` ("transitions to
+  PreCandidate WITHOUT incrementing term"). The full term-bump
+  promotion is owned by Stage 3.2's existing `election-wins-majority`
+  scenario and Stage 3.2's pre-vote-quorum-tally handler (the new
+  `pre_vote_response` quorum-check path Stage 3.2 introduces); a
+  dedicated `pre-vote-quorum-promotes-to-candidate` scenario name
+  belongs to Stage 3.2 and is NOT introduced here. The single-voter
+  cascade scenarios introduced in Step 2.5 above cover the special
+  one-voter path that has no asynchronous response event.
+
+The cross-doc edit is included in this iteration's commit so the two
+documents agree.
+
+## Resolved Decisions
+
+These were open questions in earlier iterations and are now resolved:
+
+1. **`last_leader_contact_tick` updates.** Stage 3.1 only writes the
+   field from the explicit `become_follower(_, Some(id))` path. Stage
+   3.3 will also bump it on every successful `FetchResponse`. The
+   field is `pub(crate)` so 3.3 can update without re-architecting.
+2. **`PreCandidate` counts its own pre-vote.** Following the
+   `etcd-raft` convention, the self pre-vote is pre-credited in
+   `become_pre_candidate`. Combined with the **single-voter self-
+   quorum cascade in Step 2.5**, this allows a single-node cluster
+   to self-promote from `Follower → PreCandidate → Candidate →
+   Leader` without any peer response event ever arriving. This is no
+   longer an open question — the cascade is a concrete Step 2.5
+   obligation with two named test scenarios.
 3. **`Action` ordering.** The driver must process `Action`s in the
    order emitted. The Stage 3.1 invariant is "`PersistHardState`
    before any `SendMessage` that depends on the persisted field" —
    encoded by always pushing `PersistHardState` first in the
    affected transitions.
-4. **Leftover backup artefacts (`xraft-core/src/node.rs.review-backup`,
-   four `docs/stories/.../*.iter-snapshot.bak` files).** Operator
-   guidance is to defer cleanup of the remaining
-   `node.rs.review-backup` to a dedicated future workstream; the four
-   `.iter-snapshot.bak` files are now gitignored. No source-tree
-   changes belong in this planning iteration.
+
+## Open Questions
+
+1. **Leftover backup artefacts (`xraft-core/src/node.rs.review-backup`).**
+   Per operator guidance, cleanup of the remaining
+   `node.rs.review-backup` is deferred to a dedicated future
+   workstream; the four `.iter-snapshot.bak` files are gitignored. No
+   source-tree changes belong in this planning iteration.
