@@ -32,7 +32,7 @@
 
 #![allow(clippy::result_large_err)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -77,6 +77,23 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Channel capacity for the outbound-result mpsc.
 const OUTBOUND_CHANNEL_CAPACITY: usize = 1024;
+
+/// Stage 7.1 (iter-6 evaluator finding #1) ΓÇö maximum number of
+/// pending lease-slow-path reads the driver will buffer before
+/// rejecting new queries with `NotLeader { leader_hint: None }`.
+///
+/// The slow path enqueues an inbound `ClientQuery` when
+/// `enable_leader_lease` is on but the lease is currently inactive,
+/// waiting for a quorum of voters to confirm leadership via fresh
+/// inbound `FetchRequest`s. Under healthy operation the queue drains
+/// within one or two ticks; under sustained partition it can grow
+/// without bound, eventually trying to retain an `oneshot::Sender`
+/// per buffered read. Capping the queue prevents memory exhaustion
+/// when followers are offline and routes excess load back to the
+/// caller (which can retry once the cluster recovers). Set to 1024
+/// so a moderate read burst fits without spilling, while a partition
+/// scenario cannot accumulate gigabytes of pending Bytes payloads.
+const MAX_PENDING_READS: usize = 1024;
 
 /// Reply for an inbound RPC: either a typed response or an `XRaftError`.
 ///
@@ -233,6 +250,42 @@ struct ClientCommand {
 struct ClientQuery {
     query: Bytes,
     reply: oneshot::Sender<XResult<Bytes>>,
+}
+
+/// Stage 7.1 (iter-6 evaluator finding #1) ΓÇö a `ClientQuery` deferred
+/// onto the lease *slow-path*: enqueued when `enable_leader_lease` is
+/// on but `RaftNode::has_active_lease()` is currently false. The
+/// driver answers the read only once a quorum of voters has confirmed
+/// leadership by sending a fresh `FetchRequest` strictly after the
+/// read was captured (the "extra commit-index confirmation round-trip"
+/// the spec describes), and only once the state machine has applied
+/// at least up to the read's captured `read_index`.
+///
+/// Field semantics:
+/// - `read_index`: the engine's `commit_index` at receipt. Serving
+///   before `last_applied >= read_index` would risk returning state
+///   older than the snapshot the client expects (read-after-commit
+///   linearizability). `commit_index` (not `last_log_index`) is the
+///   correct anchor ΓÇö waiting on uncommitted entries would block
+///   reads behind proposals that may never commit on this term.
+/// - `read_baseline_seq`: snapshot of `RaftNode::fetch_seq` at
+///   receipt. A voter peer counts toward the confirmation quorum iff
+///   its `last_fetch_seq > read_baseline_seq` (strict, monotonic;
+///   immune to coarse-tick aliasing).
+/// - `deadline_tick`: logical-tick deadline after which the slow path
+///   gives up and replies `NotLeader { leader_hint: None }` (the
+///   leader cannot prove it is still leader within the window). Set
+///   to `captured_tick + 2 * check_quorum_interval_ticks` so the
+///   slow path tolerates one full check-quorum window of follower
+///   silence before timing out ΓÇö comfortably more than the typical
+///   Fetch interval but bounded enough that a partitioned leader
+///   does not stall callers indefinitely.
+struct PendingRead {
+    query: Bytes,
+    reply: oneshot::Sender<XResult<Bytes>>,
+    read_index: LogIndex,
+    read_baseline_seq: u64,
+    deadline_tick: u64,
 }
 
 /// Public summary of a successfully-triggered snapshot.
@@ -1198,6 +1251,15 @@ where
     shutdown: Arc<tokio::sync::Notify>,
     /// Pending commit waiters keyed by `LogIndex` of the proposed entry.
     pending: BTreeMap<LogIndex, Vec<oneshot::Sender<XResult<LogIndex>>>>,
+    /// Stage 7.1: wall-clock instant at which the driver first
+    /// registered a pending waiter for each `LogIndex`. Populated
+    /// alongside `pending` (and cleaned up on every `pending`-removal
+    /// path) so [`DriverObserver::on_commit_latency`] can observe the
+    /// "proposal → commit" latency exactly once per index. Subsequent
+    /// waiters that piggyback on the same index do NOT reset the clock;
+    /// the metric reflects time-to-commit for the entry, not for any
+    /// individual waiter.
+    propose_times: BTreeMap<LogIndex, Instant>,
     tick: Interval,
     /// Public handle's event sender (kept here so the inbound handler
     /// can be obtained even after `run()` has been entered).
@@ -1229,6 +1291,21 @@ where
     /// single re-entrant Candidate→Leader transition emits exactly
     /// one histogram sample.
     prev_role: NodeRole,
+    /// Stage 7.1 (iter-6 evaluator finding #1) ΓÇö FIFO of reads
+    /// deferred onto the lease *slow-path*. A `ClientQuery` lands here
+    /// only when `enable_leader_lease` is on AND
+    /// `RaftNode::has_active_lease()` is false at receipt: i.e. the
+    /// leader cannot skip the commit-index confirmation round-trip and
+    /// must wait for a quorum of voter peers to send a fresh
+    /// `FetchRequest` (strict-`>` `fetch_seq`) before answering. The
+    /// queue is bounded by [`MAX_PENDING_READS`]; overflow replies
+    /// `NotLeader { leader_hint: None }` so callers can retry once the
+    /// cluster recovers. Drained by [`Self::drain_pending_reads`] after
+    /// every event-loop iteration, and explicitly on
+    /// [`Action::StepDown`](xraft_core::message::Action::StepDown),
+    /// graceful shutdown, and fail-stop shutdown so no caller hangs on
+    /// a never-resolved `oneshot`.
+    pending_reads: VecDeque<PendingRead>,
 }
 
 /// Observer hook the driver invokes after every event-loop iteration
@@ -1264,6 +1341,46 @@ pub trait DriverObserver: Send + Sync + std::fmt::Debug {
     /// `Candidate` role. Production impls observe the histogram
     /// `xraft_election_latency_seconds`.
     fn on_election_won(&self, elapsed: Duration);
+
+    /// Stage 7.1 — called for every Fetch RPC the driver observes, in
+    /// either direction (a follower/observer that just sent one, or a
+    /// leader that just received one and is about to reply). Production
+    /// impls bump the `xraft_fetch_requests_total{direction="..."}`
+    /// counter. Default impl is a no-op so existing
+    /// [`DriverObserver`] implementations (including the
+    /// `CountingObserver` test double) keep compiling without change.
+    fn on_fetch_request(&self, _direction: FetchDirection) {}
+
+    /// Stage 7.1 — called once per leader event-loop iteration for each
+    /// voter / observer peer with the current replication lag in entries
+    /// (`leader_last_log_index - peer.last_fetch_offset`). Production
+    /// impls set the `xraft_replication_lag{replica="<id>"}` gauge.
+    /// Default impl is a no-op.
+    fn on_replication_lag(&self, _replica: NodeId, _lag: u64) {}
+
+    /// Stage 7.1 — called once per committed proposal with the
+    /// wall-clock latency from "proposal accepted by driver" to "commit
+    /// index advanced past this index". Production impls observe the
+    /// `xraft_commit_latency_seconds` histogram. Default impl is a no-op.
+    fn on_commit_latency(&self, _elapsed: Duration) {}
+
+    /// Stage 7.1 — called when the engine signals the driver to drop
+    /// leader-side state via [`Action::StepDown`]. Production impls
+    /// clear all per-replica `xraft_replication_lag` gauges so the
+    /// scrape does not report stale lag for a node that is no longer
+    /// leader. Default impl is a no-op.
+    fn on_leader_step_down(&self) {}
+}
+
+/// Direction label for the `xraft_fetch_requests_total` counter (Stage 7.1).
+/// "Sent" is a follower/observer issuing a Fetch RPC to the leader;
+/// "Received" is a leader handling an inbound Fetch RPC from a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FetchDirection {
+    /// This node sent a Fetch RPC outbound (follower/observer → leader).
+    Sent,
+    /// This node received a Fetch RPC inbound (leader from peer).
+    Received,
 }
 
 impl<T, L, HS, SS, SM> Driver<T, L, HS, SS, SM>
@@ -1345,12 +1462,14 @@ where
             outbound_rx,
             shutdown,
             pending: BTreeMap::new(),
+            propose_times: BTreeMap::new(),
             tick,
             handle,
             halt_reason: None,
             observer: None,
             candidate_entered_at: None,
             prev_role,
+            pending_reads: VecDeque::new(),
         }
     }
 
@@ -1439,6 +1558,22 @@ where
         if let Some(obs) = &self.observer {
             let status = self.snapshot_node_status();
             obs.on_status(status).await;
+            // Stage 7.1: emit one replication-lag sample per tracked
+            // peer when we are leader. Computed from the engine's
+            // authoritative `last_log_index - peer.last_fetch_offset`
+            // — saturating subtraction so a peer that has somehow
+            // overshot the leader (e.g. partial state during a
+            // reconfiguration) renders as 0 lag rather than wrapping.
+            // The `on_leader_step_down` hook in the
+            // `Action::StepDown` arm clears all gauges so a node that
+            // is no longer leader does not surface stale lag.
+            if self.node.role == NodeRole::Leader {
+                let leader_tip = self.node.last_log_index.0;
+                for (peer_id, peer) in self.node.peers.iter() {
+                    let lag = leader_tip.saturating_sub(peer.last_fetch_offset.0);
+                    obs.on_replication_lag(*peer_id, lag);
+                }
+            }
         }
     }
 
@@ -1535,6 +1670,15 @@ where
             // has been processed but BEFORE the halt-reason check so a
             // fail-stop still publishes the final pre-halt state.
             self.record_role_transition_observations().await;
+
+            // Stage 7.1 (iter-6 evaluator finding #1) ΓÇö resolve any
+            // lease-slow-path reads whose quorum confirmation /
+            // last_applied / role / deadline conditions are now met.
+            // Hooked here (once per loop iteration, BEFORE halt check)
+            // so a freshly-arrived inbound `FetchRequest` that flips
+            // `RaftNode::fetch_seq` past a pending baseline drains the
+            // matching reads on the same iteration ΓÇö no extra latency.
+            self.drain_pending_reads();
 
             // Honour the fail-stop contract immediately, before another
             // tick or RPC can advance the in-memory node past durable
@@ -1637,11 +1781,44 @@ where
                     );
                     return;
                 }
-                if leader_epoch != local_term {
+                // Stage 7.1 (iter-6 evaluator finding #2) ΓÇö split
+                // stale-lower-term from higher-term outbound-stream
+                // responses. The previous `if leader_epoch !=
+                // local_term { return; }` collapsed both into a silent
+                // drop, which violated Stage 7.1's "leader steps down
+                // on higher term from ANY RPC": a snapshot stream from
+                // a peer that has bumped past us is itself proof that
+                // a new leader exists at a higher term, so we MUST
+                // adopt the new term and step down before dropping the
+                // install. Higher-term path mirrors the
+                // `handle_fetch_snapshot` INBOUND-request adoption at
+                // `xraft-server/src/driver.rs::handle_fetch_snapshot`
+                // (which calls `become_follower(Term, None)`) so both
+                // surfaces converge on the same higher-term invariant.
+                if leader_epoch > local_term {
                     warn!(
                         target: "xraft_server::driver",
-                        %peer, expected_epoch = local_term, got_epoch = leader_epoch,
-                        "FetchSnapshot rejected: stale leader_epoch"
+                        %peer, local_epoch = local_term, observed_epoch = leader_epoch,
+                        "FetchSnapshot stream observed higher leader_epoch \
+                         on outbound response ΓÇö adopting new term and stepping down"
+                    );
+                    // Use `None` for the leader hint (not `Some(peer)`):
+                    // the higher term means leadership has shifted, and
+                    // we have no positive evidence that `peer` is the
+                    // CURRENT leader at this new term ΓÇö the snapshot
+                    // stream could have been initiated under a stale
+                    // belief that `peer` is leader. A fresh inbound
+                    // FetchResponse / VoteRequest will establish the
+                    // real leader for term `leader_epoch`.
+                    let actions = self.node.become_follower(Term(leader_epoch), None);
+                    self.process_actions(actions, None).await;
+                    return;
+                }
+                if leader_epoch < local_term {
+                    warn!(
+                        target: "xraft_server::driver",
+                        %peer, local_epoch = local_term, observed_epoch = leader_epoch,
+                        "FetchSnapshot rejected: stale leader_epoch (lower than local term)"
                     );
                     return;
                 }
@@ -1724,6 +1901,15 @@ where
             })
         {
             self.pending.entry(post_last).or_default().push(cmd.reply);
+            // Stage 7.1: stamp the proposal-arrival instant only the first
+            // time a waiter is registered for this index. The metric is
+            // "time entry was first proposed → commit advanced past it",
+            // not per-waiter wall-clock — multiple waiters at the same
+            // index would otherwise reset the clock and underreport
+            // latency.
+            self.propose_times
+                .entry(post_last)
+                .or_insert_with(Instant::now);
         } else {
             // Either we were not leader (handled above) or the engine
             // dropped the propose. Reply with NotLeader so the client
@@ -1745,15 +1931,188 @@ where
     /// because `StateMachine::query` is sync — this also guarantees no
     /// other event slips in between the apply that bumped
     /// `last_applied` and the query that observes it.
-    fn handle_client_query(&self, q: ClientQuery) {
+    ///
+    /// **Stage 7.1 — leader-lease semantics (iter-6 evaluator finding
+    /// #1: real slow-path).** The Stage 7.1 brief is explicit that
+    /// `enable_leader_lease` is a **read-side OPTIMIZATION**: when the
+    /// leader holds an active lease (a quorum of voters have sent a
+    /// `FetchRequest` strictly after `leader_started_tick` and within
+    /// the current `check_quorum_interval_ticks` window), it MAY
+    /// *skip the extra commit-index confirmation round-trip* and
+    /// answer the read immediately from the local state machine. When
+    /// the flag is on but the lease is INACTIVE, the leader cannot
+    /// skip the round-trip — instead of either rejecting the read
+    /// (the iter-2/iter-3 over-fencing bug the iter-4 evaluator
+    /// flagged) or silently degrading to the fast path (the iter-5
+    /// "log-only" stub the iter-6 evaluator flagged), the read is
+    /// *deferred* onto [`Self::pending_reads`] until a quorum of voter
+    /// peers has confirmed leadership by sending a fresh
+    /// `FetchRequest` (strict-`>` `fetch_seq`) AND the state machine
+    /// has applied at least up to the captured `read_index`.
+    /// [`Self::drain_pending_reads`] serves the deferred read once
+    /// both conditions hold, or replies `NotLeader` on role change /
+    /// timeout. When the lease flag is OFF we follow the legacy
+    /// Stage 6.2 direct-query path unchanged (backward compatibility).
+    fn handle_client_query(&mut self, q: ClientQuery) {
         if self.node.role != NodeRole::Leader {
             let _ = q.reply.send(Err(XRaftError::NotLeader {
                 leader_hint: self.node.leader_id,
             }));
             return;
         }
-        let result = self.state_machine.query(&q.query).map(Bytes::from);
-        let _ = q.reply.send(result);
+        // FAST path: lease disabled, OR lease enabled and currently
+        // active (quorum-acked within the check-quorum window). Serve
+        // immediately ΓÇö this is the "skip the extra commit-index
+        // confirmation round-trip" the spec calls out.
+        let lease_on = self.node.config.enable_leader_lease;
+        if !lease_on || self.node.has_active_lease() {
+            if lease_on {
+                tracing::debug!(
+                    node_id = %self.node.id,
+                    term = %self.node.hard_state.current_term,
+                    "Stage 7.1 lease-gated read: fast path (active lease)"
+                );
+            }
+            let result = self.state_machine.query(&q.query).map(Bytes::from);
+            let _ = q.reply.send(result);
+            return;
+        }
+        // SLOW path: lease enabled but currently inactive. Defer the
+        // read until [`drain_pending_reads`] can prove a fresh quorum
+        // and the state machine has caught up to `read_index`.
+        if self.pending_reads.len() >= MAX_PENDING_READS {
+            tracing::warn!(
+                node_id = %self.node.id,
+                pending = self.pending_reads.len(),
+                cap = MAX_PENDING_READS,
+                "Stage 7.1 lease-gated read: pending-read queue at cap; \
+                 rejecting new query with NotLeader so caller can retry"
+            );
+            let _ = q
+                .reply
+                .send(Err(XRaftError::NotLeader { leader_hint: None }));
+            return;
+        }
+        let deadline_tick = self
+            .node
+            .logical_tick
+            .saturating_add(self.node.check_quorum_interval_ticks.saturating_mul(2));
+        tracing::debug!(
+            node_id = %self.node.id,
+            term = %self.node.hard_state.current_term,
+            read_index = %self.node.commit_index,
+            baseline_seq = self.node.fetch_seq,
+            deadline_tick,
+            "Stage 7.1 lease-gated read: slow path (deferring for quorum confirmation)"
+        );
+        self.pending_reads.push_back(PendingRead {
+            query: q.query,
+            reply: q.reply,
+            read_index: self.node.commit_index,
+            read_baseline_seq: self.node.fetch_seq,
+            deadline_tick,
+        });
+    }
+
+    /// Stage 7.1 (iter-6 evaluator finding #1) ΓÇö drain
+    /// [`Self::pending_reads`]: serve every queued read whose
+    /// commit-index confirmation conditions are now met, fail every
+    /// read whose deadline has elapsed or whose leader has stepped
+    /// down, and leave the rest in the queue for the next iteration.
+    ///
+    /// "Confirmation conditions met" means:
+    /// 1. We are still the leader. Otherwise reply `NotLeader` with
+    ///    the (possibly updated) `leader_id` hint and drop the entry.
+    /// 2. A quorum of voters (self + voter peers whose
+    ///    `last_fetch_seq > read_baseline_seq`) has acknowledged
+    ///    leadership AFTER the read was captured. This is the
+    ///    deferred ReadIndex "round-trip": each inbound FetchRequest
+    ///    increments `RaftNode::fetch_seq` and stamps the peer's
+    ///    `last_fetch_seq`, so a strict-`>` comparison against the
+    ///    captured baseline cleanly identifies "fresh" Fetches.
+    /// 3. The state machine has applied at least up to the captured
+    ///    `read_index`. Without this gate the served bytes could be
+    ///    older than the snapshot the client expects to see.
+    ///
+    /// On timeout (`logical_tick > deadline_tick`) we reply
+    /// `NotLeader { leader_hint: None }` ΓÇö the leader cannot prove it
+    /// is still leader, which is operationally indistinguishable from
+    /// "step down / route elsewhere" for the caller.
+    fn drain_pending_reads(&mut self) {
+        if self.pending_reads.is_empty() {
+            return;
+        }
+        let leader_hint = self.node.leader_id;
+        let role_is_leader = self.node.role == NodeRole::Leader;
+        let now_tick = self.node.logical_tick;
+        let last_applied = self.node.last_applied;
+
+        // Collect the queue into a Vec first so subsequent calls
+        // through `&self` (e.g. `has_read_index_quorum_proof`) do not
+        // conflict with the `drain(..)` mutable borrow on
+        // `self.pending_reads` itself.
+        let n = self.pending_reads.len();
+        let drained: Vec<PendingRead> = self.pending_reads.drain(..).collect();
+        let mut still_pending: VecDeque<PendingRead> = VecDeque::with_capacity(n);
+        for pr in drained {
+            if !role_is_leader {
+                let _ = pr.reply.send(Err(XRaftError::NotLeader { leader_hint }));
+                continue;
+            }
+            if now_tick > pr.deadline_tick {
+                tracing::warn!(
+                    node_id = %self.node.id,
+                    deadline_tick = pr.deadline_tick,
+                    now_tick,
+                    "Stage 7.1 lease-gated read: slow-path timeout; \
+                     no quorum confirmation within window"
+                );
+                let _ = pr
+                    .reply
+                    .send(Err(XRaftError::NotLeader { leader_hint: None }));
+                continue;
+            }
+            if self.has_read_index_quorum_proof(pr.read_baseline_seq)
+                && last_applied >= pr.read_index
+            {
+                let result = self.state_machine.query(&pr.query).map(Bytes::from);
+                let _ = pr.reply.send(result);
+            } else {
+                still_pending.push_back(pr);
+            }
+        }
+        self.pending_reads = still_pending;
+    }
+
+    /// Stage 7.1 (iter-6 evaluator finding #1) ΓÇö count this leader
+    /// (when it is itself a voter) plus every voter peer whose
+    /// `last_fetch_seq` is strictly greater than the captured
+    /// `read_baseline_seq`; return `true` iff the count is at least
+    /// the voter-quorum size. This is the ReadIndex confirmation
+    /// quorum check for the slow path: a voter contributes only if
+    /// it has sent a fresh `FetchRequest` AFTER the pending read was
+    /// captured (= after the leader stamped the read's baseline).
+    fn has_read_index_quorum_proof(&self, read_baseline_seq: u64) -> bool {
+        let Some(vs) = self.node.voter_set.as_ref() else {
+            return false;
+        };
+        let voter_ids: std::collections::HashSet<NodeId> =
+            vs.voters().iter().map(|v| v.node_id).collect();
+        let needed = vs.quorum_size();
+        let mut acks: usize = if voter_ids.contains(&self.node.id) {
+            1
+        } else {
+            0
+        };
+        for (peer_id, peer) in self.node.peers.iter() {
+            if !voter_ids.contains(peer_id) {
+                continue;
+            }
+            if peer.last_fetch_seq > read_baseline_seq {
+                acks = acks.saturating_add(1);
+            }
+        }
+        acks >= needed
     }
 
     /// Handle [`DriverEvent::TriggerSnapshot`] — operator-triggered
@@ -1897,11 +2256,35 @@ where
 
     async fn handle_inbound_fetch(&mut self, req: FetchRequest, reply: FetchReply) {
         let replica = req.replica_id;
+        // Capture the leader-acceptance preconditions BEFORE consuming
+        // `req` into the engine step. The Stage 7.1 metric contract
+        // says `xraft_fetch_requests_total{direction="received"}`
+        // counts "Fetch RPCs RECEIVED BY THE LEADER" (per
+        // `architecture.md` §7) — not "Fetch RPCs observed at the
+        // network listener". So we filter out:
+        //   - wrong-cluster traffic (network noise from foreign
+        //     clusters re-using the listen address), and
+        //   - non-leader receipts (a follower's listener happens to
+        //     accept the Fetch but the engine immediately rejects it
+        //     with NotLeader).
+        // Counted: a Fetch RPC accepted by this node WHILE IT WAS
+        // LEADER for the right cluster, regardless of whether the
+        // engine later steps us down in the same step (e.g. higher
+        // term embedded in the RPC) — the receipt itself happened at
+        // a leader.
+        let cluster_matches = req.cluster_id == self.node.config.cluster_id;
+        let was_leader_at_receipt = self.node.role == NodeRole::Leader;
         let actions = self.node.step(Input::FetchRequest(req));
         let captured = self.process_actions(actions, Some(replica)).await;
         if let Some(err) = captured.error {
             let _ = reply.send(Err(err));
             return;
+        }
+        if cluster_matches
+            && was_leader_at_receipt
+            && let Some(obs) = self.observer.as_ref()
+        {
+            obs.on_fetch_request(FetchDirection::Received);
         }
         let response = captured.fetch.unwrap_or_else(|| self.default_deny_fetch());
         let _ = reply.send(Ok(response));
@@ -1979,12 +2362,48 @@ where
             return;
         }
 
-        // (5) leader_epoch: strict equality with current term. A mismatch
-        // means either the caller or we are stale; the caller must
-        // re-discover the leader rather than have us serve a chunk
-        // stream stamped with our (possibly different) leader_epoch.
+        // (5) leader_epoch handling. Three cases:
+        //  - req.leader_epoch > our_term: a peer that just passed the
+        //    membership check (4) is on a more recent term, so we must
+        //    step down (synthesise `become_follower(Term, None)` and
+        //    let `process_actions` clear leader-side state — pending
+        //    waiters, propose_times, replication-lag gauges) and
+        //    reply NotLeader so the caller re-discovers the new
+        //    leader. This is the Stage 7.1 audit fix: this RPC
+        //    bypasses `RaftNode::step` and was the one entry that
+        //    missed the engine's higher-term step-down cascade (the
+        //    Vote / PreVote / Fetch handlers in `xraft-core/src/node.rs`
+        //    already do this).
+        //  - req.leader_epoch < our_term: the caller is stale; reply
+        //    with the epoch-mismatch transport error so they
+        //    re-discover the leader. We MUST NOT mutate state on a
+        //    stale request.
+        //  - equal: proceed to snapshot lookup.
         let our_term = self.node.hard_state.current_term.0;
-        if req.leader_epoch != our_term {
+        if req.leader_epoch > our_term {
+            let new_term = Term(req.leader_epoch);
+            let actions = self.node.become_follower(new_term, None);
+            let captured = self.process_actions(actions, None).await;
+            if let Some(err) = captured.error {
+                // Stage 7.1 evaluator iter-2 #4: the higher-term
+                // step-down emitted `Action::PersistHardState` (term
+                // bump) and that persist failed. We MUST NOT reply
+                // with NotLeader — that implies a clean transition,
+                // but the new term never reached disk so the Raft
+                // persist-before-reply contract is violated. Surface
+                // the underlying storage error so the caller knows
+                // the RPC failed; `process_actions` will already
+                // have set `halt_reason` and the driver will
+                // fail-stop on its next loop tick.
+                let _ = reply.send(Err(err));
+                return;
+            }
+            let _ = reply.send(Err(XRaftError::NotLeader {
+                leader_hint: self.node.leader_id,
+            }));
+            return;
+        }
+        if req.leader_epoch < our_term {
             let _ = reply.send(Err(XRaftError::Transport(format!(
                 "FetchSnapshot leader_epoch mismatch: caller={}, ours={}",
                 req.leader_epoch, our_term
@@ -2111,6 +2530,10 @@ where
                                     let _ = w.send(Err(XRaftError::Storage(msg.clone())));
                                 }
                             }
+                            // Stage 7.1: drop the corresponding latency
+                            // stamp so the BTreeMap does not leak entries
+                            // that will never reach `resolve_waiters_at`.
+                            self.propose_times.remove(&entry.index);
                         }
                         captured.error = Some(XRaftError::Storage(msg.clone()));
                         self.halt_reason.get_or_insert(msg);
@@ -2125,6 +2548,7 @@ where
                                     let _ = w.send(Err(XRaftError::Storage(msg.clone())));
                                 }
                             }
+                            self.propose_times.remove(&entry.index);
                         }
                         captured.error = Some(XRaftError::Storage(msg.clone()));
                         self.halt_reason.get_or_insert(msg);
@@ -2280,8 +2704,44 @@ where
                             }));
                         }
                     }
+                    // Stage 7.1: drop all pending commit-latency stamps
+                    // and clear per-replica lag gauges so a node that is
+                    // no longer leader does not surface stale latency or
+                    // lag in the next scrape.
+                    self.propose_times.clear();
+                    // Stage 7.1 (iter-6 evaluator finding #1) ΓÇö
+                    // lease-slow-path reads enqueued under our prior
+                    // leadership can never be confirmed by a future
+                    // FetchRequest (we are no longer leader), so resolve
+                    // them now with NotLeader instead of waiting for the
+                    // periodic drain to notice via the `role_is_leader`
+                    // branch.
+                    let stranded = std::mem::take(&mut self.pending_reads);
+                    let hint = self.node.leader_id;
+                    for pr in stranded {
+                        let _ = pr
+                            .reply
+                            .send(Err(XRaftError::NotLeader { leader_hint: hint }));
+                    }
+                    if let Some(obs) = self.observer.as_ref() {
+                        obs.on_leader_step_down();
+                    }
                 }
                 Action::SendMessage { to, message } => {
+                    // Stage 7.1: count outbound Fetch RPCs at the point
+                    // they leave the engine. This catches both:
+                    //  - the normal scheduled-Fetch path
+                    //    (`handle_tick` fetch scheduling block, this
+                    //    arm fires with `OutboundMessage::FetchRequest`)
+                    //  - any future eager-fetch trigger
+                    //  ...without double-counting the inbound-response
+                    //  capture path (which is for *responses*, never
+                    //  for a FetchRequest).
+                    if let OutboundMessage::FetchRequest(_) = &message
+                        && let Some(obs) = self.observer.as_ref()
+                    {
+                        obs.on_fetch_request(FetchDirection::Sent);
+                    }
                     // Inbound-response capture path: when this action's
                     // recipient matches the inbound RPC's origin AND the
                     // message variant matches the expected response shape,
@@ -3066,6 +3526,19 @@ where
                 });
             }
         }
+        // Stage 7.1: observe commit latency exactly once per index. We
+        // remove the stamp on every resolve path (success OR fail) so
+        // the BTreeMap drains alongside `pending` and never leaks. We
+        // only call `on_commit_latency` on the success path because the
+        // metric is "proposal → commit"; failed-commit paths are
+        // covered by `xraft_propose_failures_total` (Stage 6.1) and
+        // would distort the histogram if mixed in.
+        if let Some(t0) = self.propose_times.remove(&index)
+            && result.is_ok()
+            && let Some(obs) = self.observer.as_ref()
+        {
+            obs.on_commit_latency(t0.elapsed());
+        }
     }
 
     fn default_deny_vote(&self) -> VoteResponse {
@@ -3126,9 +3599,21 @@ where
         info!(
             target: "xraft_server::driver",
             pending_waiters = self.pending.len(),
+            pending_reads = self.pending_reads.len(),
             in_flight = self.router.in_flight(),
             "draining queued events"
         );
+        // Stage 7.1 (iter-6 evaluator finding #1) ΓÇö lease-slow-path
+        // reads cannot be served during shutdown (no new FetchRequests
+        // will arrive to confirm leadership, and we may not advance
+        // last_applied past the captured read_index before the drain
+        // deadline). Reply Shutdown so callers do not hang on never-
+        // resolved oneshots; this matches the in-flight `DriverEvent::
+        // Query(q)` branch below which also rejects with Shutdown.
+        let shutdown_reads = std::mem::take(&mut self.pending_reads);
+        for pr in shutdown_reads {
+            let _ = pr.reply.send(Err(XRaftError::Shutdown));
+        }
         let deadline = tokio::time::sleep(self.config.shutdown_drain_deadline);
         tokio::pin!(deadline);
         loop {
@@ -3269,6 +3754,18 @@ where
             for w in list {
                 let _ = w.send(Err(XRaftError::Storage(reason.clone())));
             }
+        }
+
+        // Stage 7.1 (iter-6 evaluator finding #1) ΓÇö lease-slow-path
+        // reads are now stranded: state-machine consistency cannot be
+        // guaranteed after a persistence failure (a missed apply could
+        // mean stale reads). Mirror the inbound `DriverEvent::Query`
+        // path's halt-reply contract and resolve every pending read
+        // with the same Storage(halt_reason) so callers see a
+        // consistent failure rather than a dropped oneshot.
+        let stranded_reads = std::mem::take(&mut self.pending_reads);
+        for pr in stranded_reads {
+            let _ = pr.reply.send(Err(XRaftError::Storage(reason.clone())));
         }
 
         Err(XRaftError::Storage(reason))
@@ -4850,12 +5347,17 @@ port = 6022
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let inbound = handle.inbound_handler();
-        // current_term after single-voter self-election = 1. Send a
-        // wildly stale leader_epoch=99 to trigger the mismatch.
+        // current_term after single-voter self-election = 1. Stage 7.1
+        // audit fix split the "mismatch" handling into two branches:
+        //   - leader_epoch > our_term ⇒ step down + NotLeader
+        //   - leader_epoch < our_term ⇒ Transport(leader_epoch mismatch)
+        // Use a STRICTLY STALE epoch (0 < 1) to exercise the stale path
+        // here — the higher-term branch is covered by
+        // `fetch_snapshot_higher_leader_epoch_steps_down` below.
         let result = inbound
             .handle_fetch_snapshot(FetchSnapshotRequest {
                 cluster_id: "test-driver".into(),
-                leader_epoch: 99,
+                leader_epoch: 0,
                 replica_id: NodeId(2),
                 snapshot_id: "irrelevant".into(),
                 offset: 0,
@@ -4873,6 +5375,881 @@ port = 6022
 
         handle.shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
+    }
+
+    /// Stage 7.1 audit: higher leader_epoch from a known peer causes
+    /// the leader to step down to Follower and reply NotLeader. Without
+    /// this, the FetchSnapshot RPC entry (which bypasses
+    /// `RaftNode::step`) would let a stale leader keep serving snapshot
+    /// bytes at its old term forever.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fetch_snapshot_higher_leader_epoch_steps_leader_down() {
+        let cfg = single_voter_config(2);
+        let (driver, handle, _) = build_driver_with_known_peer(cfg, NodeId(2));
+        let run_task = tokio::spawn(driver.run());
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let inbound = handle.inbound_handler();
+        // After single-voter self-election our term = 1. Send a higher
+        // epoch (99) from the known peer (NodeId(2)).
+        let result = inbound
+            .handle_fetch_snapshot(FetchSnapshotRequest {
+                cluster_id: "test-driver".into(),
+                leader_epoch: 99,
+                replica_id: NodeId(2),
+                snapshot_id: "irrelevant".into(),
+                offset: 0,
+                max_bytes: 0,
+            })
+            .await;
+        match result {
+            Err(XRaftError::NotLeader { .. }) => { /* expected */ }
+            Err(other) => {
+                panic!("expected NotLeader after higher-term step-down, got Err({other:?})")
+            }
+            Ok(_) => panic!("expected NotLeader after higher-term step-down, got Ok(stream)"),
+        }
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
+    }
+
+    /// Stage 7.1 evaluator iter-2 #4 — higher-term FetchSnapshot
+    /// step-down must surface persistence errors. If
+    /// `Action::PersistHardState` (emitted by `become_follower` for
+    /// the term bump) fails, replying with `NotLeader` would imply a
+    /// clean transition even though the new term never reached disk —
+    /// a violation of Raft's persist-before-reply contract. The
+    /// driver must instead propagate the underlying storage error so
+    /// the caller knows the RPC failed.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fetch_snapshot_higher_leader_epoch_persist_failure_surfaces_storage_error() {
+        use std::sync::atomic::Ordering;
+        // Combine `build_driver_with_known_peer` (so the membership
+        // check passes for NodeId(2)) and `build_driver_with_persist_fail`
+        // (so we can inject a one-shot persist failure on the term
+        // bump). Inlined because no existing helper covers both.
+        let cfg = single_voter_config(2);
+        let mut node = RaftNode::new_with_seed(cfg, 1234).expect("RaftNode ctor");
+        node.peers
+            .insert(NodeId(2), xraft_core::PeerState::new(true));
+        let log = TestLogStore::default();
+        let fail_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hs = TestHardStateStore {
+            fail_next_persist: fail_flag.clone(),
+            ..Default::default()
+        };
+        let ss = TestSnapshotStore::default();
+        let sm = TestStateMachine::default();
+        let transport = std::sync::Arc::new(NoopTransport::default());
+        let driver = Driver::new(
+            node,
+            log,
+            hs,
+            ss,
+            sm,
+            transport,
+            DriverConfig {
+                tick_interval: Duration::from_millis(2),
+                max_fetch_batch: 8,
+                shutdown_drain_deadline: Duration::from_secs(2),
+                fetch_snapshot_deadline: Duration::from_secs(2),
+            },
+        );
+        let handle = driver.handle();
+        let run_task = tokio::spawn(driver.run());
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Prime: next PersistHardState call will fail. The higher-
+        // term FetchSnapshot below triggers `become_follower(Term(99),
+        // None)` which emits `Action::PersistHardState` — that's the
+        // call that will fail.
+        fail_flag.store(true, Ordering::SeqCst);
+
+        let inbound = handle.inbound_handler();
+        let result = inbound
+            .handle_fetch_snapshot(FetchSnapshotRequest {
+                cluster_id: "test-driver".into(),
+                leader_epoch: 99,
+                replica_id: NodeId(2),
+                snapshot_id: "irrelevant".into(),
+                offset: 0,
+                max_bytes: 0,
+            })
+            .await;
+        match result {
+            Err(XRaftError::Storage(msg)) => {
+                assert!(
+                    msg.contains("hard-state persist failed"),
+                    "expected hard-state persist storage error, got: {msg}"
+                );
+            }
+            Err(other) => {
+                panic!("expected Storage(hard-state persist failed), got Err({other:?})")
+            }
+            Ok(_) => panic!("expected Storage(hard-state persist failed), got Ok(stream)"),
+        }
+
+        // The driver will fail-stop on next tick because
+        // `halt_reason` was set; let `shutdown()` race the halt.
+        handle.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 7.1 — Leader-lease gating on ClientQuery read path
+    //
+    // The spec ("leader lease optimization: ... skip the extra
+    // commit-index confirmation round-trip when answering internal
+    // read queries") is implemented in `handle_client_query` by
+    // checking `RaftNode::has_active_lease()` when
+    // `enable_leader_lease` is on. These tests cover the three
+    // resulting cells of the truth table.
+    // -----------------------------------------------------------------
+
+    /// Scenario `leader-lease-read` (the workstream's third
+    /// acceptance test). Lease on + single-voter leader holds the
+    /// lease as soon as `become_leader` runs (self counts as the
+    /// majority and `leader_started_tick` is stamped), so the query
+    /// is answered immediately without any extra confirmation
+    /// round-trip.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn client_query_with_active_lease_is_served_without_confirmation_roundtrip() {
+        // Single-voter config with leader-lease ON; check-quorum
+        // explicitly OFF so the leader never self-steps-down during
+        // the test (single voter trivially holds quorum but we want
+        // the test to be hermetic).
+        let mut cfg = single_voter_config(2);
+        cfg.enable_leader_lease = true;
+        cfg.enable_check_quorum = false;
+
+        let (driver, handle, _) = build_driver(cfg);
+        let run_task = tokio::spawn(driver.run());
+
+        // Wait long enough for self-election (election_timeout_max =
+        // tick_ms * 3 = 6ms; pad generously).
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let result = handle.query(Bytes::from_static(b"any")).await;
+        match result {
+            Ok(bytes) => {
+                // TestStateMachine::query returns an empty payload —
+                // assert exact equality (not the prior tautological
+                // `is_empty() || !is_empty()`). The meaningful
+                // post-condition is that we got an `Ok(_)`, i.e. the
+                // lease gate did NOT short-circuit to NotLeader.
+                assert_eq!(
+                    bytes.as_ref(),
+                    b"" as &[u8],
+                    "lease-served query must echo the state-machine result \
+                     (empty bytes from TestStateMachine), got {} bytes",
+                    bytes.len()
+                );
+            }
+            Err(other) => {
+                panic!("expected query to be served when lease is active, got Err({other:?})")
+            }
+        }
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
+    }
+
+    /// Stage 7.1 evaluator iter-3 #2 — 3-voter active-lease read.
+    /// A single-voter test trivially passes because self alone is a
+    /// quorum, so the lease branch never depends on peer Fetch
+    /// evidence. This test exercises the real branch: a 3-voter
+    /// leader that activates its lease via recent Fetch evidence
+    /// from at least one peer (self + 1 voter = 2 = quorum of 3),
+    /// then serves an internal read without further confirmation.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn client_query_with_active_lease_three_voter_quorum_is_served() {
+        let toml = format!(
+            r#"
+node_id = 1
+cluster_id = "test-driver"
+listen_addr = "127.0.0.1:6900"
+tick_interval_ms = 2
+election_timeout_min_ms = 4
+election_timeout_max_ms = 6
+fetch_interval_ms = 10
+enable_leader_lease = true
+enable_check_quorum = false
+
+[[voters]]
+node_id = 1
+directory_id = "{d1}"
+host = "127.0.0.1"
+port = 6001
+
+[[voters]]
+node_id = 2
+directory_id = "{d2}"
+host = "127.0.0.1"
+port = 6002
+
+[[voters]]
+node_id = 3
+directory_id = "{d3}"
+host = "127.0.0.1"
+port = 6003
+"#,
+            d1 = Uuid::new_v4(),
+            d2 = Uuid::new_v4(),
+            d3 = Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).expect("3-voter config parses");
+
+        let node = RaftNode::new_with_seed(cfg, 1234).expect("RaftNode ctor");
+        let log = TestLogStore::default();
+        let hs = TestHardStateStore::default();
+        let ss = TestSnapshotStore::default();
+        let sm = TestStateMachine::default();
+        let transport = std::sync::Arc::new(NoopTransport::default());
+        let mut driver = Driver::new(
+            node,
+            log,
+            hs,
+            ss,
+            sm,
+            transport,
+            DriverConfig {
+                tick_interval: Duration::from_millis(2),
+                max_fetch_batch: 8,
+                shutdown_drain_deadline: Duration::from_secs(2),
+                fetch_snapshot_deadline: Duration::from_secs(2),
+            },
+        );
+
+        // Stage the engine into a real-looking "leader with active
+        // lease" condition. `leader_started_tick = 1` is the
+        // post-election grace baseline; `logical_tick = 5` is a few
+        // ticks of normal operation; peer 2 has sent a Fetch at
+        // `last_fetch_time = 3` (strictly > started_tick AND well
+        // within the check-quorum window of ~6 ticks for this
+        // config). That gives the lease quorum 2 voters
+        // (self + peer-2) out of 3 voters required = quorum_size 2.
+        driver.node.role = xraft_core::NodeRole::Leader;
+        driver.node.leader_started_tick = Some(1);
+        driver.node.logical_tick = 5;
+        // Engine auto-populates peers from voter_set during
+        // construction; just stamp the Fetch evidence.
+        let peer2 = driver
+            .node
+            .peers
+            .get_mut(&NodeId(2))
+            .expect("peer NodeId(2) must exist for a 3-voter config");
+        peer2.last_fetch_time = 3;
+        // peer 3 deliberately left at default `last_fetch_time = 0`
+        // (no Fetch evidence) — we want to prove that quorum is
+        // formed by self + ONE peer, not all peers.
+
+        // Precondition: lease MUST be active before we exercise the
+        // read path. If this fails the test is testing the wrong
+        // branch.
+        assert!(
+            driver.node.has_active_lease(),
+            "test precondition: 3-voter leader with self + peer-2 Fetch \
+             evidence must hold an active lease (peers: {:?}, started_tick: {:?}, \
+             logical_tick: {})",
+            driver
+                .node
+                .peers
+                .iter()
+                .map(|(id, p)| (*id, p.last_fetch_time))
+                .collect::<Vec<_>>(),
+            driver.node.leader_started_tick,
+            driver.node.logical_tick,
+        );
+
+        let (tx, rx) = oneshot::channel();
+        driver.handle_client_query(ClientQuery {
+            query: Bytes::from_static(b"any"),
+            reply: tx,
+        });
+        match rx.await.expect("reply channel must deliver") {
+            Ok(bytes) => {
+                assert_eq!(
+                    bytes.as_ref(),
+                    b"" as &[u8],
+                    "lease-served read in 3-voter cluster must return the \
+                     state-machine payload (empty bytes), got {} bytes",
+                    bytes.len()
+                );
+            }
+            Err(other) => panic!(
+                "3-voter active-lease read must be served (no extra confirmation \
+                 round-trip), got Err({other:?})"
+            ),
+        }
+    }
+
+    /// Stage 7.1 iter-6 evaluator #1 — when `enable_leader_lease` is
+    /// on but the lease is NOT active (no recent Fetch evidence from
+    /// a quorum of voters), the leader MUST defer the read onto the
+    /// `pending_reads` slow-path queue instead of either rejecting
+    /// (the iter-2/iter-3 over-fencing bug) or silently fast-pathing
+    /// (the iter-5 "log-only stub" the iter-6 evaluator flagged). The
+    /// deferred read is served only after a quorum of voter peers has
+    /// confirmed leadership by sending a fresh inbound `FetchRequest`
+    /// (strict-`>` `RaftNode::fetch_seq`) AND the state machine has
+    /// applied at least up to the captured `read_index`.
+    ///
+    /// This test was originally
+    /// `client_query_with_lease_enabled_but_inactive_returns_notleader_no_hint`
+    /// (iter 2-4) and then
+    /// `client_query_with_lease_enabled_but_inactive_still_serves_via_slow_path`
+    /// (iter 5, stubbed slow path). Iter 6 rewrites it to exercise the
+    /// REAL deferred-confirmation flow: enqueue → not-yet-resolved →
+    /// deliver a real inbound `FetchRequest` from a voter → drain →
+    /// `Ok(bytes)`. The test deliberately drives `handle_fetch_request`
+    /// on the engine (not a manual `peer.last_fetch_seq` stamp) so it
+    /// proves the production code path actually bumps the seq.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn client_query_with_lease_enabled_but_inactive_defers_then_serves_after_real_fetch() {
+        // 3-voter config so a single self-vote isn't a quorum; this
+        // also means the engine can't self-elect during the test.
+        let toml = format!(
+            r#"
+node_id = 1
+cluster_id = "test-driver"
+listen_addr = "127.0.0.1:6900"
+tick_interval_ms = 2
+election_timeout_min_ms = 4
+election_timeout_max_ms = 6
+fetch_interval_ms = 10
+enable_leader_lease = true
+enable_check_quorum = false
+
+[[voters]]
+node_id = 1
+directory_id = "{d1}"
+host = "127.0.0.1"
+port = 6001
+
+[[voters]]
+node_id = 2
+directory_id = "{d2}"
+host = "127.0.0.1"
+port = 6002
+
+[[voters]]
+node_id = 3
+directory_id = "{d3}"
+host = "127.0.0.1"
+port = 6003
+"#,
+            d1 = Uuid::new_v4(),
+            d2 = Uuid::new_v4(),
+            d3 = Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).expect("3-voter config parses");
+
+        let node = RaftNode::new_with_seed(cfg, 1234).expect("RaftNode ctor");
+        let log = TestLogStore::default();
+        let hs = TestHardStateStore::default();
+        let ss = TestSnapshotStore::default();
+        let sm = TestStateMachine::default();
+        let transport = std::sync::Arc::new(NoopTransport::default());
+        let mut driver = Driver::new(
+            node,
+            log,
+            hs,
+            ss,
+            sm,
+            transport,
+            DriverConfig {
+                tick_interval: Duration::from_millis(2),
+                max_fetch_batch: 8,
+                shutdown_drain_deadline: Duration::from_secs(2),
+                fetch_snapshot_deadline: Duration::from_secs(2),
+            },
+        );
+
+        // Force Leader without any peer Fetch evidence ⇒ lease inactive.
+        driver.node.role = xraft_core::NodeRole::Leader;
+        driver.node.leader_started_tick = Some(0);
+        driver.node.logical_tick = 1;
+        // Bump term to 1 so the inbound FetchRequest below carries a
+        // matching leader_epoch (engine's default current_term is 0).
+        driver.node.hard_state.current_term = xraft_core::types::Term(1);
+        assert!(
+            !driver.node.has_active_lease(),
+            "test precondition: lease must be inactive for a 3-voter \
+             leader with no peer fetch evidence"
+        );
+
+        // 1. Submit the query. The slow path SHOULD enqueue (not reply).
+        let (tx, mut rx) = oneshot::channel();
+        driver.handle_client_query(ClientQuery {
+            query: Bytes::from_static(b"any"),
+            reply: tx,
+        });
+        // Sanity: pending_reads contains exactly one entry.
+        assert_eq!(
+            driver.pending_reads.len(),
+            1,
+            "lease-inactive read MUST be deferred onto pending_reads, not served immediately"
+        );
+        // Sanity: rx is NOT yet ready.
+        match rx.try_recv() {
+            Err(oneshot::error::TryRecvError::Empty) => { /* expected */ }
+            other => {
+                panic!("slow-path reply MUST not be sent before quorum confirmation; got {other:?}")
+            }
+        }
+
+        // 2. Drain WITHOUT any inbound Fetch: read must remain pending
+        //    (quorum proof not yet established).
+        driver.drain_pending_reads();
+        assert_eq!(
+            driver.pending_reads.len(),
+            1,
+            "drain without quorum proof MUST leave the read in the queue"
+        );
+
+        // 3. Deliver a REAL inbound FetchRequest from a voter peer
+        //    (NodeId(2)). This drives the production code path
+        //    (`RaftNode::handle_fetch_request`) which bumps
+        //    `self.node.fetch_seq` and stamps
+        //    `peers.get_mut(&NodeId(2)).last_fetch_seq`. After this,
+        //    self (voter 1) + peer 2 = 2 voters = quorum_size(3) — the
+        //    slow-path proof condition is satisfied.
+        let baseline_seq = driver.pending_reads.front().unwrap().read_baseline_seq;
+        let req = FetchRequest {
+            cluster_id: "test-driver".into(),
+            leader_epoch: driver.node.hard_state.current_term.0,
+            replica_id: NodeId(2),
+            fetch_offset: LogIndex(1),
+            last_fetched_epoch: Term(0),
+        };
+        let _ = driver.node.handle_fetch_request(req);
+        assert!(
+            driver.node.fetch_seq > baseline_seq,
+            "production handle_fetch_request MUST bump fetch_seq past the captured baseline \
+             (was {baseline_seq}, now {})",
+            driver.node.fetch_seq
+        );
+        let p2_seq = driver
+            .node
+            .peers
+            .get(&NodeId(2))
+            .expect("peer 2 must exist")
+            .last_fetch_seq;
+        assert!(
+            p2_seq > baseline_seq,
+            "peer 2's last_fetch_seq MUST advance past baseline ({p2_seq} <= {baseline_seq})"
+        );
+
+        // 4. Drain again — quorum proof now established AND
+        //    last_applied(0) >= read_index(0). Read must resolve Ok.
+        driver.drain_pending_reads();
+        assert!(
+            driver.pending_reads.is_empty(),
+            "drain WITH quorum proof MUST resolve the queued read"
+        );
+        match rx.try_recv() {
+            Ok(Ok(bytes)) => assert_eq!(
+                bytes.as_ref(),
+                b"" as &[u8],
+                "slow-path serve MUST return the state-machine payload \
+                 (empty bytes from TestStateMachine), got {} bytes",
+                bytes.len()
+            ),
+            other => panic!(
+                "slow-path serve after quorum proof MUST resolve Ok(state-machine bytes); got {other:?}"
+            ),
+        }
+
+        // 5. Post-condition: lease MAY now be active (the
+        //    handle_fetch_request also stamped `peer.last_fetch_time`,
+        //    which is what `has_active_lease()` checks). We do NOT
+        //    assert on that — the slow path's correctness is
+        //    independent of whether the lease flipped to active as a
+        //    side effect.
+    }
+
+    /// Stage 7.1 iter-6 evaluator #1 — slow-path TIMEOUT: when the
+    /// lease is inactive and no quorum-confirming Fetch ever arrives,
+    /// the deferred read must time out and reply
+    /// `NotLeader { leader_hint: None }` after
+    /// `2 * check_quorum_interval_ticks`. Without this gate a
+    /// partitioned leader's pending reads would hang indefinitely.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn client_query_slow_path_times_out_to_notleader_when_no_quorum_proof() {
+        let toml = format!(
+            r#"
+node_id = 1
+cluster_id = "test-driver"
+listen_addr = "127.0.0.1:6900"
+tick_interval_ms = 2
+election_timeout_min_ms = 4
+election_timeout_max_ms = 6
+fetch_interval_ms = 10
+enable_leader_lease = true
+enable_check_quorum = false
+
+[[voters]]
+node_id = 1
+directory_id = "{d1}"
+host = "127.0.0.1"
+port = 6001
+
+[[voters]]
+node_id = 2
+directory_id = "{d2}"
+host = "127.0.0.1"
+port = 6002
+
+[[voters]]
+node_id = 3
+directory_id = "{d3}"
+host = "127.0.0.1"
+port = 6003
+"#,
+            d1 = Uuid::new_v4(),
+            d2 = Uuid::new_v4(),
+            d3 = Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).expect("3-voter config parses");
+        let node = RaftNode::new_with_seed(cfg, 1234).expect("RaftNode ctor");
+        let log = TestLogStore::default();
+        let hs = TestHardStateStore::default();
+        let ss = TestSnapshotStore::default();
+        let sm = TestStateMachine::default();
+        let transport = std::sync::Arc::new(NoopTransport::default());
+        let mut driver = Driver::new(
+            node,
+            log,
+            hs,
+            ss,
+            sm,
+            transport,
+            DriverConfig {
+                tick_interval: Duration::from_millis(2),
+                max_fetch_batch: 8,
+                shutdown_drain_deadline: Duration::from_secs(2),
+                fetch_snapshot_deadline: Duration::from_secs(2),
+            },
+        );
+        driver.node.role = xraft_core::NodeRole::Leader;
+        driver.node.leader_started_tick = Some(0);
+        driver.node.logical_tick = 1;
+        assert!(!driver.node.has_active_lease());
+
+        let (tx, mut rx) = oneshot::channel();
+        driver.handle_client_query(ClientQuery {
+            query: Bytes::from_static(b"any"),
+            reply: tx,
+        });
+        assert_eq!(driver.pending_reads.len(), 1);
+        let deadline = driver.pending_reads.front().unwrap().deadline_tick;
+
+        // Advance logical_tick strictly past the deadline without ever
+        // delivering a quorum-confirming Fetch.
+        driver.node.logical_tick = deadline.saturating_add(1);
+        driver.drain_pending_reads();
+        assert!(
+            driver.pending_reads.is_empty(),
+            "slow-path timeout MUST drain the queued read"
+        );
+        match rx.try_recv() {
+            Ok(Err(XRaftError::NotLeader { leader_hint: None })) => { /* expected */ }
+            other => panic!(
+                "slow-path timeout MUST reply NotLeader {{ leader_hint: None }}; got {other:?}"
+            ),
+        }
+    }
+
+    /// Stage 7.1 iter-6 evaluator #1 — slow-path STEP-DOWN: when the
+    /// leader's role flips to Follower while a slow-path read is
+    /// pending, the next drain MUST fail the read with
+    /// `NotLeader { leader_hint: <new_leader> }`. This is the
+    /// step-down arm of the drain's safety contract; without it a
+    /// stepped-down ex-leader would either keep serving the deferred
+    /// read against a stale apply (read-after-step-down) or hang the
+    /// caller forever.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn client_query_slow_path_replies_notleader_on_step_down() {
+        let toml = format!(
+            r#"
+node_id = 1
+cluster_id = "test-driver"
+listen_addr = "127.0.0.1:6900"
+tick_interval_ms = 2
+election_timeout_min_ms = 4
+election_timeout_max_ms = 6
+fetch_interval_ms = 10
+enable_leader_lease = true
+enable_check_quorum = false
+
+[[voters]]
+node_id = 1
+directory_id = "{d1}"
+host = "127.0.0.1"
+port = 6001
+
+[[voters]]
+node_id = 2
+directory_id = "{d2}"
+host = "127.0.0.1"
+port = 6002
+
+[[voters]]
+node_id = 3
+directory_id = "{d3}"
+host = "127.0.0.1"
+port = 6003
+"#,
+            d1 = Uuid::new_v4(),
+            d2 = Uuid::new_v4(),
+            d3 = Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).expect("3-voter config parses");
+        let node = RaftNode::new_with_seed(cfg, 1234).expect("RaftNode ctor");
+        let log = TestLogStore::default();
+        let hs = TestHardStateStore::default();
+        let ss = TestSnapshotStore::default();
+        let sm = TestStateMachine::default();
+        let transport = std::sync::Arc::new(NoopTransport::default());
+        let mut driver = Driver::new(
+            node,
+            log,
+            hs,
+            ss,
+            sm,
+            transport,
+            DriverConfig {
+                tick_interval: Duration::from_millis(2),
+                max_fetch_batch: 8,
+                shutdown_drain_deadline: Duration::from_secs(2),
+                fetch_snapshot_deadline: Duration::from_secs(2),
+            },
+        );
+        driver.node.role = xraft_core::NodeRole::Leader;
+        driver.node.leader_started_tick = Some(0);
+        driver.node.logical_tick = 1;
+        assert!(!driver.node.has_active_lease());
+
+        let (tx, mut rx) = oneshot::channel();
+        driver.handle_client_query(ClientQuery {
+            query: Bytes::from_static(b"any"),
+            reply: tx,
+        });
+        assert_eq!(driver.pending_reads.len(), 1);
+
+        // Flip role to Follower and set a leader_hint pointing at
+        // peer 2; drain MUST resolve the pending read with the hint.
+        driver.node.role = xraft_core::NodeRole::Follower;
+        driver.node.leader_id = Some(NodeId(2));
+        driver.drain_pending_reads();
+        assert!(
+            driver.pending_reads.is_empty(),
+            "step-down drain MUST resolve the queued read"
+        );
+        match rx.try_recv() {
+            Ok(Err(XRaftError::NotLeader {
+                leader_hint: Some(NodeId(2)),
+            })) => { /* expected */ }
+            other => panic!(
+                "step-down drain MUST reply NotLeader {{ leader_hint: Some(NodeId(2)) }}; got {other:?}"
+            ),
+        }
+    }
+
+    /// Stage 7.1 iter-6 evaluator #1 — slow-path queue OVERFLOW: when
+    /// the deferred-reads queue is at `MAX_PENDING_READS`, additional
+    /// `handle_client_query` calls MUST reject with
+    /// `NotLeader { leader_hint: None }` (retryable) rather than
+    /// growing the queue without bound. Prevents OOM under a
+    /// partition where the leader cannot drain.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn client_query_slow_path_overflow_replies_notleader() {
+        let toml = format!(
+            r#"
+node_id = 1
+cluster_id = "test-driver"
+listen_addr = "127.0.0.1:6900"
+tick_interval_ms = 2
+election_timeout_min_ms = 4
+election_timeout_max_ms = 6
+fetch_interval_ms = 10
+enable_leader_lease = true
+enable_check_quorum = false
+
+[[voters]]
+node_id = 1
+directory_id = "{d1}"
+host = "127.0.0.1"
+port = 6001
+
+[[voters]]
+node_id = 2
+directory_id = "{d2}"
+host = "127.0.0.1"
+port = 6002
+
+[[voters]]
+node_id = 3
+directory_id = "{d3}"
+host = "127.0.0.1"
+port = 6003
+"#,
+            d1 = Uuid::new_v4(),
+            d2 = Uuid::new_v4(),
+            d3 = Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).expect("3-voter config parses");
+        let node = RaftNode::new_with_seed(cfg, 1234).expect("RaftNode ctor");
+        let log = TestLogStore::default();
+        let hs = TestHardStateStore::default();
+        let ss = TestSnapshotStore::default();
+        let sm = TestStateMachine::default();
+        let transport = std::sync::Arc::new(NoopTransport::default());
+        let mut driver = Driver::new(
+            node,
+            log,
+            hs,
+            ss,
+            sm,
+            transport,
+            DriverConfig {
+                tick_interval: Duration::from_millis(2),
+                max_fetch_batch: 8,
+                shutdown_drain_deadline: Duration::from_secs(2),
+                fetch_snapshot_deadline: Duration::from_secs(2),
+            },
+        );
+        driver.node.role = xraft_core::NodeRole::Leader;
+        driver.node.leader_started_tick = Some(0);
+        driver.node.logical_tick = 1;
+        assert!(!driver.node.has_active_lease());
+
+        // Stuff the queue exactly to cap with placeholder PendingReads
+        // (test-only access via the private struct in the same
+        // module). Then verify the next handle_client_query bounces.
+        let baseline = driver.node.fetch_seq;
+        let deadline = driver.node.logical_tick.saturating_add(1_000);
+        for _ in 0..MAX_PENDING_READS {
+            let (tx, _rx) = oneshot::channel();
+            driver.pending_reads.push_back(PendingRead {
+                query: Bytes::from_static(b"filler"),
+                reply: tx,
+                read_index: driver.node.commit_index,
+                read_baseline_seq: baseline,
+                deadline_tick: deadline,
+            });
+        }
+        assert_eq!(driver.pending_reads.len(), MAX_PENDING_READS);
+
+        // Now the (MAX+1)-th query must be rejected, NOT enqueued.
+        let (tx, mut rx) = oneshot::channel();
+        driver.handle_client_query(ClientQuery {
+            query: Bytes::from_static(b"overflow"),
+            reply: tx,
+        });
+        assert_eq!(
+            driver.pending_reads.len(),
+            MAX_PENDING_READS,
+            "overflow query MUST NOT grow the queue beyond MAX_PENDING_READS"
+        );
+        match rx.try_recv() {
+            Ok(Err(XRaftError::NotLeader { leader_hint: None })) => { /* expected */ }
+            other => {
+                panic!("overflow query MUST reply NotLeader {{ leader_hint: None }}; got {other:?}")
+            }
+        }
+    }
+
+    /// Stage 7.1 — `enable_leader_lease = false` (the default) must
+    /// preserve the legacy Stage 6.2 ClientQuery semantics: serve
+    /// every leader query without any lease check. This is the
+    /// "backward compatible" cell of the truth table — without this
+    /// gate the flag would silently change every existing user's
+    /// read behaviour.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn client_query_with_lease_disabled_skips_lease_check() {
+        // 3-voter config, lease DISABLED. We still force-set role to
+        // Leader so the test isolates the lease branch (not the
+        // role check).
+        let toml = format!(
+            r#"
+node_id = 1
+cluster_id = "test-driver"
+listen_addr = "127.0.0.1:6900"
+tick_interval_ms = 2
+election_timeout_min_ms = 4
+election_timeout_max_ms = 6
+fetch_interval_ms = 10
+enable_leader_lease = false
+enable_check_quorum = false
+
+[[voters]]
+node_id = 1
+directory_id = "{d1}"
+host = "127.0.0.1"
+port = 6001
+
+[[voters]]
+node_id = 2
+directory_id = "{d2}"
+host = "127.0.0.1"
+port = 6002
+
+[[voters]]
+node_id = 3
+directory_id = "{d3}"
+host = "127.0.0.1"
+port = 6003
+"#,
+            d1 = Uuid::new_v4(),
+            d2 = Uuid::new_v4(),
+            d3 = Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).expect("3-voter config parses");
+
+        let node = RaftNode::new_with_seed(cfg, 1234).expect("RaftNode ctor");
+        let log = TestLogStore::default();
+        let hs = TestHardStateStore::default();
+        let ss = TestSnapshotStore::default();
+        let sm = TestStateMachine::default();
+        let transport = std::sync::Arc::new(NoopTransport::default());
+        let mut driver = Driver::new(
+            node,
+            log,
+            hs,
+            ss,
+            sm,
+            transport,
+            DriverConfig {
+                tick_interval: Duration::from_millis(2),
+                max_fetch_batch: 8,
+                shutdown_drain_deadline: Duration::from_secs(2),
+                fetch_snapshot_deadline: Duration::from_secs(2),
+            },
+        );
+        driver.node.role = xraft_core::NodeRole::Leader;
+        driver.node.leader_started_tick = Some(0);
+        driver.node.logical_tick = 1;
+        // Lease is inactive (no peer fetch evidence) but disabled.
+        assert!(
+            !driver.node.has_active_lease(),
+            "test precondition: lease must be inactive (and disabled)"
+        );
+
+        let (tx, rx) = oneshot::channel();
+        driver.handle_client_query(ClientQuery {
+            query: Bytes::from_static(b"any"),
+            reply: tx,
+        });
+        match rx.await.expect("reply channel must deliver") {
+            Ok(_) => { /* expected — legacy behaviour preserved */ }
+            Err(other) => {
+                panic!("expected legacy serve (Ok) when lease disabled, got Err({other:?})")
+            }
+        }
     }
 
     /// Wrong cluster id → `XRaftError::Transport` (cluster mismatch).
@@ -6699,6 +8076,92 @@ port = 6012
         );
     }
 
+    /// **Stage 7.1 iter-6 evaluator finding #2** — HIGHER-term outbound
+    /// `OutboundResult::FetchSnapshot` MUST cause the local node to
+    /// adopt the new term and step down to Follower, NOT silently
+    /// drop the stream. The iter-5 code at this site collapsed both
+    /// stale-lower-term and higher-term into a single `if leader_epoch
+    /// != local_term { return; }` and the evaluator flagged it as a
+    /// violation of Stage 7.1's "leader steps down on higher term
+    /// from ANY RPC" invariant: an outbound snapshot stream whose
+    /// `leader_epoch` exceeds the local term is itself proof that a
+    /// new leader exists at a higher term, so we must adopt+step down
+    /// before dropping the install.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn outbound_fetch_snapshot_higher_leader_epoch_steps_leader_down() {
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, h) = build_driver_for_snapshot_tests(cfg);
+
+        // Stage as Leader at term 5; we'll receive an outbound stream
+        // tagged term 10 (HIGHER), which must force adoption + step
+        // down. The peer is set as recognised leader so we'd otherwise
+        // have passed the per-peer fence — proving the higher-term
+        // branch fires BEFORE the install would have happened.
+        driver.node.role = xraft_core::NodeRole::Leader;
+        driver.node.leader_id = Some(NodeId(2));
+        driver.node.hard_state.current_term = Term(5);
+        driver.node.leader_started_tick = Some(0);
+        driver.node.logical_tick = 1;
+
+        let metadata = SnapshotMeta {
+            id: "snap-higher-term".into(),
+            last_included_index: LogIndex(50),
+            last_included_term: Term(10),
+            voter_set: driver.node.voter_set.clone(),
+            size_bytes: Some(4),
+            checksum: None,
+        };
+        let res = OutboundResult::FetchSnapshot {
+            peer: NodeId(2),
+            cluster_id: "test-driver".into(),
+            leader_epoch: 10, // HIGHER than local term 5
+            chunk_count: 1,
+            completed: true,
+            metadata: Some(metadata),
+            data: vec![1, 2, 3, 4],
+        };
+
+        driver.handle_outbound_result(res).await;
+
+        // Higher-term invariant: term adopted, role demoted to
+        // Follower.
+        assert_eq!(
+            driver.node.hard_state.current_term,
+            Term(10),
+            "higher-term outbound FetchSnapshot MUST adopt the observed leader_epoch"
+        );
+        assert_eq!(
+            driver.node.role,
+            xraft_core::NodeRole::Follower,
+            "higher-term outbound FetchSnapshot MUST step the leader down to Follower"
+        );
+        // Install MUST NOT happen — the snapshot is dropped after the
+        // step-down because the originating peer's leadership claim
+        // at the new term is unverified (leader_hint=None).
+        assert!(
+            h.restores_received.lock().unwrap().is_empty(),
+            "higher-term outbound FetchSnapshot MUST NOT call state_machine.restore()"
+        );
+        assert!(
+            h.saved_snapshots.lock().unwrap().is_empty(),
+            "higher-term outbound FetchSnapshot MUST NOT persist a snapshot"
+        );
+        assert!(
+            driver.node.last_snapshot_meta.is_none(),
+            "engine snapshot meta must remain unset on higher-term drop"
+        );
+        assert!(
+            driver.halt_reason.is_none(),
+            "higher-term step-down MUST NOT halt the driver"
+        );
+        // Leader-only Stage 7.1 state must be cleared by
+        // become_follower (per iter-4 finding #3).
+        assert!(
+            driver.node.leader_started_tick.is_none(),
+            "step-down via higher-term snapshot MUST clear leader_started_tick"
+        );
+    }
+
     /// **Stage 5.2 evaluator iter-3 item 2** — install fence: an
     /// `OutboundResult::FetchSnapshot` from a peer that is NOT the
     /// recognised leader MUST be rejected. Snapshots only flow from
@@ -8423,15 +9886,22 @@ port = 6012
         assert_eq!(follower.node.last_log_term, Term(5));
     }
 
-    /// Counting `DriverObserver` used by election-latency tests.
-    /// Captures the elapsed durations passed to `on_election_won`
-    /// and the count of status snapshots so cascade detection can
-    /// assert exactly-one-sample-per-election.
+    /// Counting `DriverObserver` used by election-latency tests and
+    /// the Stage 7.1 Fetch-counter gating tests (iter-4 evaluator
+    /// finding #3). Captures the elapsed durations passed to
+    /// `on_election_won`, the count of status snapshots so cascade
+    /// detection can assert exactly-one-sample-per-election, AND the
+    /// per-direction Fetch RPC counts so we can prove the leader /
+    /// cluster gating in `handle_inbound_fetch` actually filters
+    /// non-leader and wrong-cluster receipts out of the `Received`
+    /// total.
     #[derive(Default, Debug)]
     struct CountingObserver {
         elections: Mutex<Vec<Duration>>,
         statuses: std::sync::atomic::AtomicUsize,
         appends: std::sync::atomic::AtomicU64,
+        fetch_received: std::sync::atomic::AtomicU64,
+        fetch_sent: std::sync::atomic::AtomicU64,
     }
 
     impl DriverObserver for CountingObserver {
@@ -8449,6 +9919,18 @@ port = 6012
         }
         fn on_election_won(&self, elapsed: Duration) {
             self.elections.lock().unwrap().push(elapsed);
+        }
+        fn on_fetch_request(&self, direction: FetchDirection) {
+            match direction {
+                FetchDirection::Received => {
+                    self.fetch_received
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                FetchDirection::Sent => {
+                    self.fetch_sent
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
         }
     }
 
@@ -8509,6 +9991,172 @@ port = 6012
             elections[0] < Duration::from_secs(1),
             "election latency must be sub-second on the local single-voter path, got {:?}",
             elections[0]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 7.1 — Iter-4 evaluator finding #3: `xraft_fetch_requests_total
+    // {direction="received"}` must count Fetch RPCs RECEIVED BY THE
+    // LEADER (per `architecture.md` §7), not raw inbound listener
+    // traffic. `handle_inbound_fetch` captures the leader/cluster
+    // preconditions BEFORE consuming `req` into `RaftNode::step`, then
+    // only bumps the observer when BOTH hold. These tests exercise
+    // the truth table at the behavior level so a regression that
+    // reintroduces the pre-check increment is caught.
+    // -----------------------------------------------------------------
+
+    fn build_driver_with_observer(
+        config: ClusterConfig,
+    ) -> (TestDriver, DriverHandle, Arc<CountingObserver>) {
+        let (mut driver, handle, _applied) = build_driver(config);
+        let obs = Arc::new(CountingObserver::default());
+        driver.observer = Some(obs.clone() as Arc<dyn DriverObserver>);
+        (driver, handle, obs)
+    }
+
+    /// Positive case: a Fetch RPC accepted by a leader for the
+    /// matching cluster MUST bump the `Received` counter exactly once.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn inbound_fetch_received_by_leader_bumps_received_counter() {
+        // Single-voter cluster so the node self-elects to Leader
+        // without any peer interaction.
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, obs) = build_driver_with_observer(cfg);
+
+        // Force the leader-at-receipt precondition deterministically
+        // without waiting on the election timer (the test would
+        // otherwise be timing-fragile).
+        driver.node.role = NodeRole::Leader;
+        driver.node.leader_started_tick = Some(0);
+
+        let cluster = driver.node.config.cluster_id.clone();
+        let leader_epoch = driver.node.hard_state.current_term.0;
+        let (tx, _rx) = oneshot::channel();
+        let req = FetchRequest {
+            cluster_id: cluster,
+            leader_epoch,
+            replica_id: NodeId(2),
+            fetch_offset: LogIndex(0),
+            last_fetched_epoch: Term(0),
+        };
+        driver.handle_inbound_fetch(req, tx).await;
+
+        assert_eq!(
+            obs.fetch_received.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "leader-accepted Fetch from the matching cluster MUST bump the Received counter",
+        );
+        assert_eq!(
+            obs.fetch_sent.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "inbound Fetch must NOT bump the Sent counter",
+        );
+    }
+
+    /// Negative case (iter-4 evaluator #3): a Fetch RPC received while
+    /// this node is NOT the leader MUST NOT bump the `Received`
+    /// counter. The Stage 7.1 metric contract is "Fetch RPCs received
+    /// by leader" — a follower's listener accepting the Fetch is not
+    /// leader-received traffic.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn inbound_fetch_received_by_non_leader_does_not_bump_received_counter() {
+        // 3-voter config + 800ms election timeout so the node CANNOT
+        // self-elect during the test (it stays as Follower).
+        let toml = format!(
+            r#"
+node_id = 1
+cluster_id = "test-driver"
+listen_addr = "127.0.0.1:6905"
+tick_interval_ms = 2
+election_timeout_min_ms = 500
+election_timeout_max_ms = 800
+fetch_interval_ms = 10
+
+[[voters]]
+node_id = 1
+directory_id = "{d1}"
+host = "127.0.0.1"
+port = 6001
+
+[[voters]]
+node_id = 2
+directory_id = "{d2}"
+host = "127.0.0.1"
+port = 6002
+
+[[voters]]
+node_id = 3
+directory_id = "{d3}"
+host = "127.0.0.1"
+port = 6003
+"#,
+            d1 = Uuid::new_v4(),
+            d2 = Uuid::new_v4(),
+            d3 = Uuid::new_v4(),
+        );
+        let cfg = ClusterConfig::from_toml_str(&toml).expect("3-voter config parses");
+        let (mut driver, _handle, obs) = build_driver_with_observer(cfg);
+
+        // Precondition: node is in the Follower role (constructor
+        // default). The inbound Fetch will be rejected with NotLeader
+        // by the engine, and the gating in `handle_inbound_fetch`
+        // must skip the counter increment.
+        assert_eq!(
+            driver.node.role,
+            NodeRole::Follower,
+            "test precondition: node must be a Follower before the inbound Fetch",
+        );
+
+        let cluster = driver.node.config.cluster_id.clone();
+        let leader_epoch = driver.node.hard_state.current_term.0;
+        let (tx, _rx) = oneshot::channel();
+        let req = FetchRequest {
+            cluster_id: cluster,
+            leader_epoch,
+            replica_id: NodeId(2),
+            fetch_offset: LogIndex(0),
+            last_fetched_epoch: Term(0),
+        };
+        driver.handle_inbound_fetch(req, tx).await;
+
+        assert_eq!(
+            obs.fetch_received.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "non-leader receipt MUST NOT bump the Received counter \
+             (Stage 7.1 metric contract: leader-received traffic only)",
+        );
+    }
+
+    /// Negative case (iter-4 evaluator #3, secondary): a Fetch RPC
+    /// from a foreign cluster MUST NOT bump the `Received` counter
+    /// even if this node is currently Leader for ITS cluster — the
+    /// metric counts in-cluster leader-received traffic only.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn inbound_fetch_from_foreign_cluster_does_not_bump_received_counter() {
+        let cfg = single_voter_config(2);
+        let (mut driver, _handle, obs) = build_driver_with_observer(cfg);
+
+        driver.node.role = NodeRole::Leader;
+        driver.node.leader_started_tick = Some(0);
+
+        // Cluster mismatch: this leader is "test-driver", request
+        // claims to belong to "OTHER-CLUSTER".
+        let leader_epoch = driver.node.hard_state.current_term.0;
+        let (tx, _rx) = oneshot::channel();
+        let req = FetchRequest {
+            cluster_id: "OTHER-CLUSTER".into(),
+            leader_epoch,
+            replica_id: NodeId(2),
+            fetch_offset: LogIndex(0),
+            last_fetched_epoch: Term(0),
+        };
+        driver.handle_inbound_fetch(req, tx).await;
+
+        assert_eq!(
+            obs.fetch_received.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "foreign-cluster Fetch MUST NOT bump the Received counter \
+             even when this node IS leader for its own cluster",
         );
     }
 }

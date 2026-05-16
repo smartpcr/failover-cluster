@@ -731,6 +731,9 @@ mod tests {
             retry_max_backoff_ms: 5_000,
             max_message_size: 64 * 1024 * 1024,
             observers: vec![],
+            enable_check_quorum: true,
+            enable_leader_lease: false,
+            check_quorum_interval_ms: None,
         }
     }
 

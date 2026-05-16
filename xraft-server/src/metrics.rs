@@ -1,45 +1,53 @@
 //! Prometheus metrics surface for the `xraft-server` admin endpoint.
 //!
-//! Stage 6.1 ships the MVP metrics subset required by the workstream
-//! brief — the canonical list from `architecture.md` §7 and
-//! `e2e-scenarios.md` Feature 15:
+//! The canonical metric list lives in `architecture.md` §7 and
+//! `e2e-scenarios.md` Feature 15. Stage 6.1 shipped the MVP subset;
+//! Stage 7.1 extends that toward the complete canonical set by adding
+//! the leader / replication observability metrics:
 //!
-//! - `xraft_current_term` — gauge, persisted term at the latest
-//!   [`NodeStatus`] publish.
-//! - `xraft_commit_index` — gauge, volatile `commit_index` at the
-//!   latest publish.
-//! - `xraft_current_leader` — gauge, `NodeId` of the recognised
-//!   leader; `-1` when unknown so dashboards can distinguish
-//!   "no-leader" from "leader=0".
-//! - `xraft_role` — gauge, numeric encoding of [`NodeRole`] per
-//!   [`role_to_gauge`](crate::status::role_to_gauge).
-//! - `xraft_election_latency_seconds` — histogram, time from
-//!   `become_candidate` to `become_leader` for this node. The driver
-//!   observes a sample only on the elected hop; followers and stepped-
-//!   down candidates contribute nothing.
-//! - `xraft_append_records_total` — counter, monotonic total of
-//!   entries appended to this node's local log store. Counted
-//!   leader-side AND follower-side because the log append happens on
-//!   every replica.
+//! ### MVP subset (Stage 6.1)
+//! - `xraft_current_term` — gauge.
+//! - `xraft_commit_index` — gauge.
+//! - `xraft_current_leader` — gauge (`-1` when unknown).
+//! - `xraft_role` — gauge (numeric encoding per
+//!   [`role_to_gauge`](crate::status::role_to_gauge)).
+//! - `xraft_election_latency_seconds` — histogram, leader-elected hop.
+//! - `xraft_append_records_total` — counter.
 //!
-//! Stage 7.1 / 7.3 add the remaining canonical metrics
-//! (`xraft_replication_lag`, `xraft_commit_latency_seconds`,
-//! `xraft_fetch_requests_total`, `xraft_snapshot_installs_total`,
-//! `xraft_log_end_offset`) on top of this scaffolding.
+//! ### Stage 7.1 additions (leader / replication observability)
+//! - `xraft_replication_lag` — gauge per `{replica}` label, entries
+//!   behind the leader, leader-only; cleared on
+//!   [`Action::StepDown`](xraft_core::message::Action::StepDown).
+//! - `xraft_commit_latency_seconds` — histogram, time from proposal
+//!   accepted by the driver to commit-index advance past the
+//!   proposal's index, leader-only.
+//! - `xraft_fetch_requests_total` — counter per `{direction}` label
+//!   (`sent` for outbound Fetch RPCs from followers/observers to the
+//!   leader, `received` for inbound Fetch RPCs that this node
+//!   **accepted as leader for this cluster** — wrong-cluster traffic
+//!   and Fetches received while a follower are filtered out per the
+//!   `architecture.md` §7 "Fetch RPCs received by leader"
+//!   contract).
+//!
+//! Stage 7.3 will land the remaining canonical metrics
+//! (`xraft_snapshot_installs_total`, `xraft_log_end_offset`).
 
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use tokio::sync::Mutex;
 
-use crate::driver::DriverObserver;
+use crate::driver::{DriverObserver, FetchDirection};
 use crate::status::{NodeStatus, StatusPublisher, role_to_gauge};
+use xraft_core::types::NodeId;
 
 /// Default histogram bucket layout for `xraft_election_latency_seconds`:
 /// 8 exponential buckets starting at 5 ms, factor 2 (5ms, 10, 20, 40,
@@ -50,28 +58,76 @@ fn election_latency_buckets() -> impl Iterator<Item = f64> {
     exponential_buckets(0.005, 2.0, 8)
 }
 
+/// Histogram bucket layout for `xraft_commit_latency_seconds`. Stage
+/// 7.1 measures "proposal accepted by driver → commit-index advance
+/// past the entry's index", which on a healthy cluster sits in the
+/// low-millisecond range (one leader→follower→leader Fetch RTT) but
+/// can grow to seconds under partition / flush stalls. Layout matches
+/// `election_latency_buckets`: 8 exponential buckets starting at 5 ms,
+/// factor 2 (5ms, 10, 20, 40, 80, 160, 320, 640 ms). Dashboards
+/// comparing the two histograms therefore see consistent bucket
+/// boundaries.
+fn commit_latency_buckets() -> impl Iterator<Item = f64> {
+    exponential_buckets(0.005, 2.0, 8)
+}
+
+/// Label set for `xraft_replication_lag`. One sample per tracked
+/// peer / observer; the leader emits a fresh value on every
+/// event-loop iteration via
+/// [`DriverObserver::on_replication_lag`]. The peer's `NodeId` is
+/// rendered as a decimal string so the Prometheus tag is
+/// human-readable (the Counter family's `direction` label uses an
+/// enum for the same reason).
+#[derive(Clone, Hash, PartialEq, Eq, EncodeLabelSet, Debug)]
+struct ReplicaLabel {
+    replica: String,
+}
+
+impl ReplicaLabel {
+    fn new(replica: NodeId) -> Self {
+        // NodeId's Display impl renders as `NodeId(N)` (Debug-style),
+        // which is noisy for Prometheus labels. Extract just the
+        // numeric id so the rendered label is `replica="2"` rather
+        // than `replica="NodeId(2)"` — the rest of the metrics
+        // pipeline (operators, dashboards) treats this as a
+        // dimension, so the wrapper would force every query to strip
+        // it.
+        Self {
+            replica: replica.0.to_string(),
+        }
+    }
+}
+
+/// Label set for `xraft_fetch_requests_total`. The `direction` label
+/// disambiguates outbound (follower / observer issuing a Fetch RPC to
+/// the leader) from inbound (leader handling a Fetch RPC from a
+/// peer). A single counter family is more dashboard-friendly than two
+/// separately-registered counters because operators can sum across
+/// both directions or split by either side without a
+/// recording rule.
+#[derive(Clone, Hash, PartialEq, Eq, EncodeLabelSet, Debug)]
+struct FetchDirectionLabel {
+    direction: &'static str,
+}
+
+impl From<FetchDirection> for FetchDirectionLabel {
+    fn from(d: FetchDirection) -> Self {
+        Self {
+            direction: match d {
+                FetchDirection::Sent => "sent",
+                FetchDirection::Received => "received",
+            },
+        }
+    }
+}
+
 /// The Prometheus registry + metric handles, plus the
 /// [`StatusPublisher`] the driver writes its observable state into.
 ///
 /// `XRaftMetrics` is the bridge between the driver loop and the
 /// `/metrics` and `/health` HTTP handlers. The driver holds an
-/// `Arc<XRaftMetrics>` and calls:
-///
-/// - [`Self::publish_state`] after every event-loop iteration to
-///   refresh the gauges (`xraft_current_term`, `xraft_commit_index`,
-///   `xraft_current_leader`, `xraft_role`).
-/// - [`Self::observe_election_latency`] when transitioning from
-///   `Candidate` to `Leader` to record one histogram sample.
-/// - [`Self::record_appends`] inside
-///   `Action::AppendEntries` to bump the `xraft_append_records_total`
-///   counter.
-///
-/// The HTTP layer holds the same `Arc<XRaftMetrics>` and calls:
-///
-/// - [`Self::render`] to serialise the registry into the Prometheus
-///   text-exposition format.
-/// - [`Self::status_publisher`] to access the latest [`NodeStatus`]
-///   for `/health`.
+/// `Arc<XRaftMetrics>` and calls the [`DriverObserver`] methods, which
+/// in turn update the underlying counters / gauges / histograms.
 pub struct XRaftMetrics {
     registry: Mutex<Registry>,
     current_term: Gauge<i64>,
@@ -80,6 +136,15 @@ pub struct XRaftMetrics {
     role: Gauge<i64>,
     election_latency_seconds: Histogram,
     append_records_total: Counter,
+    /// Stage 7.1: per-replica replication lag (entries behind leader).
+    /// Cleared on leader step-down via
+    /// [`DriverObserver::on_leader_step_down`].
+    replication_lag: Family<ReplicaLabel, Gauge<i64>>,
+    /// Stage 7.1: proposal-to-commit wall-clock latency histogram.
+    commit_latency_seconds: Histogram,
+    /// Stage 7.1: count of Fetch RPCs observed by this node, labelled
+    /// by direction. Exposed as `xraft_fetch_requests_total{direction="..."}`.
+    fetch_requests: Family<FetchDirectionLabel, Counter>,
     status: Arc<StatusPublisher>,
 }
 
@@ -107,6 +172,9 @@ impl XRaftMetrics {
         let role = Gauge::<i64>::default();
         let election_latency_seconds = Histogram::new(election_latency_buckets());
         let append_records_total = Counter::default();
+        let replication_lag = Family::<ReplicaLabel, Gauge<i64>>::default();
+        let commit_latency_seconds = Histogram::new(commit_latency_buckets());
+        let fetch_requests = Family::<FetchDirectionLabel, Counter>::default();
 
         registry.register(
             "xraft_current_term",
@@ -146,6 +214,29 @@ impl XRaftMetrics {
             "Total log entries appended to this node's local log store.",
             append_records_total.clone(),
         );
+        registry.register(
+            "xraft_replication_lag",
+            "Entries this peer is behind the leader, computed leader-side as \
+             (leader_last_log_index - peer.last_fetch_offset). Reset on leader step-down.",
+            replication_lag.clone(),
+        );
+        registry.register(
+            "xraft_commit_latency_seconds",
+            "Seconds from proposal accepted by the driver to commit_index advancing past it.",
+            commit_latency_seconds.clone(),
+        );
+        registry.register(
+            // Same `_total` auto-suffix rule as `xraft_append_records`:
+            // register without suffix, renderer adds it. Exposed as
+            // `xraft_fetch_requests_total{direction="sent"}` etc.
+            "xraft_fetch_requests",
+            "Total Fetch RPCs counted by this node, labelled by direction: \
+             `sent` for follower/observer→leader RPC dispatch, `received` for \
+             inbound Fetches accepted while leader for this cluster \
+             (wrong-cluster and non-leader receipts are filtered out per \
+             `architecture.md` §7).",
+            fetch_requests.clone(),
+        );
 
         Self {
             registry: Mutex::new(registry),
@@ -155,6 +246,9 @@ impl XRaftMetrics {
             role,
             election_latency_seconds,
             append_records_total,
+            replication_lag,
+            commit_latency_seconds,
+            fetch_requests,
             status,
         }
     }
@@ -194,6 +288,39 @@ impl XRaftMetrics {
         self.status.record_appends(n);
     }
 
+    /// Stage 7.1 — set the replication-lag gauge for `replica` to the
+    /// supplied entry count. Called by the driver once per
+    /// event-loop iteration per peer while we are leader.
+    pub fn set_replication_lag(&self, replica: NodeId, lag: u64) {
+        self.replication_lag
+            .get_or_create(&ReplicaLabel::new(replica))
+            .set(lag as i64);
+    }
+
+    /// Stage 7.1 — clear every replication-lag label so a stepped-
+    /// down leader does not surface stale lag in the next scrape.
+    /// Called by the driver from the `Action::StepDown` arm.
+    pub fn clear_replication_lag(&self) {
+        self.replication_lag.clear();
+    }
+
+    /// Stage 7.1 — observe one proposal-to-commit latency sample.
+    /// Called by the driver from `resolve_waiters_at` on the success
+    /// path only (failed commits are tracked separately by the
+    /// `xraft_propose_failures_total` counter).
+    pub fn observe_commit_latency(&self, secs: f64) {
+        self.commit_latency_seconds.observe(secs);
+    }
+
+    /// Stage 7.1 — increment `xraft_fetch_requests_total{direction=…}`
+    /// by one. Sent direction is recorded from the driver's outbound
+    /// dispatcher; received direction from the inbound Fetch handler.
+    pub fn record_fetch_request(&self, direction: FetchDirection) {
+        self.fetch_requests
+            .get_or_create(&FetchDirectionLabel::from(direction))
+            .inc();
+    }
+
     /// Borrow the shared [`StatusPublisher`] for the HTTP `/health`
     /// handler and any other read-side consumer.
     pub fn status_publisher(&self) -> Arc<StatusPublisher> {
@@ -227,6 +354,22 @@ impl DriverObserver for XRaftMetrics {
 
     fn on_election_won(&self, elapsed: Duration) {
         self.observe_election_latency(elapsed.as_secs_f64());
+    }
+
+    fn on_fetch_request(&self, direction: FetchDirection) {
+        self.record_fetch_request(direction);
+    }
+
+    fn on_replication_lag(&self, replica: NodeId, lag: u64) {
+        self.set_replication_lag(replica, lag);
+    }
+
+    fn on_commit_latency(&self, elapsed: Duration) {
+        self.observe_commit_latency(elapsed.as_secs_f64());
+    }
+
+    fn on_leader_step_down(&self) {
+        self.clear_replication_lag();
     }
 }
 
@@ -309,5 +452,71 @@ mod tests {
         s.role = NodeRole::Leader;
         metrics.publish_state(s).await;
         assert!(metrics.render().await.unwrap().contains("xraft_role 3"));
+    }
+
+    // ─── Stage 7.1 additions ────────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replication_lag_gauge_is_per_replica() {
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        metrics.set_replication_lag(NodeId(2), 17);
+        metrics.set_replication_lag(NodeId(3), 0);
+        let render = metrics.render().await.unwrap();
+        assert!(
+            render.contains("xraft_replication_lag{replica=\"2\"} 17"),
+            "render missing replica=2 line: {render}"
+        );
+        assert!(
+            render.contains("xraft_replication_lag{replica=\"3\"} 0"),
+            "render missing replica=3 line: {render}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clear_replication_lag_drops_all_labels() {
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        metrics.set_replication_lag(NodeId(2), 17);
+        metrics.set_replication_lag(NodeId(3), 9);
+        metrics.clear_replication_lag();
+        let render = metrics.render().await.unwrap();
+        // After clear() the family has no labelled samples, so the
+        // per-replica lines must be gone. The HELP / TYPE lines
+        // (containing the metric name) remain — assert on the
+        // label string instead.
+        assert!(
+            !render.contains("replica=\"2\""),
+            "render still contains replica=2 line: {render}"
+        );
+        assert!(
+            !render.contains("replica=\"3\""),
+            "render still contains replica=3 line: {render}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observe_commit_latency_records_in_histogram() {
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        metrics.observe_commit_latency(0.012);
+        metrics.observe_commit_latency(0.080);
+        let render = metrics.render().await.unwrap();
+        assert!(render.contains("xraft_commit_latency_seconds_count 2"));
+        assert!(render.contains("xraft_commit_latency_seconds_sum"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_requests_counter_is_per_direction() {
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        metrics.record_fetch_request(FetchDirection::Sent);
+        metrics.record_fetch_request(FetchDirection::Sent);
+        metrics.record_fetch_request(FetchDirection::Received);
+        let render = metrics.render().await.unwrap();
+        assert!(
+            render.contains("xraft_fetch_requests_total{direction=\"sent\"} 2"),
+            "render missing sent counter: {render}"
+        );
+        assert!(
+            render.contains("xraft_fetch_requests_total{direction=\"received\"} 1"),
+            "render missing received counter: {render}"
+        );
     }
 }

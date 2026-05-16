@@ -132,6 +132,49 @@ pub struct ClusterConfig {
     /// regular voter / follower per the voters set).
     #[serde(default)]
     pub observers: Vec<u64>,
+
+    // -----------------------------------------------------------------------
+    // Stage 7.1 — Check Quorum and Leader Lease
+    // -----------------------------------------------------------------------
+    /// Whether the leader should periodically verify it can still reach a
+    /// majority of voters, stepping down to follower if it cannot. Defaults
+    /// to `true` per `architecture.md` §2.1 / §9 ("Pre-Vote + Check-Quorum
+    /// by default") and the Stage 7.1 brief. Disable only for testing the
+    /// "no Check Quorum" baseline; production deployments should leave this
+    /// on so a partitioned leader does not continue to accept proposals
+    /// that it can never commit.
+    #[serde(default = "default_enable_check_quorum")]
+    pub enable_check_quorum: bool,
+    /// Whether the leader may treat itself as holding a valid read lease
+    /// after hearing from a majority of voters within
+    /// `check_quorum_interval_ms`. Defaults to `false` per the Stage 7.1
+    /// brief; consumers that need lease-backed local reads must opt in.
+    /// **Internal optimization only:** XRAFT v1 does not expose an
+    /// external client read API (see `tech-spec.md` §2.5); the lease flag
+    /// gates an internal optimisation that lets admin status queries and
+    /// `StateMachine`-based lookups skip an extra commit-index
+    /// confirmation round-trip when the leader has recent majority
+    /// contact via incoming Fetch RPCs.
+    #[serde(default = "default_enable_leader_lease")]
+    pub enable_leader_lease: bool,
+    /// Wall-clock window in milliseconds within which the leader counts
+    /// peer Fetch RPCs toward the Check-Quorum and Leader-Lease majority
+    /// reachability check. `None` means "derive from
+    /// `2 * election_timeout_max_ms`" per `architecture.md` §2.1 — that
+    /// is, the default check interval is twice the upper bound of the
+    /// election timeout so a transient stall in fetch traffic does not
+    /// spuriously step the leader down. Explicit values override the
+    /// derived default; consult [`effective_check_quorum_interval_ms`]
+    /// rather than reading this field directly.
+    #[serde(default)]
+    pub check_quorum_interval_ms: Option<u64>,
+}
+
+fn default_enable_check_quorum() -> bool {
+    true
+}
+fn default_enable_leader_lease() -> bool {
+    false
 }
 
 fn default_election_timeout_min() -> u64 {
@@ -181,6 +224,20 @@ fn default_retry_max_backoff_ms() -> u64 {
 }
 fn default_max_message_size() -> usize {
     64 * 1024 * 1024
+}
+
+/// Parse a boolean string from an env override. Accepts `true`/`false`,
+/// `1`/`0`, `yes`/`no`, `on`/`off` (case-insensitive). Used for the
+/// Stage 7.1 `XRAFT_ENABLE_CHECK_QUORUM` / `XRAFT_ENABLE_LEADER_LEASE`
+/// overrides so operators don't have to remember a specific spelling.
+fn parse_bool_env(val: &str, var_name: &str) -> Result<bool, XRaftError> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        other => Err(XRaftError::Config(format!(
+            "{var_name}: invalid boolean value '{other}' (expected true|false|1|0|yes|no|on|off)"
+        ))),
+    }
 }
 
 impl ClusterConfig {
@@ -335,6 +392,26 @@ impl ClusterConfig {
                     "XRAFT_SNAPSHOT_RETENTION_COUNT: invalid usize value '{val}'"
                 ))
             })?;
+        }
+        // Stage 7.1 — Check Quorum and Leader Lease env overrides.
+        if let Ok(val) = env_var("XRAFT_ENABLE_CHECK_QUORUM")
+            && !val.is_empty()
+        {
+            self.enable_check_quorum = parse_bool_env(&val, "XRAFT_ENABLE_CHECK_QUORUM")?;
+        }
+        if let Ok(val) = env_var("XRAFT_ENABLE_LEADER_LEASE")
+            && !val.is_empty()
+        {
+            self.enable_leader_lease = parse_bool_env(&val, "XRAFT_ENABLE_LEADER_LEASE")?;
+        }
+        if let Ok(val) = env_var("XRAFT_CHECK_QUORUM_INTERVAL_MS")
+            && !val.is_empty()
+        {
+            self.check_quorum_interval_ms = Some(val.parse::<u64>().map_err(|_| {
+                XRaftError::Config(format!(
+                    "XRAFT_CHECK_QUORUM_INTERVAL_MS: invalid u64 value '{val}'"
+                ))
+            })?);
         }
         Ok(())
     }
@@ -511,7 +588,37 @@ impl ClusterConfig {
         if self.max_message_size == 0 {
             return Err(XRaftError::Config("max_message_size must be > 0".into()));
         }
+
+        // Stage 7.1 — Check Quorum interval validation.
+        // The derived default is `2 * election_timeout_max_ms`; reject an
+        // explicit zero so misconfigured operators do not accidentally
+        // collapse the Check Quorum window to a tight loop that fires on
+        // every leader tick.
+        if let Some(v) = self.check_quorum_interval_ms
+            && v == 0
+        {
+            return Err(XRaftError::Config(
+                "check_quorum_interval_ms must be > 0 when set; omit the field to use the default \
+                 (2 * election_timeout_max_ms)"
+                    .into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Effective Check-Quorum / Leader-Lease window in milliseconds.
+    ///
+    /// Returns the explicit [`Self::check_quorum_interval_ms`] when set;
+    /// otherwise derives the default as `2 * election_timeout_max_ms`
+    /// per `architecture.md` §2.1 — the doubled interval gives the
+    /// leader headroom for one election-timeout's worth of fetch stall
+    /// before stepping down. Uses [`u64::saturating_mul`] so the derived
+    /// value never overflows.
+    pub fn effective_check_quorum_interval_ms(&self) -> u64 {
+        match self.check_quorum_interval_ms {
+            Some(v) => v,
+            None => self.election_timeout_max_ms.saturating_mul(2),
+        }
     }
 
     /// Resolve a peer's URL from the structured `voters` configuration.

@@ -279,6 +279,9 @@ fn two_peer_cluster(follower_port: u16, leader_port: u16) -> ClusterConfig {
         retry_max_backoff_ms: 300,
         max_message_size: 4 * 1024 * 1024,
         observers: vec![],
+        enable_check_quorum: true,
+        enable_leader_lease: false,
+        check_quorum_interval_ms: None,
     }
 }
 
