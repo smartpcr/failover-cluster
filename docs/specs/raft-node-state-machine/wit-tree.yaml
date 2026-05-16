@@ -61,7 +61,7 @@ phases:
           - id: "step-peer-state"
             title: "PeerState per-peer replication tracker"
             description: >-
-              Fields use the architecture.md §3.2 spec names (no _tick
+              Fields use the docs/stories/failover-cluster-XRAFT/architecture.md §3.2 spec names (no _tick
               suffix): last_fetch_offset: LogIndex,
               last_fetch_time: u64 (logical ticks),
               last_caught_up_time: u64, is_voter: bool. Provides
@@ -305,7 +305,7 @@ phases:
               PreCandidate -> become_pre_candidate() (RESTART the
               Pre-Vote round; MUST NOT become_candidate() here
               because the term bump requires a Stage 3.2 pre-vote
-              quorum - architecture.md §5.1 Pre-Vote safety);
+              quorum - docs/stories/failover-cluster-XRAFT/architecture.md §5.1 Pre-Vote safety);
               Candidate -> become_pre_candidate() (fallback through
               Pre-Vote, same disruption-risk argument);
               Leader / Observer -> no-op. Adds a #[tracing::instrument]

@@ -81,7 +81,7 @@ PreVote/Vote responses and tally quorums are Stage 3.2.
 A `PreCandidate` whose election timer expires must NOT transition to
 `Candidate`. Doing so would increment `current_term` without ever
 receiving a quorum of pre-votes and reintroduces the very disruption
-Pre-Vote exists to prevent (architecture.md §5.1). The Stage 3.1 tick
+Pre-Vote exists to prevent (`docs/stories/failover-cluster-XRAFT/architecture.md` §5.1). The Stage 3.1 tick
 handler therefore restarts the Pre-Vote round (stays `PreCandidate`,
 re-randomises the timer, re-emits `PreVoteRequest`s) on a PreCandidate
 timeout. The `Follower → PreCandidate` transition still happens on a
@@ -147,7 +147,7 @@ on. Each step here is a self-contained type with its own unit tests.
   sub-tick interval). Files: `xraft-core/src/node.rs`. Budget: 1.
 - Step 1.2 — `PeerState`: per-peer replication tracker. Fields
   `last_fetch_offset: LogIndex`, `last_fetch_time: u64` (logical
-  ticks; spec name from `architecture.md` §3.2),
+  ticks; spec name from `docs/stories/failover-cluster-XRAFT/architecture.md` §3.2),
   `last_caught_up_time: u64`, `is_voter: bool`. Provides
   `PeerState::new(is_voter)`. Tests cover field initialisation and
   the `Eq/Debug` derives needed by leader-election assertions. Files:
@@ -426,7 +426,7 @@ the contract boundary with 3.2/3.3.
 
 `docs/stories/failover-cluster-XRAFT/implementation-plan.md` Stage 3.1
 predates the explicit Pre-Vote safety decision recorded in this plan
-(architecture.md §5.1). Its old acceptance criteria are updated in the
+(`docs/stories/failover-cluster-XRAFT/architecture.md` §5.1). Its old acceptance criteria are updated in the
 same iteration that lands this design — specifically:
 
 - Old impl-step #5 ("trigger candidacy if [election timer] expired")
