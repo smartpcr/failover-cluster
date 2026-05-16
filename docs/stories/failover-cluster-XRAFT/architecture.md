@@ -56,8 +56,8 @@ step-down) is a pure function of inputs and current state.
 | `HardState` | Persisted before any RPC reply: `current_term`, `voted_for`. (`commit_index` and `last_applied` are volatile, rebuilt from the log on recovery — see §3.3.) |
 | `VoterSet` | Set of `(NodeId, NodeDirectoryId, Vec<Endpoint>)` tuples — the current quorum configuration. |
 | `ElectionTimer` | Randomised election timeout (150–300 ms default). Reset on valid leader contact. |
-| `Input` | Enum of all inputs: `Tick`, `VoteRequest`, `VoteResponse`, `FetchRequest`, `FetchResponse`, `ClientPropose`. |
-| `Action` | Enum of all side-effects: `PersistHardState`, `AppendEntries`, `SendMessage`, `ApplyToStateMachine`, `TakeSnapshot`, `InstallSnapshot`, `BecomeLeader`, `StepDown`. |
+| `Input` | Enum of all inputs: `Tick`, `VoteRequest`, `VoteResponse`, `PreVoteRequest`, `PreVoteResponse`, `FetchRequest`, `FetchResponse`, `ClientPropose`, `FetchRequestAcked` (driver feedback after a successful Stage 3.3 fetch read). |
+| `Action` | Enum of all side-effects: `PersistHardState`, `AppendEntries`, `SendMessage`, `ApplyToStateMachine`, `TakeSnapshot`, `InstallSnapshot`, `BecomeLeader`, `StepDown`, `ServeFetch` (driver materialises a `FetchResponse` from the durable log), `TruncateLog` (follower divergence resolution), `RejectUnsupportedInput` (Stage 3.1/3.2 visible rejection of inputs whose handlers are deferred to Stage 3.3 — `ClientPropose` / `FetchRequest` / `FetchResponse` / `FetchRequestAcked`). |
 
 **Key design choice — pull-based replication (KRaft-style):**
 Unlike canonical Raft where the leader pushes `AppendEntries`, XRAFT followers

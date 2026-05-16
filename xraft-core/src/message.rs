@@ -252,37 +252,28 @@ pub enum Action {
         high_watermark: LogIndex,
         snapshot_metadata: SnapshotMeta,
     },
-    /// Instruct the driver to mutate its durable log.
+    /// Visible rejection of an [`Input`] variant whose handler is deferred
+    /// to a future stage.
     ///
-    /// Two truncation modes are supported (see [`LogTruncation`]):
+    /// Stages 3.1 and 3.2 implement Tick + Vote/PreVote handling but defer
+    /// `FetchRequest` / `FetchResponse` / `ClientPropose` / `FetchRequestAcked`
+    /// to Stage 3.3 (Log Replication). Rather than silently returning an
+    /// empty `Vec<Action>` for those inputs — which would be invisible to
+    /// the driver and to operators — the engine emits this structured
+    /// rejection so the driver can reply over RPC, surface a metric, or
+    /// forward an "unsupported" error to the client.
     ///
-    /// - [`LogTruncation::SuffixFromInclusive`]: Stage 3.3 follower
-    ///   divergence resolution — drop entries with `index >= from`
-    ///   so the follower can re-fetch from the leader-supplied
-    ///   consistent point. After truncation the driver MUST call
-    ///   [`RaftNode::set_last_log`](crate::node::RaftNode::set_last_log)
-    ///   with the actual post-truncation last index/term so the
-    ///   engine's in-memory mirror is consistent with durable state.
-    /// - [`LogTruncation::PrefixThroughInclusive`]: Stage 5.2
-    ///   post-snapshot compaction — drop entries with
-    ///   `index <= through` so the log can release the bytes whose
-    ///   semantics are now captured by the most recent snapshot.
-    ///   Drivers without prefix-purge support yet (Stage 5.2 only
-    ///   adds the contract; the segmented-log GC lands in Stage 6.2)
-    ///   may treat this as a logging no-op while the variant flows
-    ///   through the pipeline.
-    TruncateLog(LogTruncation),
-}
-
-/// Direction of an [`Action::TruncateLog`] request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LogTruncation {
-    /// Drop entries with `index >= from_index_inclusive` (suffix).
-    /// Stage 3.3 follower divergence resolution.
-    SuffixFromInclusive { from_index_inclusive: LogIndex },
-    /// Drop entries with `index <= through_index_inclusive` (prefix).
-    /// Stage 5.2 post-snapshot log compaction.
-    PrefixThroughInclusive { through_index_inclusive: LogIndex },
+    /// `input_kind` is a `&'static str` naming the rejected `Input` variant
+    /// (e.g. `"ClientPropose"`); `reason` is a human-readable string the
+    /// driver may surface verbatim. The engine guarantees that emitting
+    /// this action does not mutate any Raft state — the rejection is a pure
+    /// pass-through; see the integration test
+    /// `scenario_stage_3_3_inputs_emit_visible_rejection` for the exact
+    /// no-mutation contract.
+    RejectUnsupportedInput {
+        input_kind: &'static str,
+        reason: String,
+    },
 }
 
 /// Messages sent over the network.
