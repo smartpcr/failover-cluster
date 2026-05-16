@@ -199,12 +199,52 @@ fn router_inner(
         .route("/health", get(health_handler))
         .route("/admin/status", get(admin_status_handler))
         .route("/admin/trigger-snapshot", post(trigger_snapshot_handler))
+        .route("/admin/add-voter", post(add_voter_handler))
+        .route("/admin/remove-voter", post(remove_voter_handler))
         .route("/metrics", get(metrics_handler))
         .with_state(state)
 }
 
 async fn root_handler() -> &'static str {
     "xraft-server admin endpoint — see /health, /admin/status and /metrics"
+}
+
+/// Handler for `POST /admin/add-voter` (Stage 7.2). Unconditionally
+/// returns `501 Not Implemented` carrying the `XRaftError::Unsupported`
+/// rejection message. Dynamic membership is **out of scope for v1**
+/// (per `tech-spec.md` §2.7, `architecture.md` §5.5, and
+/// `e2e-scenarios.md` Feature 12 — deferred to a future story
+/// entirely; not a stretch goal within XRAFT). The response is
+/// independent of whether a [`DriverHandle`] is wired into the admin
+/// state so a stand-alone test router returns the same `501` rather
+/// than `503 Service Unavailable`, matching the symmetric semantics
+/// of [`crate::driver::DriverHandle::add_voter`] which also rejects
+/// locally without touching the driver loop.
+async fn add_voter_handler() -> Response {
+    let body = serde_json::json!({
+        "error": "AddVoter is out of scope for v1 — dynamic cluster membership \
+                  is deferred to a future story entirely (per tech-spec.md \
+                  §2.7, architecture.md §5.5, e2e-scenarios.md Feature 12). \
+                  The voter set is static after first boot; restart the \
+                  cluster with a different configuration to change membership.",
+        "code": "UNSUPPORTED",
+    });
+    (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
+}
+
+/// Handler for `POST /admin/remove-voter` (Stage 7.2). See
+/// [`add_voter_handler`] for the rejection rationale; same status
+/// and body shape so operator tooling can handle the pair uniformly.
+async fn remove_voter_handler() -> Response {
+    let body = serde_json::json!({
+        "error": "RemoveVoter is out of scope for v1 — dynamic cluster membership \
+                  is deferred to a future story entirely (per tech-spec.md \
+                  §2.7, architecture.md §5.5, e2e-scenarios.md Feature 12). \
+                  The voter set is static after first boot; restart the \
+                  cluster with a different configuration to change membership.",
+        "code": "UNSUPPORTED",
+    });
+    (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
 }
 
 /// Handler for `GET /health`. Returns the latest [`NodeStatus`]
@@ -741,6 +781,103 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/trigger-snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_voter_endpoint_returns_501_with_unsupported_body() {
+        // Stage 7.2: dynamic membership is out of scope for v1. The
+        // admin endpoint must surface this via 501 Not Implemented
+        // (not 503 — the rejection is intrinsic to v1, not a
+        // missing-driver runtime gap) with a JSON body that carries
+        // the explicit "UNSUPPORTED" code and an operator-readable
+        // explanation referencing the scoping decision.
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        let app = router(metrics, test_cluster_info());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/add-voter")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], "UNSUPPORTED");
+        let err = v["error"].as_str().expect("error field must be string");
+        assert!(
+            err.contains("out of scope for v1"),
+            "error body must explain v1 scoping: {err}"
+        );
+        assert!(
+            err.contains("AddVoter"),
+            "error body must name the rejected operation: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remove_voter_endpoint_returns_501_with_unsupported_body() {
+        // Stage 7.2: symmetric to add-voter — see that test for the
+        // status-code rationale.
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        let app = router(metrics, test_cluster_info());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/remove-voter")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], "UNSUPPORTED");
+        let err = v["error"].as_str().expect("error field must be string");
+        assert!(
+            err.contains("RemoveVoter"),
+            "error body must name the rejected operation: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_voter_route_only_responds_to_post() {
+        // Membership-mutation endpoints must be POST-only so a
+        // misdirected GET cannot accidentally probe the route as a
+        // read.
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        let app = router(metrics, test_cluster_info());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/add-voter")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remove_voter_route_only_responds_to_post() {
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        let app = router(metrics, test_cluster_info());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/remove-voter")
                     .body(Body::empty())
                     .unwrap(),
             )
