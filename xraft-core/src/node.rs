@@ -1512,20 +1512,33 @@ impl RaftNode {
     // metadata back into the engine via [`Input::SnapshotComplete`] or
     // [`Input::SnapshotInstalled`]. These handlers update the engine's
     // view of the most recent durable snapshot and, in the
-    // `SnapshotComplete` case, instruct the driver to compact the now-
+    // `SnapshotComplete` case where the completion actually advances the
+    // engine's snapshot anchor, instruct the driver to compact the now-
     // redundant log prefix via
     // [`Action::TruncateLog`](`Action::TruncateLog`) with the
-    // [`LogTruncation::PrefixThroughInclusive`] variant.
+    // [`LogTruncation::PrefixThroughInclusive`] variant. A stale
+    // completion (one whose `last_included_index` does not raise the
+    // anchor) clears the debouncer but emits no follow-on truncation —
+    // the engine already anchors at a fresher index, so instructing the
+    // driver to purge through a stale, lower index would express the
+    // wrong intent even though prefix purge is idempotent in practice.
     // ---------------------------------------------------------------------
 
     /// Handle [`Input::SnapshotComplete`]: the driver finished saving a
-    /// snapshot the engine asked for. Records the snapshot metadata and
-    /// emits an [`Action::TruncateLog`] of the
+    /// snapshot the engine asked for. Records the snapshot metadata and,
+    /// when the completion actually advances the engine's snapshot
+    /// anchor, emits an [`Action::TruncateLog`] of the
     /// [`LogTruncation::PrefixThroughInclusive`] variety so the driver
     /// can compact the log prefix that is now fully covered by the
-    /// snapshot.
+    /// snapshot. A stale completion (same- or lower-indexed than the
+    /// anchor already on record) returns an empty action vec: the
+    /// fresher anchor already covers a longer prefix, so emitting a
+    /// purge instruction at the stale, lower index would misrepresent
+    /// the engine's intent — even though prefix purge is idempotent in
+    /// practice. The in-flight debouncer flag is cleared in both
+    /// branches so a subsequent threshold crossing can re-emit
+    /// [`Action::TakeSnapshot`].
     fn handle_snapshot_complete(&mut self, metadata: SnapshotMeta) -> Vec<Action> {
-        let through = metadata.last_included_index;
         // Raise-only update of `last_snapshot_meta`: a same- or
         // lower-indexed completion (e.g. a stale `Input::SnapshotComplete`
         // accidentally delivered after a newer snapshot has already been
@@ -1533,14 +1546,25 @@ impl RaftNode {
         // never replays older completions in practice, but the engine
         // enforces the invariant directly so unit tests and any future
         // alternate driver still see coherent metadata.
-        if Self::is_snapshot_meta_newer(self.last_snapshot_meta.as_ref(), &metadata) {
-            self.last_snapshot_meta = Some(metadata);
-        }
+        let is_fresh = Self::is_snapshot_meta_newer(self.last_snapshot_meta.as_ref(), &metadata);
         // Stage 5.2 trigger debouncer: a previously-emitted
         // `Action::TakeSnapshot` has now completed; future commit-index
         // advances may emit another `TakeSnapshot` once the lag re-crosses
-        // the threshold.
+        // the threshold. Clearing happens in both branches because the
+        // driver-side save attempt has resolved one way or the other.
         self.snapshot_in_flight = false;
+        if !is_fresh {
+            // Stale completion: the engine already anchors at an equal-or-
+            // newer snapshot. Emitting `TruncateLog` here would instruct
+            // the driver to purge a prefix the engine no longer considers
+            // authoritative — the fresher anchor's truncation already
+            // covered (or will cover) a longer prefix. Prefix purge is
+            // idempotent today, but expressing the wrong intent would
+            // bite us once Stage 6.2 wires up physical purging.
+            return Vec::new();
+        }
+        let through = metadata.last_included_index;
+        self.last_snapshot_meta = Some(metadata);
         vec![Action::TruncateLog(LogTruncation::PrefixThroughInclusive {
             through_index_inclusive: through,
         })]
@@ -5188,29 +5212,30 @@ port = 6004
         // `Input::SnapshotComplete` (e.g. an out-of-order completion
         // delivered after a newer snapshot has been recorded via either
         // `SnapshotComplete` or `SnapshotInstalled`) must NOT clobber the
-        // fresher anchor. The follow-on `Action::TruncateLog` is still
-        // emitted because the driver may still need to compact the log
-        // prefix the completion's `through_index_inclusive` covers, but
-        // the engine's metadata view stays raise-only.
+        // fresher anchor and must NOT emit a follow-on `TruncateLog`. The
+        // engine already anchors at a longer prefix, so instructing the
+        // driver to purge through the stale, lower index would express
+        // the wrong intent (prefix purge is idempotent today, but Stage
+        // 6.2's physical purge would treat the stale instruction as a
+        // genuine — and confusingly named — request). The debouncer
+        // flag still clears because the driver-side save attempt has
+        // resolved either way.
         let mut node = RaftNode::new_with_seed(three_voter_config(), 67).unwrap();
         let fresh = test_snapshot_meta(50, 11);
         node.last_snapshot_meta = Some(fresh.clone());
+        node.snapshot_in_flight = true;
 
         let stale = test_snapshot_meta(25, 7);
         let actions = node.step(Input::SnapshotComplete {
             metadata: stale.clone(),
         });
 
-        // TruncateLog is still emitted at the stale through_index (the
-        // driver path will treat it as a no-op compaction if the prefix
-        // is already gone).
-        assert_eq!(actions.len(), 1, "expected one TruncateLog action");
-        match &actions[0] {
-            Action::TruncateLog(LogTruncation::PrefixThroughInclusive {
-                through_index_inclusive,
-            }) => assert_eq!(*through_index_inclusive, LogIndex(25)),
-            other => panic!("expected PrefixThroughInclusive, got {other:?}"),
-        }
+        // Stale completion emits no follow-on actions — the fresher
+        // anchor already covers (or will cover) a longer prefix.
+        assert!(
+            actions.is_empty(),
+            "stale Input::SnapshotComplete must not emit any follow-on actions, got {actions:?}",
+        );
         // The fresher snapshot anchor must survive.
         assert_eq!(
             node.last_snapshot_meta.as_ref(),
