@@ -116,6 +116,28 @@ pub enum Input {
     SnapshotInstalled {
         metadata: SnapshotMeta,
     },
+    /// Driver feedback that a `Transport::send_fetch_snapshot` stream
+    /// has been fully reassembled into a `(metadata, data)` tuple.
+    ///
+    /// The driver has applied envelope-level fences (`cluster_id`,
+    /// `leader_epoch`, peer == recognised leader, metadata present)
+    /// before feeding this input. The engine then performs its own
+    /// staleness check (`metadata.last_included_index > last_applied`)
+    /// and emits exactly one [`Action::InstallSnapshot`] for the driver
+    /// to fulfil. A stale snapshot — one whose coverage is at or behind
+    /// the state machine's apply point — emits no action so that the
+    /// driver does not regress the state machine via `restore`.
+    ///
+    /// Stage 5.3 (`implementation-plan.md` §5.2 step 3): this is the
+    /// engine-side handoff that the install_snapshot contract calls
+    /// out — "receiving a FetchSnapshot response produces
+    /// `Action::InstallSnapshot { metadata, data }`". Routing the
+    /// production path through this input ensures the action contract
+    /// is exercised end-to-end (not just by synthetic tests).
+    FetchSnapshotReceived {
+        metadata: SnapshotMeta,
+        data: Vec<u8>,
+    },
 }
 
 /// Side-effects emitted by the Raft state machine.
@@ -187,6 +209,48 @@ pub enum Action {
         high_watermark: LogIndex,
         fetch_offset: LogIndex,
         last_fetched_epoch: Term,
+    },
+    /// Stage 5.3 (implementation-plan §5.2 step 4) — leader-side snapshot
+    /// redirect emitted by the engine.
+    ///
+    /// `RaftNode::handle_fetch_request` emits this action — instead of
+    /// [`Action::ServeFetch`] — when it detects that the follower's
+    /// `fetch_offset` is at or below the compacted prefix anchored by
+    /// `last_snapshot_meta` (i.e. the snapshot covers entries up to
+    /// `snapshot_metadata.last_included_index` and the follower is asking
+    /// for an index inside that range). The driver materialises an empty
+    /// [`FetchResponse`] carrying
+    /// [`snapshot_redirect: Some(SnapshotRedirect{…})`](FetchResponse::snapshot_redirect)
+    /// and dispatches it to `to`; the follower then issues a
+    /// [`FetchSnapshotRequest`] via the redirect handler in
+    /// [`RaftNode::handle_fetch_response`].
+    ///
+    /// **Mutual exclusivity with `Action::ServeFetch`**: for a single
+    /// inbound `FetchRequest` the engine emits exactly one of the two
+    /// actions, never both. `RedirectToSnapshot` carries no
+    /// `fetch_offset` / `last_fetched_epoch` because the follower is
+    /// behind the compacted prefix — the redirect itself supersedes any
+    /// log-tail comparison.
+    ///
+    /// **No `FetchRequestAcked` follow-up**: the redirect does NOT prove
+    /// the follower has replicated any entry. In fact the opposite —
+    /// the follower is BEHIND the compacted prefix. Driver-side
+    /// peer-progress / high-watermark advancement must not run here
+    /// (this is asserted by
+    /// `redirect_to_snapshot_does_not_advance_peer_progress` in
+    /// `xraft-server`).
+    ///
+    /// All envelope fields are captured at action-emit time, matching
+    /// the [`Action::ServeFetch`] contract so the driver does not race
+    /// against subsequent node mutations (e.g. a step-down between
+    /// `step()` and dispatch).
+    RedirectToSnapshot {
+        to: NodeId,
+        cluster_id: String,
+        leader_epoch: u64,
+        leader_id: NodeId,
+        high_watermark: LogIndex,
+        snapshot_metadata: SnapshotMeta,
     },
     /// Instruct the driver to mutate its durable log.
     ///
