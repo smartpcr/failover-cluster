@@ -79,9 +79,13 @@ impl LogStoreError {
 /// Trait abstracting the replicated log store (architecture §4.1).
 ///
 /// All mutating methods take `&self` — implementations use interior
-/// mutability (e.g. `tokio::sync::Mutex`) consistent with `Send + Sync`.
-/// The `IoStage` holds an owned `Box<dyn LogStore>` and invokes it via
-/// `&self` concurrently with other I/O traits via `tokio::join!`.
+/// mutability (a blocking mutex such as `std::sync::Mutex` or
+/// `parking_lot::Mutex` is appropriate, since the critical sections
+/// are short and never held across an `.await`; see Tokio's own
+/// guidance on `tokio::sync::Mutex` vs blocking mutexes) consistent
+/// with `Send + Sync`. The `IoStage` holds an owned `Box<dyn LogStore>`
+/// and invokes it via `&self` concurrently with other I/O traits via
+/// `tokio::join!`.
 #[async_trait]
 pub trait LogStore: Send + Sync + 'static {
     /// Append entries. Must fsync before returning Ok.
@@ -111,8 +115,20 @@ pub trait LogStore: Send + Sync + 'static {
 
 /// In-memory log store implementing the async `LogStore` trait.
 ///
-/// Uses `tokio::sync::Mutex` for interior mutability and atomics for
+/// Uses `std::sync::Mutex` for interior mutability and atomics for
 /// offset tracking, consistent with the `Send + Sync + 'static` bound.
+/// A blocking mutex is the correct choice here for two reasons:
+///   1. Every critical section is a short `Vec` operation (push,
+///      iterate, retain) and is *never* held across an `.await` — per
+///      Tokio's guidance, an async mutex would add overhead without
+///      benefit. See <https://docs.rs/tokio/latest/tokio/sync/struct.Mutex.html>.
+///   2. `InMemoryLog` also implements `SyncLogOps` (used by
+///      `MembershipManager` from inside the event loop), whose methods
+///      are synchronous and therefore cannot `.await`.
+///
+/// Lock acquisition goes through `lock_entries`, which transparently
+/// recovers from poisoning (the `Vec<LogEntry>` itself is never left
+/// in a partially-mutated state by any of our critical sections).
 pub struct InMemoryLog {
     entries: Mutex<Vec<LogEntry>>,
     start_offset: AtomicU64,
@@ -148,12 +164,25 @@ impl InMemoryLog {
     pub fn set_start_offset_for_test(&self, offset: u64) {
         self.start_offset.store(offset, Ordering::SeqCst);
     }
+
+    /// Acquire the entries lock, transparently recovering from a poisoned
+    /// mutex. Poisoning here would mean a panic occurred while another
+    /// thread held the lock; however, none of our critical sections leave
+    /// the `Vec<LogEntry>` in a partially-mutated state (each is a single
+    /// `push`, `retain`, `iter`, or `find`), so the underlying data is
+    /// still safe to observe and mutate. Recovering avoids cascading the
+    /// original panic into every subsequent log operation.
+    fn lock_entries(&self) -> std::sync::MutexGuard<'_, Vec<LogEntry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 #[async_trait]
 impl LogStore for InMemoryLog {
     async fn append(&self, entries: &[LogEntry]) -> Result<(), LogStoreError> {
-        let mut log = self.entries.lock().unwrap();
+        let mut log = self.lock_entries();
         for entry in entries {
             log.push(entry.clone());
         }
@@ -164,7 +193,7 @@ impl LogStore for InMemoryLog {
     }
 
     async fn read(&self, start_offset: u64, end_offset: u64) -> Result<Vec<LogEntry>, LogStoreError> {
-        let log = self.entries.lock().unwrap();
+        let log = self.lock_entries();
         let result = log
             .iter()
             .filter(|e| e.offset >= start_offset && e.offset < end_offset)
@@ -174,7 +203,7 @@ impl LogStore for InMemoryLog {
     }
 
     async fn truncate_suffix(&self, from_offset: u64) -> Result<(), LogStoreError> {
-        let mut log = self.entries.lock().unwrap();
+        let mut log = self.lock_entries();
         log.retain(|e| e.offset < from_offset);
         let new_end = log.last().map(|e| e.offset + 1).unwrap_or(0);
         self.end_offset.store(new_end, Ordering::SeqCst);
@@ -182,7 +211,7 @@ impl LogStore for InMemoryLog {
     }
 
     async fn truncate_prefix(&self, up_to_offset: u64) -> Result<(), LogStoreError> {
-        let mut log = self.entries.lock().unwrap();
+        let mut log = self.lock_entries();
         log.retain(|e| e.offset >= up_to_offset);
         self.start_offset.store(up_to_offset, Ordering::SeqCst);
         Ok(())
@@ -197,12 +226,12 @@ impl LogStore for InMemoryLog {
     }
 
     async fn entry_at(&self, offset: u64) -> Result<Option<LogEntry>, LogStoreError> {
-        let log = self.entries.lock().unwrap();
+        let log = self.lock_entries();
         Ok(log.iter().find(|e| e.offset == offset).cloned())
     }
 
     async fn has_uncommitted_voters_record(&self, high_watermark: u64) -> Result<bool, LogStoreError> {
-        let log = self.entries.lock().unwrap();
+        let log = self.lock_entries();
         Ok(log
             .iter()
             .filter(|e| e.offset >= high_watermark)
@@ -258,7 +287,7 @@ pub trait SyncLogOps: Send + Sync {
 
 impl SyncLogOps for InMemoryLog {
     fn append_entry(&self, entry: LogEntry) -> Result<(), LogStoreError> {
-        let mut log = self.entries.lock().unwrap();
+        let mut log = self.lock_entries();
         let next_offset = entry.offset + 1;
         log.push(entry);
         self.end_offset.store(next_offset, Ordering::SeqCst);
@@ -266,14 +295,14 @@ impl SyncLogOps for InMemoryLog {
     }
 
     fn has_uncommitted_voters_record_sync(&self, high_watermark: u64) -> bool {
-        let log = self.entries.lock().unwrap();
+        let log = self.lock_entries();
         log.iter()
             .filter(|e| e.offset >= high_watermark)
             .any(|e| e.entry_type == EntryType::VotersRecord)
     }
 
     fn read_entries(&self, from_offset: u64, max_entries: usize) -> Vec<LogEntry> {
-        let log = self.entries.lock().unwrap();
+        let log = self.lock_entries();
         log.iter()
             .filter(|e| e.offset >= from_offset)
             .take(max_entries)
@@ -287,7 +316,7 @@ impl SyncLogOps for InMemoryLog {
         max_entries: usize,
         max_bytes: u32,
     ) -> Vec<LogEntry> {
-        let log = self.entries.lock().unwrap();
+        let log = self.lock_entries();
         let mut result = Vec::new();
         let mut total_bytes: u64 = 0;
         for entry in log.iter().filter(|e| e.offset >= from_offset) {
@@ -314,12 +343,12 @@ impl SyncLogOps for InMemoryLog {
     }
 
     fn entry_term_at(&self, offset: u64) -> Option<Term> {
-        let log = self.entries.lock().unwrap();
+        let log = self.lock_entries();
         log.iter().find(|e| e.offset == offset).map(|e| e.term)
     }
 
     fn epoch_end_offset(&self, epoch: Term) -> u64 {
-        let log = self.entries.lock().unwrap();
+        let log = self.lock_entries();
         // Find the first entry with term > epoch, return its offset.
         // If no such entry exists, return end_offset.
         for entry in log.iter() {
@@ -331,7 +360,7 @@ impl SyncLogOps for InMemoryLog {
     }
 
     fn truncate_suffix_sync(&self, from_offset: u64) {
-        let mut log = self.entries.lock().unwrap();
+        let mut log = self.lock_entries();
         log.retain(|e| e.offset < from_offset);
         let new_end = log.last().map(|e| e.offset + 1).unwrap_or(0);
         self.end_offset.store(new_end, Ordering::SeqCst);
@@ -639,4 +668,125 @@ impl NodeState {
         self.commit_membership_change();
     }
 
+    #[test]
+    fn advance_hw_rejects_non_contiguous_entries() {
+        let mut state = default_state();
+
+        // Provide entries at offsets 0 and 2, skipping 1.
+        let entries = vec![
+            make_data_entry(0, 1),
+            make_data_entry(2, 1),
+        ];
+
+        let result = state.advance_high_watermark(3, &entries);
+        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(RaftError::NonContiguousCommit(_))),
+            "expected NonContiguousCommit, got {:?}",
+            result
+        );
+        // HW must not have advanced.
+        assert_eq!(state.high_watermark(), 0);
+    }
+
+    #[test]
+    fn advance_hw_rejects_insufficient_entry_count() {
+        let mut state = default_state();
+
+        // Only provide 2 entries for a range of 3.
+        let entries = vec![
+            make_data_entry(0, 1),
+            make_data_entry(1, 1),
+        ];
+
+        let result = state.advance_high_watermark(3, &entries);
+        assert!(result.is_err());
+        assert_eq!(state.high_watermark(), 0);
+    }
+
+    #[test]
+    fn advance_hw_applies_voters_record() {
+        let mut state = default_state();
+
+        let new_voter_set = VoterSet::from_iter(vec![
+            make_node_id(1),
+            make_node_id(2),
+            make_node_id(4),
+        ]);
+
+        // Propose the membership change first.
+        state
+            .propose_membership_change(1, new_voter_set.clone())
+            .unwrap();
+        assert!(state.pending_membership_change().is_some());
+
+        let entries = vec![
+            make_data_entry(0, 1),
+            make_voters_record_entry(1, 1, new_voter_set.clone()),
+            make_data_entry(2, 1),
+        ];
+
+        state.advance_high_watermark(3, &entries).unwrap();
+        assert_eq!(state.high_watermark(), 3);
+        assert_eq!(state.voter_set(), &new_voter_set);
+        // Pending membership change should be cleared.
+        assert!(state.pending_membership_change().is_none());
+    }
+
+    #[test]
+    fn advance_hw_rejects_backward_movement() {
+        let mut state = default_state();
+
+        let entries = vec![make_data_entry(0, 1)];
+        state.advance_high_watermark(1, &entries).unwrap();
+
+        let result = state.advance_high_watermark(1, &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn advance_hw_rejects_duplicate_offsets() {
+        let mut state = default_state();
+
+        let entries = vec![
+            make_data_entry(0, 1),
+            make_data_entry(0, 1), // duplicate
+        ];
+
+        let result = state.advance_high_watermark(2, &entries);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn clear_pending_if_truncated_clears_when_at_boundary() {
+        let mut state = default_state();
+        let new_vs = VoterSet::from_iter(vec![make_node_id(1), make_node_id(2)]);
+        state.propose_membership_change(5, new_vs).unwrap();
+        assert!(state.pending_membership_change().is_some());
+
+        state.clear_pending_if_truncated(5);
+        assert!(state.pending_membership_change().is_none());
+    }
+
+    #[test]
+    fn clear_pending_if_truncated_preserves_when_below_boundary() {
+        let mut state = default_state();
+        let new_vs = VoterSet::from_iter(vec![make_node_id(1), make_node_id(2)]);
+        state.propose_membership_change(3, new_vs).unwrap();
+
+        state.clear_pending_if_truncated(5);
+        assert!(state.pending_membership_change().is_some());
+    }
+
+    #[test]
+    fn restore_from_snapshot_stores_last_included_term() {
+        let mut state = default_state();
+        let vs = VoterSet::from_iter(vec![make_node_id(1), make_node_id(2)]);
+        let vr = VotersRecord::new(vs.clone(), 10);
+
+        state.restore_from_snapshot_metadata(10, 3, 5, vs, vr);
+        assert_eq!(state.snapshot_last_term(), 3);
+        assert_eq!(state.high_watermark(), 10);
+        assert_eq!(state.leader_epoch(), 5);
+    }
 }
