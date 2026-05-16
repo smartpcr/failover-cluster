@@ -159,7 +159,8 @@ pub struct MembershipChangeResponse {
     pub error: Option<MembershipError>,
 }
 
-/// Error variants for membership change operations (architecture §3.2).
+/// Errors that can occur during membership change operations
+/// (architecture §3.2).
 ///
 /// Returned in `MembershipChangeResponse::error`,
 /// `RegisterObserverResponse::error`, and `DeregisterObserverResponse::error`
