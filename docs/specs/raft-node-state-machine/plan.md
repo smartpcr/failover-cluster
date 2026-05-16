@@ -500,6 +500,6 @@ These were open questions in earlier iterations and are now resolved:
    artefacts (`*.review-backup`, `*.iter-snapshot.bak`) are not part
    of the Stage 3.1 design contract. The repository's `.gitignore`
    covers both patterns, so any such files that appear in a working
-   tree are untracked by design. Any cleanup of such artefacts
-   outside this worktree belongs to a dedicated cleanup workstream,
-   not this planning stage.
+   tree are untracked by design. Cleanup of any such artefacts is
+   operational follow-up tracked outside this stage; Stage 3.1 must
+   not model it as a deliverable.
