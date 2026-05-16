@@ -153,19 +153,26 @@ pub struct MembershipChangeResponse {
     pub error: Option<MembershipError>,
 }
 
-/// Error variants for membership change operations (architecture §3.2).
+/// Errors that can occur during membership change operations
+/// (architecture §3.2).
+///
+/// Returned in `MembershipChangeResponse::error`,
+/// `RegisterObserverResponse::error`, and `DeregisterObserverResponse::error`
+/// when a membership-change RPC cannot be applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipError {
-    /// This node is not the leader; `leader_id` hints at who is.
+    /// The receiving node is not the current leader; `leader_id` hints at
+    /// who is so the client can redirect.
     NotLeader { leader_id: Option<NodeId> },
     /// An uncommitted VotersRecord already exists in the log.
     ChangeInProgress,
-    /// The target node is already a voter.
+    /// The target node is already a voter in the current configuration.
     NodeAlreadyVoter,
-    /// The target node is not known (not registered as an observer).
+    /// The target node was not found (not registered as an observer, or
+    /// not present in the current configuration).
     NodeNotFound,
-    /// The observer's fetch_offset has not reached within threshold of
-    /// the leader's log end.
+    /// The observer's fetch_offset has not caught up to within threshold of
+    /// the leader's current high watermark.
     NodeNotCaughtUp,
 }
 
@@ -185,35 +192,4 @@ impl MembershipChangeResponse {
             error: Some(error),
         }
     }
-}
-
-impl MembershipChangeResponse {
-    pub fn ok() -> Self {
-        Self {
-            success: true,
-            error: None,
-        }
-    }
-
-    pub fn err(error: MembershipError) -> Self {
-        Self {
-            success: false,
-            error: Some(error),
-        }
-    }
-}
-
-/// Errors that can occur during membership changes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MembershipError {
-    /// The receiving node is not the current leader.
-    NotLeader { leader_id: Option<NodeId> },
-    /// An uncommitted VotersRecord already exists in the log.
-    ChangeInProgress,
-    /// The node is already a voter in the current configuration.
-    NodeAlreadyVoter,
-    /// The node was not found in the current configuration.
-    NodeNotFound,
-    /// The observer's fetch_offset is behind the leader's current HW.
-    NodeNotCaughtUp,
 }
