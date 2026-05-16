@@ -40,10 +40,46 @@ use xraft_transport::grpc_server::RaftGrpcServer;
 // Test helpers
 // ---------------------------------------------------------------------------
 
-/// Pick a free TCP port by asking the OS to bind one and immediately
-/// releasing it. There is an inherent race window between `drop(listener)`
-/// and the test re-binding to that port; in practice this is not an issue
-/// because the kernel returns ports from a low-contention pool.
+/// Bind an ephemeral `127.0.0.1` port AND keep the listener alive so a
+/// parallel test cannot steal the port between the pick and the
+/// eventual server bind. The caller MUST hand the returned listener
+/// to [`spawn_plain_server`] or
+/// [`GrpcTransport::start_server_with_listener`]; dropping it without
+/// consuming reintroduces the TOCTOU race against parallel ephemeral
+/// picks under CI load.
+///
+/// This helper replaces the previous `pick_free_port → drop → server
+/// rebinds the same addr` pattern that the iter-5 evaluator flagged
+/// as "the same class of parallel-CI port TOCTOU flake that this
+/// iteration fixed only in the unrelated Stage 7.2 test" — by closing
+/// the bind hand-off, we apply the Stage 7.2 listener-passthrough
+/// mitigation to the Stage 4.1 transport tests too.
+fn bind_ephemeral() -> (u16, TcpListener) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    (port, listener)
+}
+
+/// Pick a free `127.0.0.1` port and release it immediately. Has an
+/// inherent TOCTOU race against parallel ephemeral picks, so this
+/// helper is reserved for the **two** call sites where holding a
+/// listener would actually break the test:
+///   1. [`connection_retry`] — the test wants the first client
+///      attempts to fail with `ECONNREFUSED` while no server is
+///      listening; holding a listener would let the kernel complete
+///      the TCP 3-way handshake and stash the connection in the
+///      accept queue, turning "connect refused → retry" into
+///      "connect-to-blackhole → protocol timeout → retry", which
+///      exercises a different path than the brief calls out.
+///   2. `VoterConfig.port` entries for voters that the test never
+///      starts (e.g. the *other* voter slot in the TLS tests and in
+///      [`start_server_with_listener_serves_on_pre_bound_socket`]).
+///      Nothing in the test ever binds these ports, so there is no
+///      TOCTOU window to close.
+///
+/// Every other caller — i.e. every site that picks a port AND then
+/// expects the SAME port to come back during a subsequent server
+/// bind — MUST use [`bind_ephemeral`] instead.
 fn pick_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let port = listener.local_addr().unwrap().port();
@@ -56,7 +92,14 @@ fn pick_free_port() -> u16 {
 /// `::1:0`; this picker proves the chosen port is free on the SAME
 /// address family the subsequent `localhost:{port}` bind will pick,
 /// so the hostname-roundtrip test does not race itself across
-/// `127.0.0.1` vs `::1`. Used by `start_server_accepts_hostname_listen_addr`.
+/// `127.0.0.1` vs `::1`.
+///
+/// Used by `start_server_accepts_hostname_listen_addr`, which
+/// deliberately drives the **production** `GrpcTransport::start_server`
+/// hostname-resolution path (via `bind_grpc_listener(&listen_addr)`
+/// in the server) — that test would lose its raison d'être if we
+/// switched it to a pre-bound listener, so the small drop-and-rebind
+/// window is intentional here.
 fn pick_free_port_via_hostname() -> u16 {
     let listener = TcpListener::bind("localhost:0").expect("bind ephemeral localhost port");
     let port = listener.local_addr().unwrap().port();
@@ -254,11 +297,54 @@ fn client_config(endpoint: String) -> RaftGrpcClientConfig {
     }
 }
 
-/// Spawn a tonic server bound to `addr` that dispatches into `handler`.
+/// Spawn a tonic server on a **pre-bound** `std::net::TcpListener`
+/// that dispatches into `handler`.
 ///
-/// Returns a `Notify` whose `notify_one()` cleanly stops the server, plus
-/// the join handle so the test can `await` the shutdown.
+/// Closes the TOCTOU window between the caller's port pick and the
+/// server's actual bind: the caller already owns the listener (via
+/// [`bind_ephemeral`]), so no parallel test can steal the port. This
+/// is the listener-passthrough pattern that production
+/// [`GrpcTransport::start_server_with_listener`] uses (see
+/// `xraft-transport/src/grpc.rs::serve_inner` for the canonical
+/// `serve_with_incoming_shutdown` + `TcpListenerStream` shape that
+/// this helper mirrors).
+///
+/// Returns a `Notify` whose `notify_one()` cleanly stops the server,
+/// plus the join handle so the test can `await` the shutdown.
 fn spawn_plain_server(
+    std_listener: TcpListener,
+    handler: Arc<StubHandler>,
+) -> (
+    Arc<Notify>,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+) {
+    std_listener
+        .set_nonblocking(true)
+        .expect("set_nonblocking on pre-bound listener");
+    let listener = tokio::net::TcpListener::from_std(std_listener)
+        .expect("convert std TcpListener into tokio TcpListener");
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_clone = shutdown.clone();
+    let svc = RaftGrpcServer::new(handler).into_service();
+    let handle = tokio::spawn(async move {
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(incoming, async move {
+                shutdown_clone.notified().await;
+            })
+            .await
+    });
+    (shutdown, handle)
+}
+
+/// Spawn a tonic server bound to `addr` AT SPAWN TIME. Reserved for
+/// [`connection_retry`], which intentionally does NOT hold the port
+/// during the deferred-bind window so the first client attempts hit
+/// `ECONNREFUSED` (the path the brief's `connection-retry` scenario
+/// exercises). Every other call site MUST use [`spawn_plain_server`]
+/// with a pre-bound listener from [`bind_ephemeral`].
+fn spawn_plain_server_on_addr_for_deferred_bind(
     addr: std::net::SocketAddr,
     handler: Arc<StubHandler>,
 ) -> (
@@ -318,12 +404,12 @@ async fn wait_for_listening_str(addr: &str, timeout: Duration) {
 
 #[tokio::test]
 async fn grpc_vote_roundtrip() {
-    let port = pick_free_port();
+    let (port, std_listener) = bind_ephemeral();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let endpoint = format!("http://127.0.0.1:{port}");
 
     let handler = StubHandler::new();
-    let (shutdown, srv_handle) = spawn_plain_server(addr, handler.clone());
+    let (shutdown, srv_handle) = spawn_plain_server(std_listener, handler.clone());
     wait_for_listening(addr, Duration::from_secs(2)).await;
 
     let client = RaftGrpcClient::new(client_config(endpoint));
@@ -389,7 +475,8 @@ async fn connection_retry() {
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let handler = StubHandler::new();
-    let (shutdown, srv_handle) = spawn_plain_server(addr, handler.clone());
+    let (shutdown, srv_handle) =
+        spawn_plain_server_on_addr_for_deferred_bind(addr, handler.clone());
 
     // Wait for the deferred RPC to complete; tokio::time::timeout caps the
     // test at 10s so a hung retry loop fails loudly.
@@ -411,12 +498,12 @@ async fn connection_retry() {
 
 #[tokio::test]
 async fn concurrent_rpcs() {
-    let port = pick_free_port();
+    let (port, std_listener) = bind_ephemeral();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let endpoint = format!("http://127.0.0.1:{port}");
 
     let handler = StubHandler::new();
-    let (shutdown, srv_handle) = spawn_plain_server(addr, handler.clone());
+    let (shutdown, srv_handle) = spawn_plain_server(std_listener, handler.clone());
     wait_for_listening(addr, Duration::from_secs(2)).await;
 
     let client = Arc::new(RaftGrpcClient::new(client_config(endpoint)));
@@ -483,7 +570,7 @@ fn issue_localhost_cert() -> (Vec<u8>, Vec<u8>) {
 
 #[tokio::test]
 async fn tls_transport() {
-    let port = pick_free_port();
+    let (port, std_listener) = bind_ephemeral();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     // Use the SNI-friendly hostname so the client's domain_name override
     // matches the cert SAN.
@@ -545,7 +632,20 @@ async fn tls_transport() {
     let server_cfg = GrpcTransportConfig::from_cluster_config(&cluster).unwrap();
     let server_transport: Arc<GrpcTransport<StubHandler>> =
         Arc::new(GrpcTransport::new(server_cfg, handler.clone()));
-    let serve_handle = tokio::spawn(server_transport.clone().start_server());
+    // Hand the pre-bound TCP listener to the transport — TLS is layered
+    // on top by tonic, so the underlying socket stays plaintext TCP.
+    // Closes the TOCTOU window between `bind_ephemeral` and the
+    // transport bind.
+    std_listener
+        .set_nonblocking(true)
+        .expect("set_nonblocking on pre-bound tls listener");
+    let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
+        .expect("convert std listener to tokio listener for tls");
+    let serve_handle = tokio::spawn(
+        server_transport
+            .clone()
+            .start_server_with_listener(tokio_listener),
+    );
     wait_for_listening(addr, Duration::from_secs(3)).await;
 
     // Build a client transport pointing back at the server.
@@ -585,7 +685,7 @@ async fn tls_transport() {
 
 #[tokio::test]
 async fn tls_transport_cert_and_key_only() {
-    let port = pick_free_port();
+    let (port, std_listener) = bind_ephemeral();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let endpoint = format!("https://localhost:{port}");
 
@@ -646,7 +746,19 @@ async fn tls_transport_cert_and_key_only() {
     let server_cfg = GrpcTransportConfig::from_cluster_config(&cluster).unwrap();
     let server_transport: Arc<GrpcTransport<StubHandler>> =
         Arc::new(GrpcTransport::new(server_cfg, handler.clone()));
-    let serve_handle = tokio::spawn(server_transport.clone().start_server());
+    // Same listener-passthrough pattern as `tls_transport`: the
+    // caller-bound socket closes the parallel-test TOCTOU window
+    // around the `pick_free_port → server-internal rebind` gap.
+    std_listener
+        .set_nonblocking(true)
+        .expect("set_nonblocking on pre-bound tls listener");
+    let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
+        .expect("convert std listener to tokio listener for tls");
+    let serve_handle = tokio::spawn(
+        server_transport
+            .clone()
+            .start_server_with_listener(tokio_listener),
+    );
     wait_for_listening(addr, Duration::from_secs(3)).await;
 
     let mut client_cluster = cluster.clone();
@@ -689,12 +801,12 @@ async fn tls_transport_cert_and_key_only() {
 
 #[tokio::test]
 async fn pre_vote_roundtrip() {
-    let port = pick_free_port();
+    let (port, std_listener) = bind_ephemeral();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let endpoint = format!("http://127.0.0.1:{port}");
 
     let handler = StubHandler::new();
-    let (shutdown, srv_handle) = spawn_plain_server(addr, handler.clone());
+    let (shutdown, srv_handle) = spawn_plain_server(std_listener, handler.clone());
     wait_for_listening(addr, Duration::from_secs(2)).await;
 
     let client = RaftGrpcClient::new(client_config(endpoint));
@@ -751,12 +863,12 @@ async fn pre_vote_roundtrip() {
 async fn fetch_snapshot_streaming() {
     use futures::StreamExt as _;
 
-    let port = pick_free_port();
+    let (port, std_listener) = bind_ephemeral();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let endpoint = format!("http://127.0.0.1:{port}");
 
     let handler = StubHandler::new();
-    let (shutdown, srv_handle) = spawn_plain_server(addr, handler.clone());
+    let (shutdown, srv_handle) = spawn_plain_server(std_listener, handler.clone());
     wait_for_listening(addr, Duration::from_secs(2)).await;
 
     let client = RaftGrpcClient::new(client_config(endpoint));
@@ -823,10 +935,15 @@ async fn fetch_snapshot_streaming() {
 // parsed `listen_addr` as `std::net::SocketAddr` *before* binding and
 // rejected any value that wasn't a literal IP. That made a perfectly
 // valid `listen_addr = "localhost:<port>"` fail at startup. The fix
-// delegates binding to `tokio::net::TcpListener::bind(&str)`, which
-// walks DNS-resolved addresses. This test reserves a port via
-// `pick_free_port`, configures `listen_addr = "localhost:<port>"`,
-// starts the server, and proves a real RPC succeeds against the
+// delegates binding to `bind_grpc_listener(listen_addr)` (defined in
+// `xraft-transport/src/grpc.rs`), which calls
+// `std::net::TcpListener::bind(&str)` so DNS-resolved hostnames work
+// uniformly across `start_server` and `xraft_server::Server::start`.
+// This test reserves a port via `pick_free_port_via_hostname` (so the
+// reservation and the subsequent server bind share an address
+// family), configures `listen_addr = "localhost:<port>"`, starts the
+// server through `start_server` to exercise the hostname-resolution
+// path end-to-end, and proves a real RPC succeeds against the
 // hostname-configured listener.
 
 #[tokio::test]
@@ -1023,7 +1140,7 @@ fn peer_endpoints_helper_accepts_single_node_bootstrap() {
 async fn fetch_snapshot_mid_stream_transport_error_evicts_channel() {
     use futures::StreamExt as _;
 
-    let port = pick_free_port();
+    let (port, std_listener) = bind_ephemeral();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let endpoint = format!("http://127.0.0.1:{port}");
 
@@ -1032,7 +1149,7 @@ async fn fetch_snapshot_mid_stream_transport_error_evicts_channel() {
     // Status::unavailable, which is the retriable code the client uses
     // to trigger channel eviction.
     let handler = StubHandler::with_mid_stream_error();
-    let (shutdown, srv_handle) = spawn_plain_server(addr, handler.clone());
+    let (shutdown, srv_handle) = spawn_plain_server(std_listener, handler.clone());
     wait_for_listening(addr, Duration::from_secs(2)).await;
 
     let mut cfg = client_config(endpoint);
@@ -1119,12 +1236,12 @@ async fn fetch_snapshot_mid_stream_transport_error_evicts_channel() {
 
 #[tokio::test]
 async fn unary_retriable_status_evicts_cached_channel() {
-    let port = pick_free_port();
+    let (port, std_listener) = bind_ephemeral();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let endpoint = format!("http://127.0.0.1:{port}");
 
     let handler = StubHandler::new();
-    let (shutdown, srv_handle) = spawn_plain_server(addr, handler.clone());
+    let (shutdown, srv_handle) = spawn_plain_server(std_listener, handler.clone());
     wait_for_listening(addr, Duration::from_secs(2)).await;
 
     // No retries: we only want to observe the eviction triggered by the

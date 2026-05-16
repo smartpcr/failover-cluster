@@ -82,17 +82,25 @@ fn bind_ephemeral() -> (u16, std::net::TcpListener) {
 fn rebind_port(port: u16) -> std::net::TcpListener {
     let addr = format!("127.0.0.1:{port}");
     let mut last_err: Option<std::io::Error> = None;
-    for _ in 0..20 {
+    // 6s budget (60 × 100ms). The prior iter-3 budget was 1s
+    // (20 × 50ms), which the post-pass gate suite intermittently
+    // exhausted on Windows under heavy parallel-test load — Windows'
+    // dynamic-port release can lag behind `shutdown()` by several
+    // hundred ms once the loopback socket count climbs. The caller
+    // also now hard-asserts the preceding `handle.join()` completed
+    // BEFORE invoking this helper, so a long retry window here only
+    // covers the kernel-side release lag, not application shutdown.
+    for _ in 0..60 {
         match std::net::TcpListener::bind(&addr) {
             Ok(l) => return l,
             Err(e) => {
                 last_err = Some(e);
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
     }
     panic!(
-        "rebind {addr} failed after 1s of retries: {:?}",
+        "rebind {addr} failed after 6s of retries: {:?}",
         last_err.unwrap()
     );
 }
@@ -248,7 +256,17 @@ async fn bootstrap_persists_voter_set_and_recovers_on_restart() {
     // file is fully fsync'd before we read it under the test.
     tokio::time::sleep(Duration::from_millis(100)).await;
     handle.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.join()).await;
+    // Hard-assert the first server actually joined before we attempt
+    // to rebind the pinned port below. Previously this used
+    // `let _ = tokio::time::timeout(...).await;` which silently
+    // swallowed both the timeout and the join error — so a slow
+    // shutdown under CI load could race the subsequent `rebind_port`
+    // against a still-open listener, producing the intermittent
+    // post-pass gate failure on `stage_7_2_static_voter_set`.
+    let join_outcome = tokio::time::timeout(Duration::from_secs(10), handle.join())
+        .await
+        .expect("first server must join within 10s before rebinding pinned port");
+    join_outcome.expect("first server join must succeed before rebind");
 
     // Verify the on-disk file carries the voter_set field.
     let quorum_path = data_dir.join("state").join("quorum-state");
