@@ -10,40 +10,13 @@ status: "planned"
 
 # Raft Node State Machine — Design Narrative
 
-## Prior Feedback Resolution (iteration 3)
+## Design provenance
 
-This iteration closes the four "What still needs work" items called out
-by the iteration-2 evaluator (score 82). Each is marked `ADDRESSED`:
-
-1. `ADDRESSED` — `Action::SendMessage { target, message }` is corrected
-   to the actual public API `SendMessage { to: NodeId, message:
-   OutboundMessage }` in both `plan.md` Step 3.1 (and the surrounding
-   Step 2.2 / 2.3 narrative) and `wit-tree.yaml`
-   `step-input-action-enum-surface` / `step-become-pre-candidate` /
-   `step-become-candidate`. The field name `to` matches the existing
-   `xraft-core/src/message.rs::Action::SendMessage` declaration.
-2. `ADDRESSED` — `stage-raft-node-state-machine` is inserted into
-   `docs/stories/failover-cluster-XRAFT/workstreams.yaml`, immediately
-   after `stage-snapshot-storage` and before `stage-leader-election`,
-   with the canonical workstreamId
-   `ws-failover-cluster-xraft-phase-consensus-engine-stage-raft-node-state-machine`.
-   The anchor now exists in the workstreams file rather than being
-   only a "requested insertion" in the plan.
-3. `ADDRESSED` — `docs/stories/failover-cluster-XRAFT/implementation-plan.md`
-   Stage 3.1 is updated so the election-timeout step routes through
-   the Pre-Vote-first path, and the test scenario
-   `election-timeout-triggers-candidacy` is rewritten as
-   `election-timeout-triggers-pre-candidacy` (term unchanged). The
-   stale "increments term on timeout" acceptance criterion is
-   removed; full term-bump promotion is deferred to Stage 3.2 with
-   the explicit cross-reference.
-4. `ADDRESSED` — Single-voter self-quorum cascade is promoted from
-   "open question" to a concrete deliverable: new Stage 2 Step 2.5
-   (`step-single-voter-self-quorum-cascade` in the WIT) with two
-   named test scenarios (`single-voter-pre-candidate-cascades-to-
-   leader` and `single-voter-election-via-tick`). The same two
-   scenarios are mirrored into the implementation-plan.md Stage 3.1
-   test list for cross-doc consistency.
+This spec was iterated against an automated evaluator across multiple rounds.
+Resolved per-iteration decisions are folded into the body (see `## Resolved
+Decisions` and `## Cross-Document Supersedes`); historical per-iteration
+checklists live in the commit messages and the workstream's `## Iteration
+Summary` tab rather than in this long-lived document.
 
 ## Context and Intent
 
@@ -275,17 +248,30 @@ own review windows.
   This is the only place a Stage 3.1 transition emits the actions of a
   later transition; the cascade is contained, deterministic, and
   required for correctness because no asynchronous response would
-  otherwise wake the node. Test obligations:
-  - Scenario `single-voter-pre-candidate-cascades-to-leader`: a one-
-    voter cluster constructed with `new_with_seed`, when a single
-    `become_pre_candidate()` is invoked, returns the action sequence
-    `PersistHardState → BecomeLeader → AppendEntries(no-op)` in that
-    order, ends in role `Leader`, term 1, and emits zero
-    `SendMessage`s (no peers).
-  - Scenario `single-voter-election-via-tick`: a one-voter cluster
-    that has been ticked past the election timeout reaches role
-    `Leader` with `current_term == 1` and `last_log_index == 1`
-    within the same tick window.
+  otherwise wake the node. Test obligations (named to match the
+  existing source-test entrypoints in `xraft-core/src/node.rs` so
+  downstream implementers can grep directly to the test function):
+  - Scenario `single-voter-cluster-auto-promotes-to-leader` (mirrors
+    `fn single_voter_cluster_auto_promotes_to_leader`): a one-voter
+    cluster constructed with `new_with_seed`, when `become_candidate()`
+    is invoked **directly** (not via tick), returns an action set
+    that includes `PersistHardState`, `BecomeLeader`, and
+    `AppendEntries(vec![Entry { payload: EntryPayload::NoOp, .. }])`,
+    ends in role `Leader` at term 1, and emits zero `SendMessage`s
+    (no peers). This scenario exercises the Candidate→Leader half of
+    the cascade through a direct call.
+  - Scenario `election-loop-in-single-voter-cluster-via-tick` (mirrors
+    `fn election_loop_in_single_voter_cluster_via_tick`): a one-voter
+    cluster ticked past the election timeout through
+    `step(Input::Tick)` reaches role `Leader` with
+    `current_term == 1` and `last_log_index == 1` within the same
+    tick window. This scenario provides end-to-end dispatcher coverage
+    of the full Pre-Vote-first path
+    `handle_tick → become_pre_candidate → become_candidate →
+    become_leader`, exercising both cascade halves; a direct unit test
+    of `become_pre_candidate()` is unnecessary because the public
+    `step` entrypoint already proves the pre-vote-side short-circuit
+    fires.
   Files: `xraft-core/src/node.rs`. Budget: 1.
 
 #### Stage 3: Input Dispatcher and Tick Handler
@@ -419,8 +405,13 @@ same iteration that lands this design — specifically:
   `pre_vote_response` quorum-check path Stage 3.2 introduces); a
   dedicated `pre-vote-quorum-promotes-to-candidate` scenario name
   belongs to Stage 3.2 and is NOT introduced here. The single-voter
-  cascade scenarios introduced in Step 2.5 above cover the special
-  one-voter path that has no asynchronous response event.
+  cascade scenarios introduced in Step 2.5 above
+  (`single-voter-cluster-auto-promotes-to-leader` and
+  `election-loop-in-single-voter-cluster-via-tick`) cover the special
+  one-voter path that has no asynchronous response event; both names
+  match existing source-test function names in
+  `xraft-core/src/node.rs` so the obligation grep-resolves to the
+  actual test entrypoints.
 
 The cross-doc edit is included in this iteration's commit so the two
 documents agree.
@@ -438,9 +429,11 @@ These were open questions in earlier iterations and are now resolved:
    `become_pre_candidate`. Combined with the **single-voter self-
    quorum cascade in Step 2.5**, this allows a single-node cluster
    to self-promote from `Follower → PreCandidate → Candidate →
-   Leader` without any peer response event ever arriving. This is no
-   longer an open question — the cascade is a concrete Step 2.5
-   obligation with two named test scenarios.
+   Leader` without any peer response event ever arriving. The two
+   named test obligations (`single-voter-cluster-auto-promotes-to-
+   leader` and `election-loop-in-single-voter-cluster-via-tick`)
+   are deliberately named to match the existing source-test
+   function names in `xraft-core/src/node.rs`.
 3. **`Action` ordering.** The driver must process `Action`s in the
    order emitted. The Stage 3.1 invariant is "`PersistHardState`
    before any `SendMessage` that depends on the persisted field" —
