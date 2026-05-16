@@ -202,30 +202,38 @@ phases:
               call to become_leader() to the return buffer. Required
               for correctness because no asynchronous response would
               otherwise wake a one-voter cluster. Test obligations
-              are deliberately named to match the existing source-
-              test function names in xraft-core/src/node.rs so the
-              obligation grep-resolves to the actual test entrypoint:
-              (a) scenario single-voter-cluster-auto-promotes-to-
-              leader (mirrors `fn single_voter_cluster_auto_promotes_
-              to_leader`): a one-voter cluster, when
-              `become_candidate()` is invoked directly (not via
-              tick), returns actions including PersistHardState,
-              BecomeLeader, and AppendEntries(no-op), ends in role
-              Leader at term 1, and emits zero SendMessage actions
-              (no peers) — exercises the Candidate->Leader half of
-              the cascade via a direct call;
-              (b) scenario election-loop-in-single-voter-cluster-via-
-              tick (mirrors `fn election_loop_in_single_voter_
-              cluster_via_tick`): a one-voter cluster ticked past the
-              election timeout through `step(Input::Tick)` reaches
-              role Leader with current_term == 1 and last_log_index
-              == 1 within the same tick window — end-to-end
-              dispatcher coverage of the full
-              handle_tick -> become_pre_candidate -> become_candidate
-              -> become_leader Pre-Vote-first cascade (a direct unit
-              test of become_pre_candidate() is unnecessary because
-              the public step entrypoint already proves the pre-
-              vote-side short-circuit fires).
+              live in the structured `test_obligations` field below
+              so every kebab-case scenario id and snake_case source-
+              test function name remains an atomic YAML scalar that
+              grep-resolves to the actual test entrypoint in
+              xraft-core/src/node.rs (folded-scalar prose can split
+              an identifier across lines and is therefore avoided for
+              identifier-bearing strings).
+            test_obligations:
+              - scenario: "single-voter-cluster-auto-promotes-to-leader"
+                source_test: "single_voter_cluster_auto_promotes_to_leader"
+                source_test_path: "xraft-core/src/node.rs"
+                trigger: "direct call to become_candidate() on a one-voter cluster constructed via RaftNode::new_with_seed"
+                existing_source_assertions:
+                  - "node.role == NodeRole::Leader after the call"
+                  - "actions contains an Action::PersistHardState"
+                  - "actions contains an Action::BecomeLeader"
+                  - "actions contains an Action::AppendEntries(es) with es.len() == 1 and es[0].payload == EntryPayload::NoOp"
+                spec_hardening_assertions:
+                  - "node.current_term() == Term(1) after the call (the term-bump magnitude is part of the cascade contract but is not yet asserted in the existing source test; Stage 3.1 MUST add this assertion when the test is updated)"
+                  - "actions contains zero Action::SendMessage entries (a one-voter cluster has no peers; any SendMessage indicates a regression in the peer-fan-out branch)"
+                  - "the first Action::PersistHardState appears before any subsequent SendMessage / AppendEntries / BecomeLeader; the cascade emits PersistHardState first because term/vote must be durable before any RPC-facing or log-mutating side-effect"
+                purpose: "Exercises the Candidate->Leader half of the self-quorum cascade via a direct call (bypasses the Pre-Vote-side short-circuit, which the tick-driven scenario covers)."
+              - scenario: "election-loop-in-single-voter-cluster-via-tick"
+                source_test: "election_loop_in_single_voter_cluster_via_tick"
+                source_test_path: "xraft-core/src/node.rs"
+                trigger: "repeated step(Input::Tick) on a one-voter cluster until the election timer expires"
+                existing_source_assertions:
+                  - "node reaches NodeRole::Leader within (election_timer.max_ticks() + 5) ticks"
+                  - "node.current_term() == Term(1) after promotion"
+                  - "node.last_log_index == LogIndex(1) after promotion (the no-op leader entry was appended)"
+                spec_hardening_assertions: []
+                purpose: "End-to-end dispatcher coverage of the full handle_tick -> become_pre_candidate -> become_candidate -> become_leader Pre-Vote-first cascade. A direct unit test of become_pre_candidate() is unnecessary because the public step entrypoint already proves the pre-vote-side short-circuit fires; the direct become_candidate() scenario above covers the second half."
             files:
               - "xraft-core/src/node.rs"
             expectedFileChanges: 1

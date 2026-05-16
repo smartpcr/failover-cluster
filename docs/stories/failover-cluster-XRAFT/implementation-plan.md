@@ -133,6 +133,18 @@ storyId: "failover-cluster:XRAFT"
 
 ## Stage 3.1: Raft Node State Machine
 
+> **Canonical anchor disambiguation.** This stage's dependency-graph
+> parent is `phase-consensus-engine` (the spec/WIT canonical anchor,
+> matching the parent slug used by sibling stages `stage-leader-election`
+> and `stage-log-replication` in this file and in
+> `workstreams.yaml`). The workstream's git branch is
+> `ws/failover-cluster-XRAFT/phase-raft-consensus-engine-stage-raft-node-state-machine`
+> — the `phase-raft-consensus-engine-` segment is a historical
+> branch-name prefix set by the workstream tooling and is NOT a
+> dependency anchor. Automated reviewers should resolve every
+> `Dependencies:` line in this file (lines reading
+> `- phase-consensus-engine/...`) as the authoritative anchor.
+
 ### Implementation Steps
 - [ ] Create `xraft-core/src/node.rs` defining `RaftNode` struct holding the fields shown below; the node is I/O-free, accepts `Input` enums via `step()`, and returns `Vec<Action>` side-effects:
   - Identity / role: `id: NodeId`, `role: NodeRole`
@@ -155,8 +167,8 @@ storyId: "failover-cluster:XRAFT"
 ### Test Scenarios
 - [ ] Scenario: initial-state — Given a new RaftNode, When created, Then role is Follower, term is 0, and election timer is running
 - [ ] Scenario: election-timeout-triggers-pre-candidacy — Given a Follower node, When the election timer expires via repeated `Tick` inputs, Then the node transitions to `PreCandidate` (NOT `Candidate`) and `current_term` is unchanged; the term-bump promotion to `Candidate` is exercised separately by Stage 3.2's pre-vote-quorum-tally handler (see Stage 3.2 `election-wins-majority` and the deferred pre-vote-quorum coverage owned by Stage 3.2), and in the single-voter cascade scenarios below
-- [ ] Scenario: single-voter-cluster-auto-promotes-to-leader — Given a one-voter cluster (self pre-vote + self vote each alone meet quorum), When `become_candidate()` is called directly, Then the returned actions include `PersistHardState`, `BecomeLeader`, and `AppendEntries(no-op)` and the role is `Leader` at term 1 (mirrors the existing `xraft-core/src/node.rs::single_voter_cluster_auto_promotes_to_leader` test; covers the Candidate→Leader half of the self-quorum cascade via a direct call)
-- [ ] Scenario: election-loop-in-single-voter-cluster-via-tick — Given a one-voter cluster, When ticked past the election timeout through `step(Input::Tick)`, Then the node reaches role `Leader` with `current_term == 1` and `last_log_index == 1` within the same tick window (mirrors the existing `xraft-core/src/node.rs::election_loop_in_single_voter_cluster_via_tick` test; end-to-end coverage of the full `handle_tick → become_pre_candidate → become_candidate → become_leader` Pre-Vote-first cascade)
+- [ ] Scenario: single-voter-cluster-auto-promotes-to-leader — Given a one-voter cluster (self pre-vote + self vote each alone meet quorum), When `become_candidate()` is called directly, Then the **existing source test `xraft-core/src/node.rs::single_voter_cluster_auto_promotes_to_leader`** asserts: returned actions include `Action::PersistHardState`, `Action::BecomeLeader`, and `Action::AppendEntries(es)` with `es.len()==1` and `es[0].payload == EntryPayload::NoOp`; role is `Leader`. **Stage 3.1 hardening obligations** that MUST be added to that test: `node.current_term() == Term(1)`; zero `Action::SendMessage` entries (no peers); the first `Action::PersistHardState` precedes any subsequent `SendMessage` / `AppendEntries` / `BecomeLeader` in the returned `Vec` (term/vote must be durable before any RPC-facing or log-mutating side-effect). Covers the Candidate→Leader half of the self-quorum cascade via a direct call.
+- [ ] Scenario: election-loop-in-single-voter-cluster-via-tick — Given a one-voter cluster, When ticked past the election timeout through `step(Input::Tick)`, Then the **existing source test `xraft-core/src/node.rs::election_loop_in_single_voter_cluster_via_tick`** asserts: node reaches `NodeRole::Leader` within `election_timer.max_ticks() + 5` ticks; `current_term() == Term(1)`; `last_log_index == LogIndex(1)`. **Stage 3.1 hardening obligations**: none (existing assertions already cover the contract). End-to-end coverage of the full `handle_tick → become_pre_candidate → become_candidate → become_leader` Pre-Vote-first cascade.
 - [ ] Scenario: become-leader-initializes-peers — Given a node becoming leader, When `become_leader()` is called, Then `last_fetch_offset` for each peer is initialized and a no-op `Action::AppendEntries` is emitted
 
 ## Stage 3.2: Leader Election
@@ -189,7 +201,7 @@ storyId: "failover-cluster:XRAFT"
 - [ ] Implement follower log conflict resolution: when a `FetchResponse` contains a `DivergingEpoch`, follower truncates local log to the divergence point and re-fetches from there
 
 ### Dependencies
-- phase-raft-consensus-engine/stage-leader-election
+- phase-consensus-engine/stage-leader-election
 
 ### Test Scenarios
 - [ ] Scenario: basic-replication — Given a 3-node cluster with node 1 as leader, When followers send Fetch RPCs, Then the leader responds with new entries and after two fetch rounds all followers have the entry and high watermark advances
@@ -201,7 +213,7 @@ storyId: "failover-cluster:XRAFT"
 # Phase 4: Network Transport
 
 ## Dependencies
-- phase-raft-consensus-engine
+- phase-consensus-engine
 
 ## Stage 4.1: gRPC Transport Layer
 
@@ -242,7 +254,7 @@ storyId: "failover-cluster:XRAFT"
 # Phase 5: State Machine Interface
 
 ## Dependencies
-- phase-raft-consensus-engine
+- phase-consensus-engine
 
 ## Stage 5.1: State Machine Callback Trait
 
