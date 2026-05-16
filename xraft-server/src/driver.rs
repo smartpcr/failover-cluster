@@ -1698,38 +1698,54 @@ where
         metadata: SnapshotMeta,
         data: Vec<u8>,
     ) -> std::result::Result<(), String> {
+        // Order matters: the stale-snapshot guard MUST run before any
+        // metadata validation (e.g. voter_set extraction). Per the
+        // InstallSnapshot contract, a snapshot at or behind
+        // `last_applied` is a benign no-op (a delayed install for a
+        // snapshot the leader already superseded). Halting on a
+        // malformed *stale* payload would turn a harmless race into a
+        // fail-stop, contradicting the no-op semantics. Forward-going
+        // snapshots still require a voter_set — that check is below.
+        let snap_idx = metadata.last_included_index;
+        let snap_term = metadata.last_included_term;
+        if snap_idx <= self.node.last_applied {
+            // Reject stale snapshots BEFORE touching persistent state
+            // or the state machine. If `snap_idx <= last_applied`,
+            // the local state machine has already applied every entry
+            // the snapshot covers. Calling `state_machine.restore(&data)`
+            // here would roll the SM back to the older (snapshot)
+            // state while `last_applied` still reflects the newer
+            // applied tip — a silent rollback that corrupts every
+            // subsequent read. The `<=` is intentional: at equality
+            // the SM is already at that state, so the restore is at
+            // best wasteful and at worst (if the snapshot bytes
+            // differ from the deterministic apply result) corrupting.
+            // Treat as a no-op success — the driver does NOT halt
+            // because a stale snapshot is a benign race, not a
+            // correctness fault. We deliberately do NOT validate
+            // `voter_set` for stale installs: a malformed payload we
+            // are about to discard must not promote a race into a
+            // fail-stop.
+            debug!(
+                target: "xraft_server::driver",
+                snap_index = %snap_idx,
+                last_applied = %self.node.last_applied,
+                "InstallSnapshot: snapshot at or behind last_applied; no-op (no persist, no restore, no validation)"
+            );
+            return Ok(());
+        }
+
+        // Forward-going snapshot: voter_set is mandatory because the
+        // restore path rebuilds `node.voter_set` / `node.peers` from
+        // it. A missing voter_set on a forward install would leave
+        // the engine without a membership view to elect/replicate
+        // from — that's the unrecoverable case worth halting for.
         let voter_set = metadata.voter_set.clone().ok_or_else(|| {
             format!(
                 "InstallSnapshot: snapshot {} (term={}, index={}) missing required voter_set",
                 metadata.id, metadata.last_included_term.0, metadata.last_included_index.0,
             )
         })?;
-        let snap_idx = metadata.last_included_index;
-        let snap_term = metadata.last_included_term;
-
-        // Reject stale snapshots BEFORE touching persistent state or
-        // the state machine. If `snap_idx <= self.node.last_applied`,
-        // the local state machine has already applied every entry the
-        // snapshot covers. Calling `state_machine.restore(&data)` here
-        // would roll the SM back to the older (snapshot) state while
-        // `last_applied` still reflects the newer applied tip — a
-        // silent rollback that corrupts every subsequent read. The
-        // `<=` is intentional: at equality the SM is already at that
-        // state, so the restore is at best wasteful and at worst (if
-        // the snapshot bytes differ from the deterministic apply
-        // result) corrupting. Treat as a no-op success — the driver
-        // does NOT halt because a stale snapshot is a benign race
-        // (e.g. a delayed install for a snapshot the leader already
-        // superseded), not a correctness fault.
-        if snap_idx <= self.node.last_applied {
-            debug!(
-                target: "xraft_server::driver",
-                snap_index = %snap_idx,
-                last_applied = %self.node.last_applied,
-                "InstallSnapshot: snapshot at or behind last_applied; no-op (no persist, no restore)"
-            );
-            return Ok(());
-        }
 
         // Persist first so a crash between save and restore is recoverable
         // from the durable snapshot on restart.
@@ -2090,13 +2106,24 @@ where
 /// the matching `Action::SendMessage` / `Action::ServeFetch` while
 /// processing inbound-RPC actions.
 ///
-/// `error` is set when an action that the inbound reply DEPENDS ON
-/// (`PersistHardState`, `AppendEntries`, `TruncateLog`, log read for
-/// `ServeFetch`) fails. Inbound handlers MUST surface that error to
-/// the caller rather than returning a captured-but-unsafe response —
-/// most importantly, a granted `VoteResponse` whose backing
-/// `PersistHardState` failed would violate the Raft single-vote-per-
-/// term safety invariant on crash + restart.
+/// `error` is set when ANY action processed during the inbound RPC's
+/// batch fails in a way that makes a captured success reply unsafe.
+/// Inbound handlers MUST surface that error to the caller rather than
+/// returning a captured-but-unsafe response — most importantly, a
+/// granted `VoteResponse` whose backing `PersistHardState` failed
+/// would violate the Raft single-vote-per-term safety invariant on
+/// crash + restart.
+///
+/// Sources of `error` (kept in sync with `process_actions`):
+/// - `PersistHardState` failure
+/// - `AppendEntries` / `TruncateLog` failure
+/// - `ServeFetch` log-read failure
+/// - `ApplyToStateMachine` failure (state_machine.apply or the
+///   range-validation halt in `apply_committed`)
+/// - `TakeSnapshot` failure (state_machine.snapshot or
+///   snapshot_store.save_snapshot)
+/// - `InstallSnapshot` failure (save_snapshot or state_machine.restore;
+///   stale-snapshot no-ops do NOT populate this field)
 #[derive(Default)]
 struct CapturedResponse {
     vote: Option<VoteResponse>,
@@ -2220,6 +2247,17 @@ mod tests {
         /// short / gapped range — used to exercise the
         /// `apply_committed` range-validation halt path.
         drop_indices_in_get_range: Arc<Mutex<std::collections::HashSet<LogIndex>>>,
+        /// Index rewrites applied to `get_range` responses AFTER the
+        /// drop filter. Keyed by the original entry's index; the
+        /// stored value replaces `entry.index` on its way out. This
+        /// lets tests construct a same-length, monotonically-offset
+        /// response that defeats the length check but trips the
+        /// per-position index-continuity check in `apply_committed`.
+        /// Without this injector the index-continuity branch is
+        /// unreachable in unit tests because every other failure
+        /// mode (drop / short read / inverted range) already trips
+        /// the length check.
+        override_indices_in_get_range: Arc<Mutex<std::collections::HashMap<LogIndex, LogIndex>>>,
     }
 
     impl LogStore for TestLogStore {
@@ -2242,11 +2280,18 @@ mod tests {
                 )));
             }
             let drop = self.drop_indices_in_get_range.lock().unwrap().clone();
+            let overrides = self.override_indices_in_get_range.lock().unwrap().clone();
             Ok(self
                 .entries
                 .iter()
                 .filter(|e| e.index >= start && e.index < end && !drop.contains(&e.index))
                 .cloned()
+                .map(|mut e| {
+                    if let Some(&new_idx) = overrides.get(&e.index) {
+                        e.index = new_idx;
+                    }
+                    e
+                })
                 .collect())
         }
         fn last_index(&self) -> LogIndex {
@@ -4475,6 +4520,66 @@ port = 6012
         assert!(sm.restored_snapshots().is_empty());
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn install_snapshot_stale_with_missing_voter_set_is_noop() {
+        // Iteration 5 fix: the stale-snapshot guard MUST run BEFORE
+        // any metadata validation. A stale install (snap_idx <=
+        // last_applied) is a benign race — even if its metadata is
+        // malformed (e.g. missing voter_set) the driver must treat
+        // it as a no-op. The prior iteration validated voter_set
+        // first, which fail-stopped the driver on a payload we were
+        // about to discard anyway — a real edge-case contradiction
+        // of the new no-op semantics.
+        //
+        // Companion test:
+        // `install_snapshot_rejects_metadata_missing_voter_set`
+        // still asserts that a FORWARD-going install with missing
+        // voter_set halts. The reorder narrows the halt condition;
+        // it does not remove it.
+        let (mut driver, sm, ss) = build_dispatch_driver();
+        seed_committed_entries(&mut driver, 100);
+        let pre_last_applied = driver.node.last_applied;
+        let pre_commit = driver.node.commit_index;
+        let pre_last_log_index = driver.node.last_log_index;
+        let pre_voter_set = driver.node.voter_set.clone();
+
+        let meta = SnapshotMeta {
+            last_included_index: LogIndex(50),
+            last_included_term: Term(2),
+            id: "stale-no-voters".to_string(),
+            voter_set: None,
+            size_bytes: None,
+            checksum: None,
+        };
+        let _ = driver
+            .process_actions(
+                vec![Action::InstallSnapshot {
+                    metadata: meta,
+                    data: b"stale".to_vec(),
+                }],
+                None,
+            )
+            .await;
+
+        assert!(
+            driver.halt_reason.is_none(),
+            "stale install with missing voter_set must be a no-op, not a halt: {:?}",
+            driver.halt_reason
+        );
+        assert!(
+            ss.saved_snapshots().is_empty(),
+            "stale install must not persist"
+        );
+        assert!(
+            sm.restored_snapshots().is_empty(),
+            "stale install must not call state_machine.restore"
+        );
+        assert_eq!(driver.node.last_applied, pre_last_applied);
+        assert_eq!(driver.node.commit_index, pre_commit);
+        assert_eq!(driver.node.last_log_index, pre_last_log_index);
+        assert_eq!(driver.node.voter_set, pre_voter_set);
+    }
+
     // -----------------------------------------------------------------
     // Iteration 4 — additional fix coverage:
     //   * `apply_committed` halt-on-incomplete-range (gap or short
@@ -4540,15 +4645,13 @@ port = 6012
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn apply_committed_halts_when_log_range_has_index_gap() {
-        // Seed 1,2,4 (no entry 3) and request [1..=4]. The store
-        // returns 3 entries — the length check still triggers, but
-        // we also want to confirm the index-continuity check would
-        // catch a same-length-but-misaligned response (e.g. a future
-        // store that returns 1,2,4,4 by mistake). Easiest way to
-        // exercise the index-continuity branch with the existing
-        // injectors is to drop entry 2 instead of 3, then assert the
-        // failure message names the index mismatch.
+    async fn apply_committed_halts_when_log_range_drops_middle_entry() {
+        // Length-check coverage. Drop entry 2 so the store returns
+        // 3 entries when 4 are expected. With ONLY this injector the
+        // length check fires first — see
+        // `apply_committed_halts_when_log_range_has_misaligned_index`
+        // below for the test that actually exercises the per-position
+        // index-continuity branch.
         let (mut driver, _sm, _ss) = build_dispatch_driver();
         seed_committed_entries(&mut driver, 4);
         driver
@@ -4571,13 +4674,81 @@ port = 6012
         let halt = driver
             .halt_reason
             .as_ref()
-            .expect("must halt on log range gap");
+            .expect("must halt on log range short read");
         assert!(
-            halt.contains("returned 3 entries, expected 4")
-                || halt.contains("at position"),
-            "halt reason should describe the range mismatch, got: {halt}"
+            halt.contains("returned 3 entries, expected 4"),
+            "length check should fire first when an entry is dropped, got: {halt}"
         );
         assert!(captured.error.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn apply_committed_halts_when_log_range_has_misaligned_index() {
+        // Index-continuity branch coverage (the prior iteration only
+        // covered the length check). Construct a same-length response
+        // where one entry's `index` is wrong relative to its position
+        // in the returned slice — defeats the length check (4 entries
+        // requested, 4 returned) and forces the per-position check at
+        // `apply_committed`'s index-equality loop to halt.
+        //
+        // Without the `override_indices_in_get_range` injector this
+        // branch is unreachable from unit tests: every other failure
+        // mode (drop / short read / inverted range) trips the length
+        // check first. The reordering decision matters because a
+        // future store implementation could in principle return the
+        // right COUNT of entries but with one out-of-order index
+        // (e.g. a corrupted on-disk log or a bug in segment
+        // stitching) — that must halt rather than silently apply the
+        // wrong entry under the engine's `last_applied` advancement.
+        let (mut driver, sm, _ss) = build_dispatch_driver();
+        seed_committed_entries(&mut driver, 4);
+        // Rewrite entry 3's index to a far-away value. Result of
+        // `get_range(1, 5)` becomes (index, position) pairs of
+        // (1,0), (2,1), (99,2), (4,3) — same length 4, but the
+        // entry at position 2 has index 99, not the expected 3.
+        driver
+            .log_store
+            .override_indices_in_get_range
+            .lock()
+            .unwrap()
+            .insert(LogIndex(3), LogIndex(99));
+
+        let captured = driver
+            .process_actions(
+                vec![Action::ApplyToStateMachine {
+                    from: LogIndex(1),
+                    to: LogIndex(4),
+                }],
+                None,
+            )
+            .await;
+
+        let halt = driver
+            .halt_reason
+            .as_ref()
+            .expect("must halt on log range index misalignment");
+        assert!(
+            halt.contains("at position 2")
+                && halt.contains("LogIndex(99)")
+                && halt.contains("expected LogIndex(3)"),
+            "halt reason should name the misaligned index/position, got: {halt}"
+        );
+        assert!(
+            !halt.contains("returned 4 entries, expected"),
+            "length check must NOT fire — this test covers the index-continuity branch, got: {halt}"
+        );
+        assert!(
+            captured.error.is_some(),
+            "captured.error must be set for inbound RPC handlers"
+        );
+        // Validation runs before the apply loop, so the SM sees zero
+        // applies — proves the index-continuity check halts BEFORE
+        // any (potentially wrong-index) entry reaches the state
+        // machine.
+        assert!(
+            sm.snapshot_handle().lock().unwrap().is_empty(),
+            "no apply must happen when index-continuity validation fails"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
