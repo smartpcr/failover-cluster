@@ -79,11 +79,9 @@ impl LogStoreError {
 /// Trait abstracting the replicated log store (architecture §4.1).
 ///
 /// All mutating methods take `&self` — implementations use interior
-/// mutability (a sync mutex such as `std::sync::Mutex` for short
-/// critical sections, or an async mutex when work crosses `.await`)
-/// consistent with `Send + Sync`. The `IoStage` holds an owned
-/// `Box<dyn LogStore>` and invokes it via `&self` concurrently with
-/// other I/O traits via `tokio::join!`.
+/// mutability (e.g. `tokio::sync::Mutex`) consistent with `Send + Sync`.
+/// The `IoStage` holds an owned `Box<dyn LogStore>` and invokes it via
+/// `&self` concurrently with other I/O traits via `tokio::join!`.
 #[async_trait]
 pub trait LogStore: Send + Sync + 'static {
     /// Append entries. Must fsync before returning Ok.
@@ -111,25 +109,23 @@ pub trait LogStore: Send + Sync + 'static {
     async fn has_uncommitted_voters_record(&self, high_watermark: u64) -> Result<bool, LogStoreError>;
 }
 
-/// In-memory log store implementing the async `LogStore` trait.
+/// In-memory log store implementing both the async `LogStore` trait
+/// and the synchronous `SyncLogOps` trait.
 ///
 /// Uses `std::sync::Mutex` for interior mutability and atomics for
 /// offset tracking, consistent with the `Send + Sync + 'static` bound.
-///
-/// The standard-library mutex is the correct choice here (per Tokio's
-/// own guidance for short, sync-only critical sections that never cross
-/// an `.await`): every guard is dropped within the same synchronous
-/// block that acquires it, and the same struct also implements the
-/// purely-synchronous [`SyncLogOps`] trait used by the in-event-loop
-/// `MembershipManager` — `tokio::sync::Mutex::lock()` is async and
-/// therefore unusable from `SyncLogOps` methods.
-///
-/// Lock acquisition goes through the private [`Self::lock_entries`]
-/// helper, which recovers from poisoning rather than panicking with
-/// `.unwrap()`: the guarded data is a `Vec<LogEntry>` whose critical
-/// sections only push, retain, iterate, and clone — none of which can
-/// leave the vector in a logically inconsistent state if another
-/// thread panics.
+/// `std::sync::Mutex` (not `tokio::sync::Mutex`) is the correct choice
+/// here for two reasons:
+///   1. Tokio's own documentation recommends a blocking mutex when the
+///      lock guards plain data and the critical sections are short with
+///      no `.await` held — exactly the pattern used below (push / iter
+///      over an in-memory `Vec`).
+///   2. `InMemoryLog` also implements `SyncLogOps`, whose non-`async`
+///      methods cannot await a `tokio::sync::Mutex`.
+/// Lock acquisition is funnelled through `lock_entries`, which converts
+/// poisoning into an informative panic — poisoning here would indicate
+/// a panic in another thread that left the log in an inconsistent state,
+/// and continuing silently would be unsafe.
 pub struct InMemoryLog {
     entries: Mutex<Vec<LogEntry>>,
     start_offset: AtomicU64,
@@ -166,19 +162,20 @@ impl InMemoryLog {
         self.start_offset.store(offset, Ordering::SeqCst);
     }
 
-    /// Acquire the entries lock, recovering from mutex poisoning.
+    /// Acquire the entries lock, surfacing mutex poisoning as an
+    /// informative panic rather than `.unwrap()`'s opaque message.
     ///
-    /// Centralises the lock policy so we don't sprinkle `.unwrap()`
-    /// across the trait impls. Poisoning can only happen if another
-    /// thread panicked while holding the lock — the critical sections
-    /// in this file only mutate the `Vec` via `push`/`retain` and the
-    /// atomic offsets are updated immediately afterwards with no
-    /// panicking code in between, so the guarded data is always in a
-    /// valid (if possibly stale) state when we resume.
+    /// Poisoning here indicates a bug — a thread panicked while holding
+    /// the lock, which may have left the entries `Vec` in an inconsistent
+    /// state (e.g. partway through a `push` or `retain`). Continuing with
+    /// possibly-corrupt log data would risk silently violating Raft
+    /// safety invariants, so failing fast is intentional. Both the async
+    /// `LogStore` impl and the synchronous `SyncLogOps` impl route every
+    /// lock acquisition through this helper.
     fn lock_entries(&self) -> std::sync::MutexGuard<'_, Vec<LogEntry>> {
         self.entries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("InMemoryLog entries mutex poisoned by a panic in another thread")
     }
 }
 
