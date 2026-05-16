@@ -78,6 +78,17 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// Channel capacity for the outbound-result mpsc.
 const OUTBOUND_CHANNEL_CAPACITY: usize = 1024;
 
+/// Stage 7.3 (iter 2) — capacity of the snapshot-completion mpsc.
+///
+/// At most one snapshot is in flight at any time (gated by
+/// [`xraft_core::node::RaftNode::snapshot_in_flight`] for the
+/// engine-emitted path and the driver-level guard for the
+/// operator-triggered path), so a small bounded channel is sufficient.
+/// 4 leaves headroom for back-to-back snapshots during a brief race
+/// between completion delivery and the driver processing the previous
+/// message without blocking the worker's `send().await`.
+const SNAPSHOT_DONE_CHANNEL_CAPACITY: usize = 4;
+
 /// Stage 7.1 (iter-6 evaluator finding #1) ΓÇö maximum number of
 /// pending lease-slow-path reads the driver will buffer before
 /// rejecting new queries with `NotLeader { leader_hint: None }`.
@@ -305,6 +316,65 @@ pub struct TriggeredSnapshotInfo {
     pub last_included_index: u64,
     pub last_included_term: u64,
     pub size_bytes: u64,
+}
+
+/// Stage 7.3 — outcome of a background snapshot worker run, returned
+/// by the spawn_blocking worker launched from
+/// [`Driver::dispatch_snapshot_worker`]. Carries the observed
+/// duration and serialised payload size so the caller can publish
+/// `xraft_snapshot_duration_seconds` /
+/// `xraft_snapshot_size_bytes` and fire the
+/// [`DriverObserver::on_snapshot_taken`] hook.
+#[derive(Debug, Clone, Copy)]
+struct SnapshotOutcome {
+    /// Wall-clock time elapsed from the start of the SM snapshot
+    /// serialization through the end of the SnapshotStore save call.
+    /// Measured INSIDE the `spawn_blocking` worker so it reflects the
+    /// blocking-pool work, not the round-trip through the driver task.
+    duration: Duration,
+    /// Length in bytes of the serialised snapshot payload.
+    data_size: usize,
+}
+
+/// Stage 7.3 (iter 2) — message delivered from a background snapshot
+/// worker task back to the driver's `select!` loop when the SM
+/// serialize + SS save cycle completes.
+///
+/// The driver's `Action::TakeSnapshot` arm is **fire-and-forget**:
+/// it `tokio::spawn`s a task that runs the blocking snapshot work and
+/// sends this message on completion. The driver's `select!` loop
+/// receives the message on `snapshot_done_rx` and processes the
+/// completion WITHOUT blocking the `events_rx` arm — so new client
+/// commands / inbound RPCs are processed concurrently with the
+/// snapshot's blocking I/O.
+///
+/// The reply oneshot is `Some` only when the snapshot was started via
+/// [`DriverEvent::TriggerSnapshot`] (operator-triggered path); in
+/// that case the driver resolves the oneshot with the result after
+/// processing the completion's follow-up actions.
+struct SnapshotCompletion {
+    /// Snapshot anchor's `last_included_index`. Mirrors
+    /// `metadata.last_included_index` for convenience.
+    through_index: LogIndex,
+    /// Snapshot anchor's `last_included_term`. Mirrors
+    /// `metadata.last_included_term` for convenience.
+    through_term: Term,
+    /// Canonical metadata (id normalised, `size_bytes` set) of the
+    /// snapshot the worker produced. Fed into the engine via
+    /// `Input::SnapshotComplete` so it can record `last_snapshot_meta`
+    /// and emit the follow-on `TruncateLog(PrefixThroughInclusive)`.
+    metadata: SnapshotMeta,
+    /// `Ok(outcome)` on a successful save; `Err(_)` carries the
+    /// failure (SM.snapshot, SS.save_snapshot, or spawn_blocking
+    /// JoinError). The driver fail-stops on `Err`.
+    result: XResult<SnapshotOutcome>,
+    /// Operator-triggered snapshot reply channel. `None` for
+    /// engine-emitted snapshots; `Some` for
+    /// [`DriverEvent::TriggerSnapshot`] so the driver can resolve
+    /// the admin caller's `oneshot` with `TriggeredSnapshotInfo` (or
+    /// the relevant error) after follow-up actions have been
+    /// processed.
+    reply: Option<oneshot::Sender<XResult<TriggeredSnapshotInfo>>>,
 }
 
 /// Unified event consumed by the driver loop.
@@ -1288,8 +1358,82 @@ where
     node: RaftNode,
     log_store: L,
     hs_store: HS,
-    snapshot_store: SS,
-    state_machine: SM,
+    /// Stage 7.3 — wrapped in `Arc<std::sync::Mutex<_>>` so the background
+    /// snapshot worker (running on a `tokio::task::spawn_blocking`
+    /// thread) can call `save_snapshot` without taking ownership of
+    /// the store. The driver loop only locks briefly (e.g. inside
+    /// `handle_inbound_fetch_snapshot`); the snapshot worker holds
+    /// the lock for the duration of the `save_snapshot` I/O.
+    snapshot_store: Arc<std::sync::Mutex<SS>>,
+    /// Stage 7.3 — wrapped in `Arc<std::sync::Mutex<_>>` so the background
+    /// snapshot worker (running on a `tokio::task::spawn_blocking`
+    /// thread) can call `begin_snapshot(&self)` without taking ownership.
+    /// **Lock-holding contract (iter 8/9)**: the snapshot capture phase
+    /// runs on an AWAITED `tokio::task::spawn_blocking` worker spawned
+    /// by `dispatch_snapshot_worker`. The worker locks the SM, calls
+    /// `begin_snapshot()`, drops the lock, then returns the
+    /// `SnapshotSerializer` to the awaiting driver task. The driver
+    /// then spawns a SEPARATE background task that runs `serialize()`
+    /// + `save_snapshot()` WITHOUT any SM lock held.
+    ///
+    /// Why awaited spawn_blocking rather than driver-thread call:
+    /// `dispatch_snapshot_worker` resolves the snapshot's
+    /// `last_included_{index,term}` from the log right before
+    /// awaiting the capture. The await keeps the driver task parked
+    /// inside its current `select!` arm body, so no concurrent
+    /// `Action::ApplyToStateMachine` can be processed by the driver
+    /// while the capture is in flight — capture is atomic with
+    /// metadata resolution, closing the iter-6 race where applies
+    /// between dispatch and capture would advance state past
+    /// `last_included_index` (a Raft snapshot safety violation,
+    /// since followers restoring this snapshot would be advanced
+    /// past entries they never applied from the log).
+    ///
+    /// Why spawn_blocking rather than direct driver-thread capture:
+    /// the default `begin_snapshot()` impl in `xraft-core` calls
+    /// `self.snapshot()` eagerly, which is O(state bytes). Running
+    /// that on the reactor thread would block the tokio runtime for
+    /// the full serialization wall-clock. spawn_blocking ships the
+    /// work to the blocking pool — the reactor stays free to poll
+    /// other tokio tasks (inbound RPCs, replication workers, the
+    /// admin endpoint, ticks queued in `events_rx`) during the
+    /// await. This satisfies the Stage 7.3 requirement: "use
+    /// `tokio::task::spawn_blocking` to avoid blocking the event
+    /// loop during snapshot serialization" for ALL `StateMachine`
+    /// implementations, not just CoW-capable overrides.
+    ///
+    /// **Stage 7.3 (iter 9) — client-latency SLA scoping.** The
+    /// `background-snapshot-nonblocking` SLA from
+    /// `architecture.md` §7 / `e2e-scenarios.md` Feature 15 —
+    /// `client request latency does not spike above 2× baseline
+    /// during a background snapshot` — is met **only** for state
+    /// machines whose
+    /// [`StateMachine::snapshot_capture_mode`](xraft_core::state_machine::StateMachine::snapshot_capture_mode)
+    /// returns
+    /// [`SnapshotCaptureMode::NonBlockingCapture`](xraft_core::state_machine::SnapshotCaptureMode::NonBlockingCapture).
+    /// For these (typically CoW) SMs, `begin_snapshot` is bounded
+    /// (`O(1)` shallow-clone), the SM lock is released almost
+    /// immediately, and concurrent `apply` / `propose` proceeds at
+    /// near-baseline latency — see the regression test
+    /// `scenario_background_snapshot_keeps_propose_latency_within_2x_baseline`.
+    ///
+    /// State machines that fall back to the trait default
+    /// `begin_snapshot` (capture mode
+    /// [`SnapshotCaptureMode::EagerMayStallDriver`](xraft_core::state_machine::SnapshotCaptureMode::EagerMayStallDriver))
+    /// are EXPLICITLY OUT OF SCOPE for the 2× SLA: the SM lock is
+    /// held for the snapshot's full wall-clock, so a single-voter
+    /// cluster's `propose → commit → apply` path (which shares
+    /// the SM mutex with the snapshot worker) defers until the
+    /// snapshot capture completes. The reactor stays free (heavy
+    /// work runs in `spawn_blocking`), but the driver task is
+    /// parked. This is documented at the trait level and verified
+    /// by the regression test
+    /// `scenario_default_eager_begin_snapshot_stalls_driver_loop_documented_limitation`,
+    /// which uses a deterministic barrier to prove the
+    /// `propose` cannot complete until the snapshot worker
+    /// releases the SM mutex. Production deployments that need
+    /// the SLA MUST supply a `NonBlockingCapture`-capable SM.
+    state_machine: Arc<std::sync::Mutex<SM>>,
     router: MessageRouter<T>,
     config: DriverConfig,
     events_rx: mpsc::Receiver<DriverEvent>,
@@ -1352,6 +1496,29 @@ where
     /// graceful shutdown, and fail-stop shutdown so no caller hangs on
     /// a never-resolved `oneshot`.
     pending_reads: VecDeque<PendingRead>,
+    /// Stage 7.3 (iter 2) — sender end of the snapshot-completion
+    /// channel. Cloned into every spawned snapshot worker task so the
+    /// worker can deliver its [`SnapshotCompletion`] back to the driver
+    /// `select!` loop without coupling to driver-private state.
+    snapshot_done_tx: mpsc::Sender<SnapshotCompletion>,
+    /// Stage 7.3 (iter 2) — receiver end of the snapshot-completion
+    /// channel. Polled in the driver's `run()` `select!` loop. Each
+    /// received message triggers
+    /// [`Self::handle_snapshot_completed`] which feeds
+    /// `Input::SnapshotComplete` into the engine and drives any
+    /// follow-up `TruncateLog` action — all on the driver task, not
+    /// on the worker.
+    snapshot_done_rx: mpsc::Receiver<SnapshotCompletion>,
+    /// Stage 7.3 (iter 2) — driver-level "snapshot worker in flight"
+    /// guard. Set synchronously in the
+    /// `Action::TakeSnapshot`/`DriverEvent::TriggerSnapshot` arms
+    /// **before** dispatching the worker, and cleared in
+    /// [`Self::handle_snapshot_completed`] after the engine has
+    /// recorded `last_snapshot_meta`. Independent of (but consistent
+    /// with) `engine.snapshot_in_flight` so the operator-triggered
+    /// path can defend against duplicate dispatches without
+    /// round-tripping through the engine.
+    snapshot_worker_in_flight: bool,
 }
 
 /// Observer hook the driver invokes after every event-loop iteration
@@ -1416,6 +1583,36 @@ pub trait DriverObserver: Send + Sync + std::fmt::Debug {
     /// scrape does not report stale lag for a node that is no longer
     /// leader. Default impl is a no-op.
     fn on_leader_step_down(&self) {}
+
+    /// Stage 7.3 — called once per successful background snapshot
+    /// (engine-emitted `Action::TakeSnapshot` OR operator-triggered
+    /// `DriverEvent::TriggerSnapshot`) with the wall-clock duration of
+    /// the SM serialize + SS save cycle (measured inside the
+    /// `spawn_blocking` worker) and the size of the serialised
+    /// snapshot payload. Production impls observe both the
+    /// `xraft_snapshot_duration_seconds` and
+    /// `xraft_snapshot_size_bytes` histograms. Default impl is a no-op.
+    fn on_snapshot_taken(&self, _elapsed: Duration, _data_size: u64) {}
+
+    /// Stage 7.3 — called once per successful `Action::InstallSnapshot`
+    /// after the snapshot is durable in `SnapshotStore` and the state
+    /// machine has been restored from it. The argument is the
+    /// `last_included_index` of the snapshot that was installed —
+    /// production observers may attach this as a metric label or log
+    /// field so ops can correlate install events with the specific
+    /// snapshot (e.g. when reasoning about a follower that fell behind
+    /// the leader's compacted log floor). Default impl is a no-op.
+    /// Production impls bump the `xraft_snapshot_installs_total`
+    /// counter.
+    fn on_snapshot_installed(&self, _last_included_index: LogIndex) {}
+
+    /// Stage 7.3 — called once per successful log-prefix compaction
+    /// (`Action::TruncateLog(PrefixThroughInclusive(_))`) with the
+    /// snapshot's `last_included_index` that the log was truncated
+    /// through. Production impls bump the
+    /// `xraft_log_compaction_events_total` counter so operators can
+    /// graph compaction frequency. Default impl is a no-op.
+    fn on_log_compaction(&self, _through_index: LogIndex) {}
 }
 
 /// Direction label for the `xraft_fetch_requests_total` counter (Stage 7.1).
@@ -1482,6 +1679,7 @@ where
             shutdown,
         } = channels;
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (snapshot_done_tx, snapshot_done_rx) = mpsc::channel(SNAPSHOT_DONE_CHANNEL_CAPACITY);
         let router = MessageRouter::new_with_fetch_snapshot_deadline(
             transport,
             outbound_tx,
@@ -1500,8 +1698,8 @@ where
             node,
             log_store,
             hs_store,
-            snapshot_store,
-            state_machine,
+            snapshot_store: Arc::new(std::sync::Mutex::new(snapshot_store)),
+            state_machine: Arc::new(std::sync::Mutex::new(state_machine)),
             router,
             config,
             events_rx,
@@ -1516,6 +1714,9 @@ where
             candidate_entered_at: None,
             prev_role,
             pending_reads: VecDeque::new(),
+            snapshot_done_tx,
+            snapshot_done_rx,
+            snapshot_worker_in_flight: false,
         }
     }
 
@@ -1711,6 +1912,18 @@ where
                 _ = self.shutdown.notified() => {
                     info!(target: "xraft_server::driver", "shutdown signal received");
                     break;
+                }
+
+                // Stage 7.3 (iter 2) — drain background snapshot
+                // completions FIRST in the biased order so a freshly-
+                // finished worker is not starved by a hot `events_rx`
+                // burst. The engine cannot emit further
+                // `Action::TakeSnapshot` until this completion clears
+                // `snapshot_in_flight`, so delaying its processing
+                // also delays prefix-compaction follow-ups (which keep
+                // the WAL bounded).
+                Some(completion) = self.snapshot_done_rx.recv() => {
+                    self.handle_snapshot_completed(completion).await;
                 }
 
                 Some(event) = self.events_rx.recv() => {
@@ -2065,7 +2278,12 @@ where
                     "Stage 7.1 lease-gated read: fast path (active lease)"
                 );
             }
-            let result = self.state_machine.query(&q.query).map(Bytes::from);
+            let result = self
+                .state_machine
+                .lock()
+                .expect("state_machine mutex poisoned")
+                .query(&q.query)
+                .map(Bytes::from);
             let _ = q.reply.send(result);
             return;
         }
@@ -2167,7 +2385,12 @@ where
             if self.has_read_index_quorum_proof(pr.read_baseline_seq)
                 && last_applied >= pr.read_index
             {
-                let result = self.state_machine.query(&pr.query).map(Bytes::from);
+                let result = self
+                    .state_machine
+                    .lock()
+                    .expect("state_machine mutex poisoned")
+                    .query(&pr.query)
+                    .map(Bytes::from);
                 let _ = pr.reply.send(result);
             } else {
                 still_pending.push_back(pr);
@@ -2239,15 +2462,14 @@ where
             }));
             return;
         }
-        // Reject concurrent triggers — the engine already has a
-        // snapshot in flight (a prior `Action::TakeSnapshot` whose
-        // `Input::SnapshotComplete` follow-up has not yet flowed back
-        // through `process_actions`). Driving two concurrent
-        // state-machine snapshots would either double-load the SM or
-        // write a stale anchor when both completions race; cleaner to
-        // surface a `Config` error so the operator backs off and
-        // retries.
-        if self.node.snapshot_in_flight {
+        // Reject concurrent triggers — either the engine has already
+        // emitted `Action::TakeSnapshot` whose worker is still in
+        // flight (`engine.snapshot_in_flight`) OR a previous operator
+        // trigger is still being processed
+        // (`self.snapshot_worker_in_flight`). Surfacing as `Config`
+        // lets the operator back off and retry once the in-flight
+        // snapshot completes.
+        if self.node.snapshot_in_flight || self.snapshot_worker_in_flight {
             let _ = reply.send(Err(XRaftError::Config(
                 "snapshot already in flight; retry after current snapshot completes".to_string(),
             )));
@@ -2260,49 +2482,43 @@ where
             through_index = %through_index,
             "operator-triggered snapshot starting"
         );
-        match self.take_snapshot_with_meta(through_index) {
-            Ok((meta, follow_ups)) => {
-                // Push follow-on actions (e.g. TruncateLog from the
-                // engine's SnapshotComplete) through the same
-                // worklist plumbing the engine-driven path uses. We
-                // forward them via process_actions so prefix
-                // compaction lands transparently.
-                //
-                // Evaluator iter-2 item 1: a follow-up
-                // TruncateLog/flush failure inside `process_actions`
-                // sets `captured.error` AND `self.halt_reason` so the
-                // driver fail-stops on the next loop iteration. We
-                // MUST surface that error to the admin caller too —
-                // returning Ok(TriggeredSnapshotInfo) while the
-                // driver is about to halt would lie to the operator
-                // and hide the storage failure behind a successful
-                // HTTP response.
-                let captured = self.process_actions(follow_ups, None).await;
-                if let Some(err) = captured.error {
-                    error!(
-                        target: "xraft_server::driver",
-                        node_id = %self.node.id,
-                        last_included_index = %meta.last_included_index,
-                        error = %err,
-                        "operator-triggered snapshot persisted but a follow-up action failed; reporting failure to the admin caller"
-                    );
-                    let _ = reply.send(Err(err));
-                    return;
-                }
-                let info = TriggeredSnapshotInfo {
-                    last_included_index: meta.last_included_index.0,
-                    last_included_term: meta.last_included_term.0,
-                    size_bytes: meta.size_bytes.unwrap_or(0),
-                };
-                let _ = reply.send(Ok(info));
-            }
-            Err(e) => {
-                let msg = format!("operator-triggered snapshot failed: {e}");
-                error!(target: "xraft_server::driver", %msg, "halting driver");
-                let halt = XRaftError::Storage(msg.clone());
-                self.halt_reason.get_or_insert(msg);
-                let _ = reply.send(Err(halt));
-            }
+
+        // Stage 7.3 (iter 2) — set engine `snapshot_in_flight` BEFORE
+        // dispatching so any concurrent engine-side commit advance
+        // sees the flag and skips emitting its own
+        // `Action::TakeSnapshot`. The engine clears the flag in
+        // `Input::SnapshotComplete` (fed by
+        // `handle_snapshot_completed`), keeping the two paths
+        // consistent.
+        self.node.snapshot_in_flight = true;
+
+        if let Err(e) = self
+            .dispatch_snapshot_worker(through_index, Some(reply))
+            .await
+        {
+            // Dispatch failed (e.g. term_at lookup error or
+            // `begin_snapshot()` failure on the awaited capture
+            // worker). Roll back `snapshot_in_flight` so the engine
+            // can retry on the next commit advance, and fail-stop
+            // because the dispatch path is a precondition the
+            // operator relies on.
+            self.node.snapshot_in_flight = false;
+            self.snapshot_worker_in_flight = false;
+            let msg = format!("operator-triggered snapshot dispatch failed: {e}");
+            error!(target: "xraft_server::driver", %msg, "halting driver");
+            self.halt_reason.get_or_insert(msg);
+            // NOTE: `dispatch_snapshot_worker` consumed `reply` when it
+            // attached it to the spawned task; on the failure path
+            // (term_at lookup error / `begin_snapshot()` failure on
+            // the awaited capture worker) the task was never spawned,
+            // so `reply` was dropped on the Err path inside
+            // `dispatch_snapshot_worker`. The admin caller observes a
+            // channel-closed error. That's acceptable for the
+            // fail-stop path — the driver is about to exit anyway.
+            //
+            // (If a future refactor needs the operator to receive a
+            // structured error here, plumb `reply` back out of
+            // `dispatch_snapshot_worker` on the Err branch.)
         }
     }
 
@@ -2504,7 +2720,12 @@ where
         }
 
         // (6) Resolve snapshot metadata by id.
-        let meta = match self.snapshot_store.find_by_id(&req.snapshot_id) {
+        let meta = match self
+            .snapshot_store
+            .lock()
+            .expect("snapshot_store mutex poisoned")
+            .find_by_id(&req.snapshot_id)
+        {
             Ok(Some(m)) => m,
             Ok(None) => {
                 let _ = reply.send(Err(XRaftError::SnapshotNotFound(req.snapshot_id.clone())));
@@ -2528,12 +2749,12 @@ where
         // `chunk_size` of 0 makes the store pick its default; the
         // store also uses `chunk_size == 0 → default` semantics.
         let chunk_size: usize = max_bytes_opt.map(|n| n as usize).unwrap_or(0);
-        let iter = match self.snapshot_store.snapshot_reader_from_offset(
-            &meta,
-            chunk_size,
-            req.offset,
-            max_bytes_opt,
-        ) {
+        let iter = match self
+            .snapshot_store
+            .lock()
+            .expect("snapshot_store mutex poisoned")
+            .snapshot_reader_from_offset(&meta, chunk_size, req.offset, max_bytes_opt)
+        {
             Ok(it) => it,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -2751,19 +2972,49 @@ where
                     }
                 }
                 Action::TakeSnapshot { through_index } => {
-                    match self.handle_take_snapshot(through_index) {
-                        Ok(follow_ups) => {
-                            for fu in follow_ups {
-                                worklist.push_back(fu);
-                            }
-                        }
-                        Err(e) => {
-                            let msg = format!("snapshot save failed: {e}");
-                            error!(target: "xraft_server::driver", %msg, "halting driver");
-                            captured.error = Some(XRaftError::Storage(msg.clone()));
-                            self.halt_reason.get_or_insert(msg);
-                            break;
-                        }
+                    // Stage 7.3 (iter 8/9) — two-phase dispatch:
+                    //   1) AWAIT a `spawn_blocking` worker that locks
+                    //      the SM and calls `begin_snapshot()` (the
+                    //      slow-for-default-impl capture phase).
+                    //      Atomic with metadata because we're still
+                    //      inside this `select!` arm body.
+                    //   2) Spawn a background task that runs the
+                    //      captured `SnapshotSerializer::serialize()`
+                    //      + `SnapshotStore::save_snapshot()` with
+                    //      NO SM lock — completion arrives later on
+                    //      `self.snapshot_done_rx` and is processed
+                    //      by `handle_snapshot_completed`.
+                    //
+                    // The capture phase runs on the blocking pool —
+                    // the reactor stays free for OTHER tokio tasks
+                    // (inbound RPCs, replication workers, ticks) for
+                    // the duration of the await. The DRIVER TASK
+                    // itself is parked for the capture phase to
+                    // serialize against further applies in this
+                    // batch (iter-6 race fix).
+                    //
+                    // Iter-9 SLA scoping: the
+                    // `background-snapshot-nonblocking` scenario's
+                    // 2× propose-latency ceiling is met ONLY for
+                    // state machines whose `snapshot_capture_mode`
+                    // returns `NonBlockingCapture` (CoW override —
+                    // `begin_snapshot` is O(1)). For state
+                    // machines on the trait default
+                    // (`EagerMayStallDriver`), the await on the
+                    // capture phase blocks for the SM's full
+                    // serialize wall-clock; concurrent `propose`
+                    // responses wait for the next apply, which
+                    // waits on the SM lock — those SMs are
+                    // EXPLICITLY OUT OF SCOPE for the 2× SLA. See
+                    // `SnapshotCaptureMode` doc-comment in
+                    // `xraft-core::state_machine` and the
+                    // `dispatch_snapshot_worker` doc above.
+                    if let Err(e) = self.dispatch_snapshot_worker(through_index, None).await {
+                        let msg = format!("snapshot dispatch failed: {e}");
+                        error!(target: "xraft_server::driver", %msg, "halting driver");
+                        captured.error = Some(XRaftError::Storage(msg.clone()));
+                        self.halt_reason.get_or_insert(msg);
+                        break;
                     }
                 }
                 Action::InstallSnapshot { metadata, data } => {
@@ -3118,10 +3369,33 @@ where
             };
             match resolved_term {
                 Ok(Some(actual_term)) if actual_term != last_fetched_epoch => {
-                    let (end_index, _) = self.effective_log_tip();
+                    // Stage 7.3 — KRaft-style fast divergence detection.
+                    // The leader-epoch checkpoint maps `(epoch ->
+                    // start_offset)` so we can answer "what is the
+                    // last valid offset of the follower's epoch?"
+                    // without scanning the log. Per `architecture.md`
+                    // §5.4 the response carries `(epoch, end_offset)`
+                    // where `epoch` is the epoch whose end is being
+                    // reported (i.e. the follower's claimed epoch).
+                    // The follower truncates to `end_offset` and
+                    // re-fetches with `last_fetched_epoch = epoch`.
+                    let (diverging_epoch, end_offset) =
+                        match self.log_store.end_offset_for_epoch(last_fetched_epoch) {
+                            Ok(Some(precise)) => (last_fetched_epoch, precise),
+                            Ok(None) | Err(_) => {
+                                // No checkpoint hit — fall back to the
+                                // leader's term-at-prev and the
+                                // effective log tip. This preserves
+                                // the (epoch, end_offset) contract:
+                                // both fields reference the same
+                                // anchor point.
+                                let (tip_index, tip_term) = self.effective_log_tip();
+                                (tip_term.max(actual_term), tip_index)
+                            }
+                        };
                     diverging = Some(DivergingEpoch {
-                        epoch: actual_term,
-                        end_offset: end_index,
+                        epoch: diverging_epoch,
+                        end_offset,
                     });
                 }
                 Ok(Some(_)) => {}
@@ -3131,11 +3405,21 @@ where
                     // effective tail (snapshot anchor or log tip,
                     // whichever is further) so the follower's resume
                     // pointer is anchored at known-good ground.
-                    let (end_index, end_term) = self.effective_log_tip();
-                    diverging = Some(DivergingEpoch {
-                        epoch: end_term,
-                        end_offset: end_index,
-                    });
+                    //
+                    // Stage 7.3 — if we have a checkpoint hit for the
+                    // follower's claimed epoch, prefer that as the
+                    // divergence anchor. It gives the follower a more
+                    // precise truncate point than the unconditional
+                    // log-tip fallback. The returned epoch is the
+                    // follower's claimed epoch (whose end we are
+                    // reporting), matching `architecture.md` §5.4.
+                    let (tip_index, tip_term) = self.effective_log_tip();
+                    let (epoch, end_offset) =
+                        match self.log_store.end_offset_for_epoch(last_fetched_epoch) {
+                            Ok(Some(precise)) => (last_fetched_epoch, precise),
+                            Ok(None) | Err(_) => (tip_term, tip_index),
+                        };
+                    diverging = Some(DivergingEpoch { epoch, end_offset });
                 }
                 Err(e) => {
                     return Err(XRaftError::Storage(format!(
@@ -3784,6 +4068,17 @@ where
                     self.handle_outbound_result(res).await;
                 }
 
+                // Stage 7.3 (iter 2) — keep draining snapshot
+                // completions during graceful shutdown so an
+                // in-flight worker's operator-trigger reply oneshot
+                // does not strand with a channel-closed error. The
+                // engine's `Input::SnapshotComplete` follow-ups
+                // (notably `TruncateLog`) also run here, keeping the
+                // WAL bounded even when the driver is winding down.
+                Some(completion) = self.snapshot_done_rx.recv() => {
+                    self.handle_snapshot_completed(completion).await;
+                }
+
                 _ = self.router.reap_one(), if self.router.in_flight() > 0 => {}
             }
         }
@@ -3791,6 +4086,18 @@ where
         // events_rx closed but before this loop noticed.
         while let Ok(res) = self.outbound_rx.try_recv() {
             self.handle_outbound_result(res).await;
+            if self.halt_reason.is_some() {
+                return;
+            }
+        }
+        // Stage 7.3 (iter 2) — best-effort: drain any snapshot
+        // completions that arrived after events_rx closed. Any
+        // remaining in-flight worker (the dispatch task itself, not
+        // yet completed) is allowed to die when the runtime tears
+        // down; the durable bytes saved so far are not corrupted
+        // because `SnapshotStore::save_snapshot` uses tmp+rename.
+        while let Ok(completion) = self.snapshot_done_rx.try_recv() {
+            self.handle_snapshot_completed(completion).await;
             if self.halt_reason.is_some() {
                 return;
             }
@@ -3877,6 +4184,24 @@ where
         for pr in stranded_reads {
             let _ = pr.reply.send(Err(XRaftError::Storage(reason.clone())));
         }
+
+        // Stage 7.3 (iter 2) — drain any pending snapshot completions
+        // and resolve their operator-trigger reply oneshots with the
+        // halt error so admin callers don't strand on dropped
+        // channels. We do NOT process the completions through
+        // `handle_snapshot_completed` here (which would call into the
+        // engine and try to advance state) — once we're in fail-stop
+        // the engine state is frozen and feeding new inputs is
+        // unsafe.
+        self.snapshot_done_rx.close();
+        while let Ok(completion) = self.snapshot_done_rx.try_recv() {
+            if let Some(r) = completion.reply {
+                let _ = r.send(Err(XRaftError::Storage(reason.clone())));
+            }
+        }
+        // Also clear the in-flight flag so a hypothetical follow-up
+        // path doesn't see a stale gate.
+        self.snapshot_worker_in_flight = false;
 
         Err(XRaftError::Storage(reason))
     }
@@ -4220,6 +4545,50 @@ mod tests {
             self.entries.retain(|e| e.index > through_index_inclusive);
             Ok(())
         }
+
+        // Stage 7.3 — record the snapshot anchor (monotonic).
+        fn update_snapshot_anchor(&mut self, term: Term, index: LogIndex) -> XResult<()> {
+            if self
+                .fail_next_update_snapshot_anchor
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(XRaftError::Storage(format!(
+                    "injected update_snapshot_anchor failure at (term={}, index={})",
+                    term.0, index.0,
+                )));
+            }
+            match self.snapshot_anchor {
+                Some((_, prev)) if prev >= index => Ok(()),
+                _ => {
+                    self.snapshot_anchor = Some((term, index));
+                    Ok(())
+                }
+            }
+        }
+
+        // Stage 7.3 — KRaft-style end_offset lookup for a given epoch.
+        // Because Raft logs are append-only with monotonically
+        // non-decreasing terms, the highest-index entry with `term ==
+        // epoch` is the end of that epoch. When no live entries cover
+        // `epoch` but the snapshot anchor's term is >= `epoch`, the
+        // anchor index is the floor.
+        fn end_offset_for_epoch(&self, epoch: Term) -> XResult<Option<LogIndex>> {
+            if let Some(highest) = self
+                .entries
+                .iter()
+                .filter(|e| e.term == epoch)
+                .map(|e| e.index)
+                .max()
+            {
+                return Ok(Some(highest));
+            }
+            if let Some((anchor_term, anchor_idx)) = self.snapshot_anchor
+                && epoch <= anchor_term
+            {
+                return Ok(Some(anchor_idx));
+            }
+            Ok(None)
+        }
     }
 
     #[derive(Default)]
@@ -4375,6 +4744,60 @@ mod tests {
         fn fail_next_apply_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
             self.fail_next_apply.clone()
         }
+        fn snapshot_delay_ms_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+            self.snapshot_delay_ms.clone()
+        }
+        fn snapshot_serialize_delay_ms_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+            self.snapshot_serialize_delay_ms.clone()
+        }
+        fn begin_snapshot_delay_ms_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+            self.begin_snapshot_delay_ms.clone()
+        }
+        fn use_eager_begin_snapshot_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+            self.use_eager_begin_snapshot.clone()
+        }
+        fn snapshot_capture_barrier_engaged_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+            self.snapshot_capture_barrier_engaged.clone()
+        }
+        fn snapshot_entered_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+            self.snapshot_entered.clone()
+        }
+    }
+
+    /// Stage 7.3 (iter 4) — owned, sendable serializer used by
+    /// `TestStateMachine::begin_snapshot`. Holds the captured payload
+    /// and the post-lock delay so the actual `serialize()` runs
+    /// WITHOUT the SM lock, proving the non-blocking-serialize
+    /// property.
+    struct TestSnapshotSerializer {
+        payload: Vec<u8>,
+        snapshots_taken: SnapshotCalls,
+        serialize_delay_ms: u64,
+        /// Stage 7.3 (iter 7) — `snapshot_delay_ms` (originally the
+        /// "in-lock delay" knob) now applies INSIDE `serialize()` —
+        /// the serialize phase is the only place that can be made
+        /// arbitrarily slow without violating the iter-7 atomic-
+        /// capture contract. Keeping this knob honoured here lets
+        /// the `does_not_block_tokio_reactor` test continue to prove
+        /// the reactor stays free during a long-running snapshot
+        /// without re-introducing the begin_snapshot race.
+        legacy_snapshot_delay_ms: u64,
+    }
+
+    impl xraft_core::state_machine::SnapshotSerializer for TestSnapshotSerializer {
+        fn serialize(self: Box<Self>) -> XResult<Vec<u8>> {
+            if self.legacy_snapshot_delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(self.legacy_snapshot_delay_ms));
+            }
+            if self.serialize_delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(self.serialize_delay_ms));
+            }
+            self.snapshots_taken
+                .lock()
+                .unwrap()
+                .push(self.payload.clone());
+            Ok(self.payload)
+        }
     }
 
     impl StateMachine for TestStateMachine {
@@ -4404,6 +4827,31 @@ mod tests {
                 .unwrap()
                 .push(snapshot.to_vec());
             Ok(())
+        }
+        fn snapshot_capture_mode(&self) -> xraft_core::state_machine::SnapshotCaptureMode {
+            // Stage 7.3 (iter 9) — surface the capability dynamically
+            // based on the `use_eager_begin_snapshot` test knob:
+            //   - knob = false (default): the iter-7/8 override path
+            //     above is bounded — it captures a payload `Vec<u8>`
+            //     and returns a `TestSnapshotSerializer` that owns
+            //     its bytes. The SM lock is released as soon as the
+            //     payload clone completes. This mirrors a production
+            //     CoW state machine, so the SLA-relevant
+            //     `NonBlockingCapture` mode is reported.
+            //   - knob = true: the eager mimic above runs
+            //     `self.snapshot()` under the SM lock, exactly like
+            //     the trait default. Surface this as
+            //     `EagerMayStallDriver` so SLA assertions trip at
+            //     setup time if a test accidentally configures the
+            //     wrong SM kind.
+            if self
+                .use_eager_begin_snapshot
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                xraft_core::state_machine::SnapshotCaptureMode::EagerMayStallDriver
+            } else {
+                xraft_core::state_machine::SnapshotCaptureMode::NonBlockingCapture
+            }
         }
     }
 
@@ -4649,6 +5097,61 @@ port = 6000
         /// silently returning `Ok`.
         #[allow(dead_code)]
         fail_next_purge_prefix: Arc<std::sync::atomic::AtomicBool>,
+        /// Stage 7.3 — set non-zero to make `state_machine.snapshot()`
+        /// `std::thread::sleep` for this many milliseconds on the
+        /// blocking-pool thread (so the
+        /// `background-snapshot-nonblocking` scenario can prove the
+        /// driver's `tokio::task::spawn_blocking` keeps the reactor
+        /// free during a slow serialisation).
+        snapshot_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+        /// Stage 7.3 (iter 2) — set non-zero to make
+        /// `snapshot_store.save_snapshot()` `std::thread::sleep` for
+        /// this many milliseconds. The driver dispatches save via
+        /// `spawn_blocking`, so this delay does NOT block the
+        /// reactor OR the state-machine mutex (so propose / apply
+        /// can complete during the slow save). Used by the
+        /// `background-snapshot-propose-latency-within-2x-baseline`
+        /// scenario.
+        save_snapshot_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+        /// Stage 7.3 (iter 4) — set non-zero to make the
+        /// SnapshotSerializer returned by
+        /// `TestStateMachine::begin_snapshot` sleep this many ms
+        /// during `serialize()` (AFTER the SM mutex has been
+        /// dropped). Used by the
+        /// `scenario_background_snapshot_serialize_keeps_propose_latency_within_2x_baseline`
+        /// scenario to prove that slow serialization no longer
+        /// blocks apply / propose.
+        snapshot_serialize_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+        /// Stage 7.3 (iter 7) — see `TestStateMachine::
+        /// begin_snapshot_delay_ms` for full docs. Used by the
+        /// atomic-capture regression test to prove
+        /// `begin_snapshot` runs synchronously on the driver
+        /// thread during `dispatch_snapshot_worker`.
+        begin_snapshot_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+        /// Stage 7.3 (iter 8) — see `TestStateMachine::
+        /// use_eager_begin_snapshot` for full docs. When set,
+        /// `TestStateMachine::begin_snapshot` mimics the trait's
+        /// default impl (eager `snapshot()` + `EagerSerializer`).
+        /// Used by the iter-8 default-path reactor-non-blocking
+        /// regression test.
+        use_eager_begin_snapshot: Arc<std::sync::atomic::AtomicBool>,
+        /// Stage 7.3 (iter 9) — barrier the test thread can use to
+        /// pin `TestStateMachine::snapshot()` (and therefore the SM
+        /// mutex) inside a busy-wait loop. Used by the
+        /// documented-limitation test
+        /// `scenario_default_eager_begin_snapshot_stalls_driver_loop_documented_limitation`
+        /// to deterministically prove that `propose` -> `apply`
+        /// cannot complete while a default-eager snapshot is in
+        /// progress. Setting this to `true` makes the next
+        /// `snapshot()` call enter the loop; flipping it back to
+        /// `false` releases the loop.
+        snapshot_capture_barrier_engaged: Arc<std::sync::atomic::AtomicBool>,
+        /// Stage 7.3 (iter 9) — companion entry-signal for the
+        /// capture barrier. `snapshot()` sets this to `true`
+        /// immediately upon entering the busy-wait so the test
+        /// thread can confirm the SM lock is held BEFORE issuing
+        /// the propose whose stall it measures.
+        snapshot_entered: Arc<std::sync::atomic::AtomicBool>,
     }
 
     /// Build a driver pre-wired with capture-aware test doubles for the
@@ -4666,12 +5169,19 @@ port = 6000
         let hs = TestHardStateStore::default();
         let ss = TestSnapshotStore::default();
         let saved_snapshots = ss.saved.clone();
+        let save_snapshot_delay_ms = ss.save_snapshot_delay_ms_handle();
         let sm = TestStateMachine::default();
         let applied = sm.snapshot_handle();
         let snapshots_taken = sm.snapshots_taken_handle();
         let restores_received = sm.restores_received_handle();
         let snapshot_payload = sm.snapshot_payload_handle();
         let fail_next_apply = sm.fail_next_apply_handle();
+        let snapshot_delay_ms = sm.snapshot_delay_ms_handle();
+        let snapshot_serialize_delay_ms = sm.snapshot_serialize_delay_ms_handle();
+        let begin_snapshot_delay_ms = sm.begin_snapshot_delay_ms_handle();
+        let use_eager_begin_snapshot = sm.use_eager_begin_snapshot_handle();
+        let snapshot_capture_barrier_engaged = sm.snapshot_capture_barrier_engaged_handle();
+        let snapshot_entered = sm.snapshot_entered_handle();
         let transport = Arc::new(NoopTransport::default());
         let driver = Driver::new(
             node,
@@ -4701,6 +5211,13 @@ port = 6000
                 fail_next_get_range,
                 fail_next_truncate,
                 fail_next_purge_prefix,
+                snapshot_delay_ms,
+                save_snapshot_delay_ms,
+                snapshot_serialize_delay_ms,
+                begin_snapshot_delay_ms,
+                use_eager_begin_snapshot,
+                snapshot_capture_barrier_engaged,
+                snapshot_entered,
             },
         )
     }
@@ -4822,6 +5339,15 @@ port = 6000
             "TakeSnapshot cycle should not error, got {:?}",
             captured.error,
         );
+        // Stage 7.3 (iter 2) — TakeSnapshot is now fire-and-forget.
+        // The dispatcher returns immediately and the worker delivers
+        // a SnapshotCompletion on snapshot_done_rx; the test helper
+        // awaits that completion and runs handle_snapshot_completed
+        // so all downstream assertions (snapshots_taken,
+        // saved_snapshots, log_store.snapshot_anchor, observer
+        // counters) hold afterwards just as they did under the prior
+        // blocking implementation.
+        driver.await_pending_snapshot().await;
         assert!(
             driver.halt_reason.is_none(),
             "TakeSnapshot must not halt the driver, halt_reason = {:?}",

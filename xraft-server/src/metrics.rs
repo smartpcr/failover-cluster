@@ -2,8 +2,9 @@
 //!
 //! The canonical metric list lives in `architecture.md` §7 and
 //! `e2e-scenarios.md` Feature 15. Stage 6.1 shipped the MVP subset;
-//! Stage 7.1 extends that toward the complete canonical set by adding
-//! the leader / replication observability metrics:
+//! Stage 7.1 added the leader / replication observability metrics;
+//! Stage 7.3 completes the canonical set with snapshot + log
+//! observability:
 //!
 //! ### MVP subset (Stage 6.1)
 //! - `xraft_current_term` — gauge.
@@ -29,8 +30,20 @@
 //!   `architecture.md` §7 "Fetch RPCs received by leader"
 //!   contract).
 //!
-//! Stage 7.3 will land the remaining canonical metrics
-//! (`xraft_snapshot_installs_total`, `xraft_log_end_offset`).
+//! ### Stage 7.3 additions (snapshot + log observability)
+//! - `xraft_snapshot_installs_total` — counter, snapshots installed
+//!   by this node (every successful `Action::InstallSnapshot`).
+//! - `xraft_log_end_offset` — gauge, highest log index this node
+//!   knows about (may be ahead of commit). Mirrored from
+//!   `NodeStatus.last_log_index` on every `publish_state` call.
+//! - `xraft_snapshot_duration_seconds` — histogram, wall-clock
+//!   duration of each background snapshot worker run (SM serialize
+//!   + SS save), measured inside the `spawn_blocking` worker.
+//! - `xraft_snapshot_size_bytes` — histogram, serialised payload
+//!   size of each successful snapshot.
+//! - `xraft_log_compaction_events_total` — counter, successful
+//!   log-prefix compactions (every successful
+//!   `Action::TruncateLog(PrefixThroughInclusive(_))`).
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -47,7 +60,7 @@ use tokio::sync::Mutex;
 
 use crate::driver::{DriverObserver, FetchDirection};
 use crate::status::{NodeStatus, StatusPublisher, role_to_gauge};
-use xraft_core::types::NodeId;
+use xraft_core::types::{LogIndex, NodeId};
 
 /// Default histogram bucket layout for `xraft_election_latency_seconds`:
 /// 8 exponential buckets starting at 5 ms, factor 2 (5ms, 10, 20, 40,
@@ -69,6 +82,27 @@ fn election_latency_buckets() -> impl Iterator<Item = f64> {
 /// boundaries.
 fn commit_latency_buckets() -> impl Iterator<Item = f64> {
     exponential_buckets(0.005, 2.0, 8)
+}
+
+/// Stage 7.3 histogram buckets for `xraft_snapshot_duration_seconds`.
+/// Snapshot serialization + SS save can range from sub-millisecond
+/// for tiny in-memory state machines to multiple seconds for large
+/// production payloads (multi-MB serializations). 10 exponential
+/// buckets starting at 1 ms, factor 4 (1ms, 4, 16, 64, 256ms, 1s,
+/// 4s, 16s, 64s, 256s) covers four orders of magnitude — enough to
+/// alert on both healthy fast snapshots and pathological multi-minute
+/// stalls.
+fn snapshot_duration_buckets() -> impl Iterator<Item = f64> {
+    exponential_buckets(0.001, 4.0, 10)
+}
+
+/// Stage 7.3 histogram buckets for `xraft_snapshot_size_bytes`.
+/// Snapshots span a wide range from a handful of bytes (empty test
+/// state machines) to hundreds of MB. 10 exponential buckets
+/// starting at 1 KiB, factor 4 (1KiB, 4, 16, 64, 256KiB, 1MiB, 4,
+/// 16, 64, 256 MiB) covers six orders of magnitude.
+fn snapshot_size_buckets() -> impl Iterator<Item = f64> {
+    exponential_buckets(1024.0, 4.0, 10)
 }
 
 /// Label set for `xraft_replication_lag`. One sample per tracked
@@ -145,6 +179,27 @@ pub struct XRaftMetrics {
     /// Stage 7.1: count of Fetch RPCs observed by this node, labelled
     /// by direction. Exposed as `xraft_fetch_requests_total{direction="..."}`.
     fetch_requests: Family<FetchDirectionLabel, Counter>,
+    /// Stage 7.3: count of snapshots installed by this node (every
+    /// successful `Action::InstallSnapshot`). Exposed as
+    /// `xraft_snapshot_installs_total`.
+    snapshot_installs: Counter,
+    /// Stage 7.3: count of successful log-prefix compactions
+    /// (every successful `Action::TruncateLog(PrefixThroughInclusive(_))`).
+    /// Exposed as `xraft_log_compaction_events_total`.
+    log_compaction_events: Counter,
+    /// Stage 7.3: histogram of background snapshot worker durations
+    /// (SM serialize + SS save), measured inside the `spawn_blocking`
+    /// closure so it reflects blocking-pool work rather than the
+    /// round-trip through the driver task.
+    snapshot_duration_seconds: Histogram,
+    /// Stage 7.3: histogram of serialised snapshot payload sizes.
+    /// Sampled once per successful snapshot (engine-emitted or
+    /// operator-triggered).
+    snapshot_size_bytes: Histogram,
+    /// Stage 7.3: highest log index this node knows about (may be
+    /// ahead of commit). Refreshed on every `publish_state` call
+    /// from `NodeStatus.last_log_index`.
+    log_end_offset: Gauge<i64>,
     status: Arc<StatusPublisher>,
 }
 
@@ -175,6 +230,11 @@ impl XRaftMetrics {
         let replication_lag = Family::<ReplicaLabel, Gauge<i64>>::default();
         let commit_latency_seconds = Histogram::new(commit_latency_buckets());
         let fetch_requests = Family::<FetchDirectionLabel, Counter>::default();
+        let snapshot_installs = Counter::default();
+        let log_compaction_events = Counter::default();
+        let snapshot_duration_seconds = Histogram::new(snapshot_duration_buckets());
+        let snapshot_size_bytes = Histogram::new(snapshot_size_buckets());
+        let log_end_offset = Gauge::<i64>::default();
 
         registry.register(
             "xraft_current_term",
@@ -237,6 +297,47 @@ impl XRaftMetrics {
              `architecture.md` §7).",
             fetch_requests.clone(),
         );
+        // Stage 7.3 — canonical metric `xraft_snapshot_installs_total`
+        // from `architecture.md` §7. Same auto-suffix rule: register
+        // without `_total`, prometheus-client appends it on render.
+        registry.register(
+            "xraft_snapshot_installs",
+            "Snapshots installed by this node (every successful Action::InstallSnapshot).",
+            snapshot_installs.clone(),
+        );
+        // Stage 7.3 — supporting metric for log-compaction observability.
+        registry.register(
+            "xraft_log_compaction_events",
+            "Successful log-prefix compactions \
+             (every successful Action::TruncateLog(PrefixThroughInclusive(_))).",
+            log_compaction_events.clone(),
+        );
+        // Stage 7.3 — background snapshot serialization+save duration.
+        registry.register(
+            "xraft_snapshot_duration_seconds",
+            "Wall-clock duration of each background snapshot worker run \
+             (StateMachine::snapshot + SnapshotStore::save_snapshot), \
+             measured inside the spawn_blocking worker so it reflects \
+             blocking-pool work rather than driver-task round-trip.",
+            snapshot_duration_seconds.clone(),
+        );
+        // Stage 7.3 — snapshot payload size (state-machine serialized output).
+        registry.register(
+            "xraft_snapshot_size_bytes",
+            "Serialised snapshot payload size in bytes, sampled once per \
+             successful snapshot (engine-emitted or operator-triggered).",
+            snapshot_size_bytes.clone(),
+        );
+        // Stage 7.3 — canonical metric `xraft_log_end_offset` from
+        // `architecture.md` §7. Mirrors `NodeStatus.last_log_index`
+        // (refreshed on every publish_state call); MAY be ahead of
+        // commit_index when entries have been appended but not yet
+        // replicated to a quorum.
+        registry.register(
+            "xraft_log_end_offset",
+            "Highest log index this node knows about (may be ahead of commit_index).",
+            log_end_offset.clone(),
+        );
 
         Self {
             registry: Mutex::new(registry),
@@ -249,6 +350,11 @@ impl XRaftMetrics {
             replication_lag,
             commit_latency_seconds,
             fetch_requests,
+            snapshot_installs,
+            log_compaction_events,
+            snapshot_duration_seconds,
+            snapshot_size_bytes,
+            log_end_offset,
             status,
         }
     }
@@ -271,6 +377,11 @@ impl XRaftMetrics {
         let leader_gauge = status.leader_id.map(|n| n as i64).unwrap_or(-1);
         self.current_leader.set(leader_gauge);
         self.role.set(role_to_gauge(status.role));
+        // Stage 7.3 — mirror NodeStatus.last_log_index onto
+        // `xraft_log_end_offset`. Published every iteration so
+        // dashboards see the log tip move in real time, even between
+        // commits.
+        self.log_end_offset.set(status.last_log_index as i64);
         self.status.publish(status).await;
     }
 
@@ -319,6 +430,38 @@ impl XRaftMetrics {
         self.fetch_requests
             .get_or_create(&FetchDirectionLabel::from(direction))
             .inc();
+    }
+
+    /// Stage 7.3 — increment `xraft_snapshot_installs_total` by one.
+    /// Called after a successful `Action::InstallSnapshot` (durable
+    /// save + state-machine restore + engine `SnapshotInstalled`
+    /// step). Stale snapshots that are rejected before any state
+    /// mutation do NOT increment this counter.
+    pub fn record_snapshot_install(&self) {
+        self.snapshot_installs.inc();
+    }
+
+    /// Stage 7.3 — increment `xraft_log_compaction_events_total` by one.
+    /// Called after a successful
+    /// `Action::TruncateLog(PrefixThroughInclusive(_))` (the engine's
+    /// post-snapshot prefix compaction step).
+    pub fn record_log_compaction(&self) {
+        self.log_compaction_events.inc();
+    }
+
+    /// Stage 7.3 — observe one background-snapshot duration sample on
+    /// `xraft_snapshot_duration_seconds`. Sampled inside the
+    /// `spawn_blocking` worker so the reported time covers the
+    /// SM serialize + SS save calls only.
+    pub fn observe_snapshot_duration(&self, secs: f64) {
+        self.snapshot_duration_seconds.observe(secs);
+    }
+
+    /// Stage 7.3 — observe one snapshot-size sample (bytes) on
+    /// `xraft_snapshot_size_bytes`. Sampled once per successful
+    /// snapshot alongside [`Self::observe_snapshot_duration`].
+    pub fn observe_snapshot_size(&self, bytes: f64) {
+        self.snapshot_size_bytes.observe(bytes);
     }
 
     /// Borrow the shared [`StatusPublisher`] for the HTTP `/health`
@@ -370,6 +513,23 @@ impl DriverObserver for XRaftMetrics {
 
     fn on_leader_step_down(&self) {
         self.clear_replication_lag();
+    }
+
+    fn on_snapshot_taken(&self, elapsed: Duration, data_size: u64) {
+        // Stage 7.3 — feed both histograms on every successful
+        // snapshot (engine-emitted Action::TakeSnapshot or operator-
+        // triggered TriggerSnapshot). Duration is measured inside the
+        // spawn_blocking worker so it reflects blocking-pool work.
+        self.observe_snapshot_duration(elapsed.as_secs_f64());
+        self.observe_snapshot_size(data_size as f64);
+    }
+
+    fn on_snapshot_installed(&self, _last_included_index: LogIndex) {
+        self.record_snapshot_install();
+    }
+
+    fn on_log_compaction(&self, _through_index: LogIndex) {
+        self.record_log_compaction();
     }
 }
 
@@ -518,5 +678,69 @@ mod tests {
             render.contains("xraft_fetch_requests_total{direction=\"received\"} 1"),
             "render missing received counter: {render}"
         );
+    }
+
+    // ─── Stage 7.3 additions ────────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_state_sets_log_end_offset_gauge() {
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(7)));
+        let mut s = sample_status();
+        s.last_log_index = 4321;
+        metrics.publish_state(s).await;
+        let render = metrics.render().await.unwrap();
+        assert!(
+            render.contains("xraft_log_end_offset 4321"),
+            "render missing log_end_offset gauge: {render}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_install_counter_increments_on_observer_hook() {
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        // Invoke through the DriverObserver trait surface (what the
+        // real driver calls) — not just the convenience helper.
+        DriverObserver::on_snapshot_installed(&*metrics, LogIndex(100));
+        DriverObserver::on_snapshot_installed(&*metrics, LogIndex(200));
+        let render = metrics.render().await.unwrap();
+        assert!(
+            render.contains("xraft_snapshot_installs_total 2"),
+            "render missing snapshot install counter: {render}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn log_compaction_counter_increments_on_observer_hook() {
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        DriverObserver::on_log_compaction(&*metrics, LogIndex(500));
+        DriverObserver::on_log_compaction(&*metrics, LogIndex(750));
+        DriverObserver::on_log_compaction(&*metrics, LogIndex(900));
+        let render = metrics.render().await.unwrap();
+        assert!(
+            render.contains("xraft_log_compaction_events_total 3"),
+            "render missing log compaction counter: {render}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_taken_observer_feeds_duration_and_size_histograms() {
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        DriverObserver::on_snapshot_taken(&*metrics, std::time::Duration::from_millis(42), 1024);
+        DriverObserver::on_snapshot_taken(
+            &*metrics,
+            std::time::Duration::from_secs(2),
+            8 * 1024 * 1024,
+        );
+        let render = metrics.render().await.unwrap();
+        assert!(
+            render.contains("xraft_snapshot_duration_seconds_count 2"),
+            "render missing snapshot duration histogram: {render}"
+        );
+        assert!(render.contains("xraft_snapshot_duration_seconds_sum"));
+        assert!(
+            render.contains("xraft_snapshot_size_bytes_count 2"),
+            "render missing snapshot size histogram: {render}"
+        );
+        assert!(render.contains("xraft_snapshot_size_bytes_sum"));
     }
 }
