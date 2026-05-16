@@ -164,8 +164,7 @@ impl LogStore for MemoryLogStore {
         // Volatile store: dropping in-memory entries is the entire
         // purge. Idempotent — entries.retain on an already-purged
         // store is a cheap no-op walk.
-        self.entries
-            .retain(|e| e.index > through_index_inclusive);
+        self.entries.retain(|e| e.index > through_index_inclusive);
         Ok(())
     }
 }
