@@ -1,10 +1,4 @@
-use std::net::SocketAddr;
-
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
-
-use bytes::Bytes;
 
 use crate::log_entry::LogEntry;
 use crate::types::{NodeId, Term};
