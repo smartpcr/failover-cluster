@@ -927,33 +927,35 @@ async fn fetch_snapshot_streaming() {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario: hostname-listen-addr (iter-2 fix for prior evaluator finding)
+// Scenario: hostname-listen-addr
 // ---------------------------------------------------------------------------
 //
-// `ClusterConfig::validate_address` accepts hostnames such as
-// `localhost:6000`, but the previous `GrpcTransport::start_server`
-// parsed `listen_addr` as `std::net::SocketAddr` *before* binding and
-// rejected any value that wasn't a literal IP. That made a perfectly
-// valid `listen_addr = "localhost:<port>"` fail at startup. The fix
-// delegates binding to `bind_grpc_listener(listen_addr)` (defined in
-// `xraft-transport/src/grpc.rs`), which calls
-// `std::net::TcpListener::bind(&str)` so DNS-resolved hostnames work
-// uniformly across `start_server` and `xraft_server::Server::start`.
-// This test reserves a port via `pick_free_port_via_hostname` (so the
-// reservation and the subsequent server bind share an address
-// family), configures `listen_addr = "localhost:<port>"`, starts the
-// server through `start_server` to exercise the hostname-resolution
-// path end-to-end, and proves a real RPC succeeds against the
-// hostname-configured listener.
+// Drives the production hostname-resolution path end-to-end:
+//
+//   - port picker:  `pick_free_port_via_hostname`  (binds `localhost:0`
+//     via `std::net::TcpListener::bind`, captures the OS-assigned port,
+//     drops the listener; the immediate-rebind window is intentional
+//     here so the server itself goes through the hostname code path)
+//   - server bind:  `GrpcTransport::start_server` → `bind_grpc_listener`
+//     (`xraft-transport/src/grpc.rs`), which calls
+//     `std::net::TcpListener::bind(&str)` and walks every
+//     `ToSocketAddrs`-resolved address until one binds — the SAME
+//     helper `xraft_server::Server::start` uses
+//   - readiness probe: `wait_for_listening_str(&listen, ..)`, which
+//     walks every resolved address family until one accepts (so a
+//     dual-stack `::1` ↔ `127.0.0.1` mismatch does not race the test)
+//
+// Asserts: a real Vote RPC over the hostname-configured listener
+// completes successfully, proving hostname `listen_addr` values are
+// accepted from `ClusterConfig` all the way through to a live
+// listener.
 
 #[tokio::test]
 async fn start_server_accepts_hostname_listen_addr() {
-    // Pick the port via the SAME hostname bind path the server will
-    // use, so the port is provably free on whichever address family
-    // (`::1` or `127.0.0.1`) the resolver hands us. The previous
-    // version picked a 127.0.0.1-bound port, then asked the server to
-    // bind `localhost:{port}` — on IPv6-preferring systems that
-    // mismatch made the test race itself.
+    // `pick_free_port_via_hostname` binds `localhost:0` so the port is
+    // provably free on whichever address family (`::1` or `127.0.0.1`)
+    // the resolver hands us — the SAME family the subsequent server
+    // bind through `bind_grpc_listener("localhost:{port}")` will pick.
     let port = pick_free_port_via_hostname();
     let other_port = pick_free_port_via_hostname();
     let listen = format!("localhost:{port}");
@@ -962,7 +964,7 @@ async fn start_server_accepts_hostname_listen_addr() {
     let cluster = ClusterConfig {
         cluster_id: TEST_CLUSTER_ID.to_string(),
         node_id: NodeId(SERVER_NODE_ID),
-        // Hostname-form listen_addr — the gap the iter-1 evaluator flagged.
+        // Hostname-form listen_addr (not a literal SocketAddr).
         listen_addr: listen.clone(),
         peers: Vec::new(),
         voters: vec![
