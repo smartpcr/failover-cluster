@@ -26,21 +26,16 @@ use xraft_server::{Server, ServerConfig, ServerHandle};
 /// of a single-voter cluster.
 const LIFECYCLE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Drain `handle.join()` and panic on ANY unexpected outcome.
+/// Joins `handle` within [`LIFECYCLE_SHUTDOWN_TIMEOUT`] and
+/// asserts the outcome.
 ///
-/// Outcome handling:
-/// * `Ok(())` from [`ServerHandle::join`] — clean shutdown,
-///   returns silently.
-/// * `Err(XRaftError)` matching the Windows tempdir-teardown
-///   race (via [`is_allowed_teardown_noise`]) — logged to
-///   stderr with the call `label` for diagnosability but does
-///   NOT fail the test, since this race occurs after all
-///   replicated state has been durably persisted.
-/// * Any other `Err(XRaftError)` — PANICS with the `label` so
-///   the test author sees which call site surfaced the error.
-/// * Timeout after [`LIFECYCLE_SHUTDOWN_TIMEOUT`] — PANICS so
-///   shutdown deadlocks are visible instead of vanishing into
-///   a discarded timeout future.
+/// Outcomes:
+/// * `Ok(())` — returns silently.
+/// * `Err(e)` for which [`is_allowed_teardown_noise`] returns
+///   `true` — logs `e` and `label` to stderr; does not panic.
+/// * Any other `Err(e)` — panics with `label` and `e`.
+/// * Timeout — panics with `label` and
+///   [`LIFECYCLE_SHUTDOWN_TIMEOUT`].
 async fn assert_clean_shutdown(handle: ServerHandle, label: &str) {
     match tokio::time::timeout(LIFECYCLE_SHUTDOWN_TIMEOUT, handle.join()).await {
         Ok(Ok(())) => {}

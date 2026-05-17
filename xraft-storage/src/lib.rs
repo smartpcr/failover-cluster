@@ -30,15 +30,3 @@ pub use snapshot_store::{
 // wired in here).
 pub use hard_state::{FileHardStateStore, MemoryHardStateStore};
 pub use log::{FileLogStore, MemoryLogStore};
-
-// Stage 7.3 (iter-5) leader-epoch-checkpoint surface. Re-export the
-// Kafka-compatible checkpoint helpers so the canonical names live in
-// the crate's public API and a `cargo doc --no-deps` lists them under
-// `xraft_storage::`. `architecture.md` §6 + `implementation-plan.md`
-// §357,367 require this surface even though the engine hasn't yet
-// wired it into the WAL recovery path (engine-leader-epoch-recovery
-// open question).
-pub use log::{
-    LEADER_EPOCH_CHECKPOINT_FILE, LeaderEpochEntry, read_leader_epoch_checkpoint,
-    write_leader_epoch_checkpoint,
-};

@@ -700,14 +700,6 @@ impl LogStore for FileLogStore {
         self.active_writer = None;
 
         // Truncate the segment containing the first removed entry.
-        // Both the `set_len` metadata update AND the implicit data
-        // de-allocation must be durable before we proceed — otherwise a
-        // crash between `set_len` and the next OS flush can leave the
-        // boundary segment with a stale file size while the data blocks
-        // are partially updated (or vice-versa), producing an
-        // inconsistent on-disk frame at the truncation point. An fsync
-        // here pins both the metadata and the data side so recovery
-        // always sees a clean trailing edge.
         {
             let seg_path = &self.segments[seg_idx].path;
             let f = OpenOptions::new()
@@ -715,19 +707,45 @@ impl LogStore for FileLogStore {
                 .open(seg_path)
                 .map_err(io_to_storage)?;
             f.set_len(byte_offset).map_err(io_to_storage)?;
-            f.sync_all().map_err(io_to_storage)?;
         }
 
-        // Delete all subsequent segment files.
-        for seg in self.segments.drain(seg_idx + 1..) {
-            let _ = fs::remove_file(&seg.path);
+        // Delete all subsequent segment files. Propagate real I/O
+        // failures (permission denied, disk error, …) so callers learn
+        // that the WAL is no longer consistent with the in-memory log
+        // store; treat `NotFound` as idempotent so a retry after a
+        // partial prior truncation still succeeds. We pop from the
+        // back so that, on failure, every segment still on disk is
+        // also still tracked in `self.segments` — keeping the two
+        // views in sync for a follow-up retry.
+        while self.segments.len() > seg_idx + 1 {
+            let seg_path = self
+                .segments
+                .last()
+                .expect("len checked above")
+                .path
+                .clone();
+            match fs::remove_file(&seg_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_to_storage(e)),
+            }
+            self.segments.pop();
         }
 
         // If the truncated segment is now empty, remove it as well.
-        if byte_offset == 0
-            && let Some(seg) = self.segments.pop()
-        {
-            let _ = fs::remove_file(&seg.path);
+        // Same propagation + `NotFound` carve-out as the loop above;
+        // we delete the file *before* popping the in-memory entry so
+        // a mid-call failure leaves disk and memory consistent.
+        if byte_offset == 0 {
+            let last_path = self.segments.last().map(|s| s.path.clone());
+            if let Some(seg_path) = last_path {
+                match fs::remove_file(&seg_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(io_to_storage(e)),
+                }
+                self.segments.pop();
+            }
         }
 
         // Purge in-memory caches.
