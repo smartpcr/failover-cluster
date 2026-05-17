@@ -515,6 +515,12 @@ impl AdminServer {
         self.shutdown.notify_one();
     }
 
+    /// Fail-stop the admin server by aborting its serve task at the
+    /// next `.await` point. Used by [`crate::ServerHandle::abort`].
+    pub fn abort(&self) {
+        self.serve_task.abort();
+    }
+
     /// Await graceful exit of the serve task.
     pub async fn join(self) -> Result<(), XRaftError> {
         match self.serve_task.await {

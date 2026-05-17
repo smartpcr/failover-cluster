@@ -3,9 +3,24 @@ name = "xraft-test"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 xraft-core = { path = "../xraft-core" }
 xraft-storage = { path = "../xraft-storage" }
+xraft-server = { path = "../xraft-server" }
+xraft-transport = { path = "../xraft-transport" }
+xraft-client = { path = "../xraft-client" }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 rand = { workspace = true }
+bytes = { workspace = true }
+bincode = { workspace = true }
+uuid = { workspace = true }
+tempfile = "3"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true }
