@@ -622,11 +622,34 @@ mod tests {
     // orders and asserts each link's per-roll outcome is identical
     // across both orderings — that is, link L's i-th roll is the
     // same whether L is the first, second, or third link to sample.
+    //
+    // NOTE: `route_decision` is called without any registered
+    // handlers, so a non-dropped packet falls through to the
+    // "no simulated handler" lookup miss instead of returning `Ok`.
+    // The test classifies each roll by inspecting the error MESSAGE,
+    // not the `Result` discriminant — drops surface as a
+    // `Transport("simulated packet drop ...")` error while
+    // non-drops surface as `Transport("no simulated handler ...")`.
+    // This is the only way to distinguish the two without spinning
+    // up a real driver per link; an earlier version of this test
+    // used `is_err()` and was therefore vacuously true for every
+    // roll.
     #[test]
     fn per_link_rng_is_independent_of_interleaving() {
+        // Returns `true` iff the routing decision was a simulated
+        // drop. A `false` either means the drop RNG declined OR the
+        // routing reached the handler-lookup step (which fails here
+        // because no handlers are registered). Either way, `false`
+        // means the drop dice fell on "deliver", which is exactly
+        // what we need to compare across interleavings.
         fn rolls(network: &SimulatedNetwork, link: (NodeId, NodeId), n: usize) -> Vec<bool> {
             (0..n)
-                .map(|_| network.route_decision(link.0, link.1).is_err())
+                .map(|_| {
+                    matches!(
+                        network.route_decision(link.0, link.1),
+                        Err(XRaftError::Transport(ref msg)) if msg.contains("simulated packet drop")
+                    )
+                })
                 .collect()
         }
 
@@ -669,6 +692,27 @@ mod tests {
         assert_eq!(
             a_23, b_23,
             "link 2→3 drop sequence must be independent of when 1→2 / 1→3 rolled"
+        );
+
+        // Sanity check: with `drop_pct = 50` over 10 rolls per link,
+        // a healthy RNG must produce BOTH drops and deliveries on at
+        // least one link. If every entry in every vector is the
+        // same boolean, the classifier above is bypassed and the
+        // cross-ordering equality is again vacuous. (Probability of
+        // a 30-roll all-true OR all-false sequence at 50% is ~2e-9.)
+        let all_rolls: Vec<bool> = a_12
+            .iter()
+            .chain(a_13.iter())
+            .chain(a_23.iter())
+            .copied()
+            .collect();
+        let drops = all_rolls.iter().filter(|b| **b).count();
+        let delivers = all_rolls.iter().filter(|b| !**b).count();
+        assert!(
+            drops > 0 && delivers > 0,
+            "at drop_pct=50 the classifier must observe BOTH drops and deliveries \
+             (got drops={drops}, delivers={delivers}); otherwise the cross-ordering \
+             equality is vacuous"
         );
     }
 
