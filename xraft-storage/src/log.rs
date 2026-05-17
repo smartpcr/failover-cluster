@@ -630,6 +630,19 @@ impl LogStore for FileLogStore {
                      and must not be written to WAL segment files",
                 ));
             }
+            // Purge low-watermark: any append at `index <= first_valid_index`
+            // is for an entry that `purge_prefix` has logically deleted.
+            // Silently skip — do NOT persist to disk and do NOT insert into
+            // the in-memory maps. Matches the durable-recovery filter at
+            // `recover_segment` (the marker would suppress these on the next
+            // restart anyway) and mirrors `MemoryLogStore`'s
+            // `memory_reappend_below_purge_floor_stays_invisible` semantics:
+            // out-of-order appends below the floor stay invisible to every
+            // read path within the same process lifetime, not just across
+            // restarts.
+            if entry.index <= self.first_valid_index {
+                continue;
+            }
             let frame = Self::encode_frame(entry);
 
             if self.should_rotate(frame.len()) {
@@ -656,16 +669,22 @@ impl LogStore for FileLogStore {
     }
 
     fn get(&self, index: LogIndex) -> Result<Option<Entry>> {
-        if index.0 == 0 {
+        if index.0 == 0 || index <= self.first_valid_index {
             return Ok(None);
         }
         Ok(self.entries.get(&index).cloned())
     }
 
     fn get_range(&self, start: LogIndex, end: LogIndex) -> Result<Vec<Entry>> {
+        // Defensive filter: even though `append` and `purge_prefix` keep
+        // `self.entries` consistent with the floor, force every read API
+        // through the same `> first_valid_index` predicate so any future
+        // append/purge bug surfaces here instead of silently leaking a
+        // compacted entry.
         Ok(self
             .entries
             .range(start..end)
+            .filter(|(_, e)| e.index > self.first_valid_index)
             .map(|(_, e)| e.clone())
             .collect())
     }
@@ -673,16 +692,18 @@ impl LogStore for FileLogStore {
     fn last_index(&self) -> LogIndex {
         self.entries
             .keys()
-            .next_back()
+            .rev()
+            .find(|i| **i > self.first_valid_index)
             .copied()
             .unwrap_or(LogIndex(0))
     }
 
     fn last_term(&self) -> Term {
         self.entries
-            .values()
-            .next_back()
-            .map_or(Term(0), |e| e.term)
+            .iter()
+            .rev()
+            .find(|(i, _)| **i > self.first_valid_index)
+            .map_or(Term(0), |(_, e)| e.term)
     }
 
     fn truncate_from(&mut self, index: LogIndex) -> Result<()> {
@@ -730,6 +751,9 @@ impl LogStore for FileLogStore {
     }
 
     fn term_at(&self, index: LogIndex) -> Result<Option<Term>> {
+        if index <= self.first_valid_index {
+            return Ok(None);
+        }
         Ok(self.entries.get(&index).map(|e| e.term))
     }
 
@@ -1467,5 +1491,71 @@ mod tests {
             assert_eq!(e.index, LogIndex(i));
         }
         assert_eq!(log.last_index(), LogIndex(20));
+    }
+
+    /// FileLogStore: analogue of
+    /// `memory_reappend_below_purge_floor_stays_invisible`. After
+    /// `purge_prefix(N)` an out-of-order `append` at an index `<= N`
+    /// MUST stay invisible to every read API within the SAME process
+    /// lifetime — i.e. without a restart / recovery to scrub it.
+    /// This is the bypass the in-memory `first_valid_index` filter
+    /// closes for the file-backed store: previously, `append` would
+    /// re-insert into `entries` / `offsets` and the re-appended entry
+    /// would surface from `get` / `get_range` / `term_at` /
+    /// `last_index` / `last_term` until the next process restart.
+    /// Regression test for evaluator feedback on
+    /// `xraft-storage/src/log.rs` (FileLogStore purge watermark).
+    #[test]
+    fn file_reappend_below_purge_floor_stays_invisible() {
+        let dir = test_dir("file_reappend_below_purge_floor_stays_invisible");
+        let mut log = FileLogStore::open(&dir).unwrap();
+        let entries: Vec<Entry> = (1..=10).map(|i| make_entry(i, 1)).collect();
+        log.append(&entries).unwrap();
+        log.flush().unwrap();
+
+        log.purge_prefix(LogIndex(5)).unwrap();
+
+        // Out-of-order re-append at an index covered by the purge
+        // floor. Use a distinctive term so any leak would be obvious.
+        log.append(&[make_entry(3, 99)]).unwrap();
+        log.flush().unwrap();
+
+        assert!(
+            log.get(LogIndex(3)).unwrap().is_none(),
+            "re-appended entry at purged index must stay invisible to get()",
+        );
+        assert!(
+            log.term_at(LogIndex(3)).unwrap().is_none(),
+            "re-appended entry at purged index must stay invisible to term_at()",
+        );
+
+        let range = log.get_range(LogIndex(1), LogIndex(6)).unwrap();
+        for e in &range {
+            assert!(
+                e.index > LogIndex(5),
+                "get_range returned entry at index {} (must be > purge floor 5)",
+                e.index.0,
+            );
+        }
+        assert_eq!(
+            range.len(),
+            0,
+            "no entry in [1, 6) should survive the purge floor",
+        );
+
+        // The resurrected entry at index 3 with term 99 must not
+        // hijack the reported tail.
+        assert_eq!(log.last_index(), LogIndex(10));
+        assert_eq!(log.last_term(), Term(1));
+
+        // And the suppression must also survive a restart — i.e.
+        // the in-memory filter and the durable `purge.idx` marker
+        // agree on which indices are dead. Reopen and re-check.
+        drop(log);
+        let log = FileLogStore::open(&dir).unwrap();
+        assert!(log.get(LogIndex(3)).unwrap().is_none());
+        assert!(log.term_at(LogIndex(3)).unwrap().is_none());
+        assert_eq!(log.last_index(), LogIndex(10));
+        assert_eq!(log.last_term(), Term(1));
     }
 }

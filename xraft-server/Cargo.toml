@@ -46,6 +46,12 @@ uuid = { workspace = true }
 # 0.5 minor release without enabling any extra features.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Stage 6.2 iter 4: the router+ConnectionPool integration test uses
+# `futures::stream::iter` to build a no-op `SnapshotChunkStream` for
+# the local stub `RaftMessageHandler`. The handler's
+# `handle_fetch_snapshot` arm is unreachable in these tests, but the
+# trait method still has to compile against an empty stream value.
+futures = "0.3"
 
 [target.'cfg(unix)'.dev-dependencies]
 # `nix` is only used by the Unix integration test that exercises the real
