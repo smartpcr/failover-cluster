@@ -97,6 +97,77 @@ impl fmt::Debug for ConnectionPool {
     }
 }
 
+/// Stage 6.2 (evaluator iter 3 follow-up): the outcome of
+/// [`ConnectionPool::fetch_via_leader`], coupling the final
+/// [`xraft_core::message::FetchResponse`] with the [`NodeId`] of
+/// the peer that actually produced it.
+///
+/// The responder MAY differ from the `prefer` argument the caller
+/// supplied:
+///
+/// * On the no-redirect path the responder is the target the pool
+///   initially selected (cached hint or `prefer`).
+/// * On the one-hop redirect path the responder is the advertised
+///   leader the pool re-queried after the initial target replied
+///   with `is_leader == false`.
+///
+/// Surfacing the responder lets the call-site attribute the reply
+/// to the node that actually handled it — important for downstream
+/// metrics, observability, and any fencing that depends on which
+/// peer produced a given response (e.g., the driver's
+/// `OutboundResult::Fetch { peer, .. }` docs require `peer` to be
+/// the responder, not the originally-requested node).
+#[derive(Debug)]
+pub struct FetchOutcome {
+    /// The peer that produced [`Self::response`] — post-redirect
+    /// when a one-hop redirect was followed, otherwise the initial
+    /// target.
+    pub responder: NodeId,
+    /// The final response observed.
+    pub response: xraft_core::message::FetchResponse,
+}
+
+/// Stage 6.2 (evaluator iter 3 follow-up): pure target-selection
+/// helper used by [`ConnectionPool::fetch_via_leader`].
+///
+/// Returns the [`NodeId`] the pool should issue the *initial*
+/// `Fetch` against, applying the **epoch-fenced hint precedence
+/// rule** the evaluator called out:
+///
+/// * `hint` wins only when its cached `epoch` is **strictly greater
+///   than** `request_epoch` AND the hinted leader is in the
+///   configured roster. Strictly-greater (not `>=`) is the only
+///   safe choice — equal epochs mean both the pool and the engine
+///   observed the same term, and by Raft's election-safety property
+///   at most one leader exists per term, so any disagreement is
+///   necessarily stale or buggy; the engine's own choice (`prefer`)
+///   is authoritative in that case. An older cached hint
+///   (`hint_epoch < request_epoch`) is by definition stale — the
+///   engine has already advanced past it — and MUST not be allowed
+///   to route the follower away from the leader the Raft engine
+///   already knows.
+/// * Otherwise the engine-selected `prefer` is used (the engine has
+///   the authoritative log + term state).
+///
+/// This function is total and side-effect-free; the routing
+/// decision is exercised directly by unit tests without needing to
+/// stand up a real RPC server.
+pub(crate) fn select_fetch_target(
+    prefer: NodeId,
+    hint: Option<(NodeId, u64)>,
+    request_epoch: u64,
+    peer_endpoints: &HashMap<NodeId, String>,
+) -> NodeId {
+    match hint {
+        Some((hint_id, hint_epoch))
+            if hint_epoch > request_epoch && peer_endpoints.contains_key(&hint_id) =>
+        {
+            hint_id
+        }
+        _ => prefer,
+    }
+}
+
 impl ConnectionPool {
     /// Build a pool directly from an [`Arc<RaftGrpcClient>`] and a
     /// pre-resolved peer roster. Used by
@@ -283,60 +354,82 @@ impl ConnectionPool {
         Ok(Some(self.peer_client(leader)?))
     }
 
-    /// Stage 6.2 (evaluator feedback iter 1 item 4): transparent
-    /// leader redirect for `Fetch` RPCs.
+    /// Stage 6.2 (evaluator feedback iter 1 item 4 +
+    /// iter 3 follow-up): transparent leader redirect for `Fetch`
+    /// RPCs, with epoch-fenced hint precedence and explicit
+    /// responder attribution.
     ///
     /// Implements the **at-most-one-redirect** routing protocol the
     /// consensus layer expects:
     ///
-    /// 1. Resolve the target node:
-    ///    * if a leader hint is cached and the hinted leader is in
-    ///      the configured roster, target = hint;
-    ///    * otherwise target = `prefer` (the caller's best guess,
-    ///      typically a fixed bootstrap peer or the previous fetch
-    ///      target).
+    /// 1. Resolve the target node via [`select_fetch_target`]:
+    ///    * if a leader hint is cached AND its epoch is **strictly
+    ///      greater than** `request.leader_epoch` AND the hinted
+    ///      leader is in the configured roster, target = hint;
+    ///    * otherwise target = `prefer` (the engine's chosen peer
+    ///      for this fetch). The engine is authoritative whenever
+    ///      its `leader_epoch` is `>=` the cached hint's, so a
+    ///      stale cached hint can NEVER route the follower away
+    ///      from the leader the Raft engine already knows.
     /// 2. Issue the `Fetch` against the target.
     /// 3. On reply, classify:
-    ///    * `is_leader == true` — done; return `Ok(response)`. The
-    ///      per-peer hint cache has already been updated (gated by
-    ///      `is_leader`) by [`PeerClient::fetch`], so the next call
-    ///      will route directly.
+    ///    * `is_leader == true` — done; return [`FetchOutcome`]
+    ///      with `responder = target`. The per-peer hint cache has
+    ///      already been updated (gated by `is_leader`) by
+    ///      [`PeerClient::fetch`], so the next call will route
+    ///      directly.
     ///    * `is_leader == false` AND `leader_id != target` AND
     ///      `leader_id` is in the roster — the responder is telling
     ///      us who the real leader is. Re-issue the request once
     ///      against `leader_id`. The redirect is **bounded to a
     ///      single hop** so a confused-cluster (every node
-    ///      redirecting to the next) cannot loop the caller.
-    ///    * otherwise — return the response as-is; the caller can
-    ///      backoff and retry (we deliberately do NOT swallow a
-    ///      `is_leader=false` response into an error so the engine
-    ///      driver can still apply the divergence / snapshot
-    ///      signalling the response carries).
+    ///      redirecting to the next) cannot loop the caller; the
+    ///      returned [`FetchOutcome::responder`] is the
+    ///      redirect-target peer that produced the final response.
+    ///    * otherwise — return the response as-is with
+    ///      `responder = target`; the caller can backoff and retry
+    ///      (we deliberately do NOT swallow a `is_leader=false`
+    ///      response into an error so the engine driver can still
+    ///      apply the divergence / snapshot signalling the response
+    ///      carries).
     ///
-    /// Returns the final [`FetchResponse`] (post-redirect when
-    /// applicable). Errors from the underlying transport propagate
-    /// unchanged.
+    /// Errors from the underlying transport propagate unchanged.
+    /// On error there is no responder; the caller's
+    /// [`OutboundResult::Error`]-style attribution should fall back
+    /// to the original `prefer` (the dispatch peer) so error
+    /// accounting stays consistent with the engine's view.
     ///
     /// Concurrency: the method clones the [`FetchRequest`] before
     /// the redirect so a retry against a different peer reuses the
     /// same request value. `FetchRequest` is small (single struct
-    /// with `u64` fields plus an optional `Vec<u8>` token) so the
+    /// with `u64` fields plus a `Vec<u8>` for `cluster_id`) so the
     /// clone is cheap.
     pub async fn fetch_via_leader(
         &self,
         prefer: NodeId,
         request: xraft_core::message::FetchRequest,
-    ) -> XResult<xraft_core::message::FetchResponse> {
-        // Pick the target: cached hint wins when the hinted leader
-        // is in the roster; otherwise fall back to `prefer`.
-        let target = match self.leader_hint() {
-            Some(id) if self.peer_endpoints.contains_key(&id) => id,
-            _ => prefer,
-        };
+    ) -> XResult<FetchOutcome> {
+        // Stage 6.2 iter 3 follow-up: epoch-fenced target selection.
+        // A cached hint with `epoch <= request.leader_epoch` is
+        // either equal-to (Raft elects exactly one leader per term,
+        // so a disagreeing same-epoch hint is necessarily stale or
+        // buggy) or strictly older than the engine's view, so the
+        // engine's `prefer` wins in both cases. Only a strictly-
+        // newer cached hint observation is allowed to override the
+        // engine's choice.
+        let target = select_fetch_target(
+            prefer,
+            self.leader_hint_entry(),
+            request.leader_epoch,
+            &self.peer_endpoints,
+        );
         let target_client = self.peer_client(target)?;
         let response = target_client.fetch(request.clone()).await?;
         if response.is_leader {
-            return Ok(response);
+            return Ok(FetchOutcome {
+                responder: target,
+                response,
+            });
         }
         // Hop once toward the responder-advertised leader, but only
         // when (a) the responder actually points somewhere else,
@@ -344,13 +437,23 @@ impl ConnectionPool {
         // would not be re-querying the same node.
         let advertised = response.leader_id;
         if advertised == target {
-            return Ok(response);
+            return Ok(FetchOutcome {
+                responder: target,
+                response,
+            });
         }
         if !self.peer_endpoints.contains_key(&advertised) {
-            return Ok(response);
+            return Ok(FetchOutcome {
+                responder: target,
+                response,
+            });
         }
         let leader_client = self.peer_client(advertised)?;
-        leader_client.fetch(request).await
+        let final_response = leader_client.fetch(request).await?;
+        Ok(FetchOutcome {
+            responder: advertised,
+            response: final_response,
+        })
     }
 }
 
@@ -781,5 +884,122 @@ mod tests {
         // cached value — "without additional discovery."
         assert_eq!(pool.leader_hint(), Some(NodeId(2)));
         assert_eq!(pool.leader_hint(), Some(NodeId(2)));
+    }
+
+    // ---------------------------------------------------------------
+    // Stage 6.2 (evaluator iter 3 follow-up): epoch-fenced target
+    // selection — unit tests for the pure `select_fetch_target`
+    // helper. Each test exercises ONE branch of the rule so a
+    // regression is localised to the case that broke.
+    //
+    // The rule is "cached hint wins only when its epoch is STRICTLY
+    // greater than the request's leader_epoch AND the hinted leader
+    // is in the configured roster; otherwise the engine-selected
+    // `prefer` target wins." These tests are deliberately pure
+    // (no RPCs) so they ship as fast feedback when the rule is
+    // tweaked.
+    // ---------------------------------------------------------------
+
+    /// Helper: build the roster `{2, 3}` used by all
+    /// `select_fetch_target` tests.
+    fn roster_2_3() -> HashMap<NodeId, String> {
+        let mut m = HashMap::new();
+        m.insert(NodeId(2), "http://10.0.0.2:6000".to_string());
+        m.insert(NodeId(3), "http://10.0.0.3:6000".to_string());
+        m
+    }
+
+    #[test]
+    fn select_fetch_target_uses_engine_prefer_when_no_hint() {
+        // No cached hint at all — the engine's `prefer` is the only
+        // input we trust. This is the cold-start case immediately
+        // after bootstrap, before any FetchResponse has been
+        // observed.
+        let roster = roster_2_3();
+        assert_eq!(
+            select_fetch_target(NodeId(3), None, /* request_epoch = */ 5, &roster),
+            NodeId(3),
+            "no hint => prefer wins"
+        );
+    }
+
+    #[test]
+    fn select_fetch_target_uses_cached_hint_when_strictly_newer() {
+        // Cached hint at epoch 10, engine's request at epoch 5 —
+        // the pool observed a newer leader than the engine (rare
+        // but possible if a parallel RPC heard the higher term
+        // first). The hint wins.
+        let roster = roster_2_3();
+        assert_eq!(
+            select_fetch_target(
+                NodeId(3),
+                Some((NodeId(2), 10)),
+                /* request_epoch = */ 5,
+                &roster
+            ),
+            NodeId(2),
+            "strictly-newer hint epoch => hint wins"
+        );
+    }
+
+    #[test]
+    fn select_fetch_target_uses_engine_prefer_when_hint_epoch_is_stale() {
+        // Cached hint at epoch 3, engine's request at epoch 7 —
+        // the engine has already advanced past the cached
+        // observation. Trusting the hint here would route the
+        // follower BACK to a deposed leader (the exact regression
+        // the evaluator called out). Engine's `prefer` MUST win.
+        let roster = roster_2_3();
+        assert_eq!(
+            select_fetch_target(
+                NodeId(3),
+                Some((NodeId(2), 3)),
+                /* request_epoch = */ 7,
+                &roster
+            ),
+            NodeId(3),
+            "stale hint epoch => engine's prefer wins (no stale-route regression)"
+        );
+    }
+
+    #[test]
+    fn select_fetch_target_uses_engine_prefer_when_hint_epoch_is_equal() {
+        // Cached hint at epoch 5, engine's request at epoch 5 —
+        // both observed the same term. Raft's election-safety
+        // property guarantees at most one leader per term, so a
+        // disagreement here is necessarily stale or buggy and the
+        // engine's authoritative choice wins. (The cached hint may
+        // even AGREE with `prefer`, but the rule applies uniformly:
+        // strict `>`, not `>=`.)
+        let roster = roster_2_3();
+        assert_eq!(
+            select_fetch_target(
+                NodeId(3),
+                Some((NodeId(2), 5)),
+                /* request_epoch = */ 5,
+                &roster
+            ),
+            NodeId(3),
+            "equal-epoch hint => engine's prefer wins (Raft single-leader-per-term rule)"
+        );
+    }
+
+    #[test]
+    fn select_fetch_target_uses_engine_prefer_when_hint_target_not_in_roster() {
+        // Cached hint at epoch 99 (very fresh) but pointing to a
+        // node-id that is NOT in the configured roster (e.g., a
+        // peer that was removed from the cluster). The hint is
+        // unusable; engine's `prefer` wins.
+        let roster = roster_2_3();
+        assert_eq!(
+            select_fetch_target(
+                NodeId(3),
+                Some((NodeId(42), 99)),
+                /* request_epoch = */ 5,
+                &roster
+            ),
+            NodeId(3),
+            "hint pointing outside the roster => engine's prefer wins"
+        );
     }
 }

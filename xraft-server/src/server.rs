@@ -151,6 +151,19 @@ pub struct ServerHandle {
     /// inspect the configured peer roster without re-deriving
     /// from [`ClusterConfig`]. Drops with the handle.
     pub connection_pool: ConnectionPool,
+    /// Stage 6.2 (evaluator iter 3 follow-up): captured at server
+    /// assembly time from the `Driver::is_pool_attached()` accessor
+    /// **before** [`Driver::run`] consumed the driver. `true` iff
+    /// the assembly path actually called
+    /// [`Driver::with_connection_pool`] — i.e. the production
+    /// outbound `FetchRequest` path goes through
+    /// [`ConnectionPool::fetch_via_leader`] instead of the raw
+    /// [`xraft_core::transport::Transport::send_fetch`]. Tests
+    /// assert on [`Self::driver_pool_attached`] to guard against a
+    /// future change silently deleting the
+    /// `with_connection_pool(connection_pool.clone())` call from
+    /// [`Server::start_with_state_machine`].
+    driver_pool_attached: bool,
     /// Shared metrics handle. Borrow-able by tests via
     /// [`ServerHandle::metrics`] to assert on observed state.
     metrics: Arc<XRaftMetrics>,
@@ -201,6 +214,24 @@ impl ServerHandle {
     /// Borrow the driver handle for in-process `propose` calls.
     pub fn driver_handle(&self) -> DriverHandle {
         self.driver_handle.clone()
+    }
+
+    /// Stage 6.2 (evaluator iter 3 follow-up): assembly-time
+    /// indicator proving that [`Server::start_with_state_machine`]
+    /// wired the shared [`ConnectionPool`] into the driver's
+    /// outbound [`MessageRouter`] (i.e. the engine's
+    /// `FetchRequest` dispatches go through
+    /// [`ConnectionPool::fetch_via_leader`] with redirect-aware
+    /// routing). Captured **before** the driver was consumed by
+    /// `tokio::spawn(driver.run())`, so the value reflects the real
+    /// `Driver::is_pool_attached()` state at the moment of
+    /// assembly — not a hard-coded constant.
+    ///
+    /// Tests use this to guard against a future refactor silently
+    /// deleting the `with_connection_pool(connection_pool.clone())`
+    /// line from the assembly path.
+    pub fn driver_pool_attached(&self) -> bool {
+        self.driver_pool_attached
     }
 
     /// Embedded API (Stage 6.2) — submit `command` to the leader's log
@@ -931,6 +962,15 @@ impl Server {
         .with_connection_pool(connection_pool.clone());
 
         let driver_handle = driver.handle();
+        // Stage 6.2 (evaluator iter 3 follow-up): capture the
+        // pool-attached state from the actual driver instance
+        // BEFORE `tokio::spawn(driver.run())` consumes it. Tests
+        // assert on `ServerHandle::driver_pool_attached()` to prove
+        // the assembly path actually called
+        // `.with_connection_pool(connection_pool.clone())` above —
+        // a hard-coded `true` would let a future refactor silently
+        // delete that call without failing a test.
+        let driver_pool_attached = driver.is_pool_attached();
         let driver_task = tokio::spawn(async move { driver.run().await });
 
         // ------------------------------------------------------- 8. spawn admin
@@ -955,6 +995,7 @@ impl Server {
             admin_addr,
             grpc_listen_addr: grpc_listen,
             connection_pool,
+            driver_pool_attached,
             metrics,
             driver_handle,
             transport_shutdown,
