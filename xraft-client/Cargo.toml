@@ -45,3 +45,13 @@ futures-util = "0.3"
 # real gRPC traffic; the stub handler emits a `SnapshotChunkStream`
 # (impl-Trait over `Stream`) that needs `futures::stream::iter`.
 futures = "0.3"
+# `TcpListenerStream` wrapper used by the redirect integration test to
+# hand a pre-bound `tokio::net::TcpListener` to
+# `tonic::transport::Server::serve_with_incoming_shutdown`. Eliminates
+# the bind race in `pick_free_port` -> `spawn_plain_server` (between
+# closing the probe listener and re-binding the same address inside the
+# spawned task) that produced the iter 6 post-pass gate flake
+# "Fetch connect to peer 2 after 9 attempts: transport error". Matches
+# the production server's pre-bound-listener pattern in
+# xraft-transport/src/grpc.rs::start_server_with_listener.
+tokio-stream = { version = "0.1", features = ["net"] }
