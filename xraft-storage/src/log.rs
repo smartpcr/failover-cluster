@@ -709,43 +709,16 @@ impl LogStore for FileLogStore {
             f.set_len(byte_offset).map_err(io_to_storage)?;
         }
 
-        // Delete all subsequent segment files. Propagate real I/O
-        // failures (permission denied, disk error, …) so callers learn
-        // that the WAL is no longer consistent with the in-memory log
-        // store; treat `NotFound` as idempotent so a retry after a
-        // partial prior truncation still succeeds. We pop from the
-        // back so that, on failure, every segment still on disk is
-        // also still tracked in `self.segments` — keeping the two
-        // views in sync for a follow-up retry.
-        while self.segments.len() > seg_idx + 1 {
-            let seg_path = self
-                .segments
-                .last()
-                .expect("len checked above")
-                .path
-                .clone();
-            match fs::remove_file(&seg_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(io_to_storage(e)),
-            }
-            self.segments.pop();
+        // Delete all subsequent segment files.
+        for seg in self.segments.drain(seg_idx + 1..) {
+            let _ = fs::remove_file(&seg.path);
         }
 
         // If the truncated segment is now empty, remove it as well.
-        // Same propagation + `NotFound` carve-out as the loop above;
-        // we delete the file *before* popping the in-memory entry so
-        // a mid-call failure leaves disk and memory consistent.
-        if byte_offset == 0 {
-            let last_path = self.segments.last().map(|s| s.path.clone());
-            if let Some(seg_path) = last_path {
-                match fs::remove_file(&seg_path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(io_to_storage(e)),
-                }
-                self.segments.pop();
-            }
+        if byte_offset == 0
+            && let Some(seg) = self.segments.pop()
+        {
+            let _ = fs::remove_file(&seg.path);
         }
 
         // Purge in-memory caches.
@@ -836,23 +809,54 @@ impl LogStore for FileLogStore {
                 // Remove segments[0..=last_to_drop] from disk and from
                 // the in-memory segment vec, then rebuild the offsets
                 // map's segment-index references to reflect the shift.
+                //
+                // Delete files one at a time and propagate real I/O
+                // failures (permission denied, disk error, …) so the
+                // operator learns the WAL has segments still on disk
+                // that the in-memory store believes are gone — i.e.
+                // the metrics/observers will NOT report successful
+                // compaction while leaked segment files sit on disk.
+                // Treat `NotFound` as idempotent so a retry after a
+                // partial prior purge still progresses. We count
+                // successful unlinks and only drain *that many*
+                // entries from `self.segments` (and shift offsets by
+                // the same amount) before propagating the error —
+                // that way memory and disk stay in sync for a
+                // follow-up retry to reattempt exactly the segments
+                // that are still on disk.
                 let drop_count = last_to_drop + 1;
-                let dropped: Vec<SegmentInfo> = self.segments.drain(0..drop_count).collect();
-                for seg in dropped {
-                    let _ = fs::remove_file(&seg.path);
+                let mut deleted: usize = 0;
+                let mut delete_error: Option<io::Error> = None;
+                while deleted < drop_count {
+                    let seg_path = self.segments[deleted].path.clone();
+                    match fs::remove_file(&seg_path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            delete_error = Some(e);
+                            break;
+                        }
+                    }
+                    deleted += 1;
                 }
-                // Shift surviving offsets' seg_idx by `-drop_count`.
-                // (No offsets survive in `[0..drop_count]` because we
-                // also purged in-memory entries above; but defensively
-                // walk the map.)
-                let mut new_offsets: BTreeMap<LogIndex, (usize, u64)> = BTreeMap::new();
-                for (idx, (seg_idx, byte_off)) in self.offsets.iter() {
-                    let shifted = seg_idx
-                        .checked_sub(drop_count)
-                        .expect("offset for surviving entry must reference a kept segment");
-                    new_offsets.insert(*idx, (shifted, *byte_off));
+                if deleted > 0 {
+                    self.segments.drain(0..deleted);
+                    // Shift surviving offsets' seg_idx by `-deleted`.
+                    // (No offsets survive in `[0..deleted]` because we
+                    // also purged in-memory entries above; but
+                    // defensively walk the map.)
+                    let mut new_offsets: BTreeMap<LogIndex, (usize, u64)> = BTreeMap::new();
+                    for (idx, (seg_idx, byte_off)) in self.offsets.iter() {
+                        let shifted = seg_idx
+                            .checked_sub(deleted)
+                            .expect("offset for surviving entry must reference a kept segment");
+                        new_offsets.insert(*idx, (shifted, *byte_off));
+                    }
+                    self.offsets = new_offsets;
                 }
-                self.offsets = new_offsets;
+                if let Some(e) = delete_error {
+                    return Err(io_to_storage(e));
+                }
             }
         }
 
