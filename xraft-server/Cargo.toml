@@ -29,6 +29,7 @@ prometheus-client = { workspace = true }
 bytes = { workspace = true }
 crc32fast = { workspace = true }
 futures-core = "0.3"
+async-trait = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 # `tokio::signal::unix` requires the `signal` feature, which is included in

@@ -21,11 +21,12 @@ pub mod driver;
 pub mod metrics;
 pub mod server;
 pub mod status;
+pub mod teardown;
 
 pub use admin::{AdminConfig, AdminServer, ClusterInfo, router as admin_router};
 pub use driver::{
     Driver, DriverConfig, DriverHandle, DriverInboundHandler, DriverObserver, InboundRpc,
-    MessageRouter, OutboundResult, TriggeredSnapshotInfo,
+    IntervalTickSource, MessageRouter, OutboundResult, TickSource, TriggeredSnapshotInfo,
 };
 pub use metrics::XRaftMetrics;
 pub use server::{Server, ServerConfig, ServerHandle};

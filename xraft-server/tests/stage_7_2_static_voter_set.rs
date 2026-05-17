@@ -40,6 +40,7 @@
 //!   `observer_preserves_role_on_higher_term_become_follower`,
 //!   `fetch_response_with_observer_as_leader_dropped`.
 
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -47,16 +48,92 @@ use bytes::Bytes;
 use tempfile::TempDir;
 use xraft_core::config::{ClusterConfig, VoterConfig};
 use xraft_core::error::XRaftError;
+use xraft_core::state_machine::NoOpStateMachine;
 use xraft_core::types::NodeId;
-use xraft_server::{Server, ServerConfig};
+use xraft_server::teardown::is_allowed_teardown_noise;
+use xraft_server::{Server, ServerConfig, ServerHandle};
+
+/// Per-handle teardown budget for this file. Tighter than the
+/// `RealCluster::shutdown` 30 s ceiling because callsites here
+/// only drain ONE handle each (or a small for-loop of 3-4); a
+/// genuine shutdown deadlock should surface in well under 10 s.
+const STAGE_7_2_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Drain `handle.join()` and panic with `label` on ANY unexpected
+/// outcome. This replaces the iter-12 `let _ = tokio::time::timeout
+/// (Duration::from_secs(5), handle.join()).await;` pattern that the
+/// iter-12 evaluator (item 2) flagged across 11 sites in this file
+/// for silently swallowing join errors / timeouts.
+///
+/// Outcome handling:
+/// * `Ok(())` from [`ServerHandle::join`] — clean shutdown,
+///   returns silently.
+/// * `Err(XRaftError::Storage(...))` matching the Windows
+///   tempdir-teardown race (via
+///   [`is_allowed_teardown_noise`](xraft_server::teardown::is_allowed_teardown_noise))
+///   — cosmetic since iter 4, logged to stderr with the call
+///   `label` for diagnosability but does NOT fail the test.
+/// * Any other `Err(XRaftError)` — PANICS with the `label` so the
+///   test author sees which call site surfaced the error.
+/// * Timeout after [`STAGE_7_2_SHUTDOWN_TIMEOUT`] — PANICS; a
+///   real shutdown deadlock is now visible instead of vanishing
+///   into the discarded timeout future.
+async fn assert_clean_shutdown(handle: ServerHandle, label: &str) {
+    match tokio::time::timeout(STAGE_7_2_SHUTDOWN_TIMEOUT, handle.join()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(ref e)) if is_allowed_teardown_noise(e) => {
+            eprintln!(
+                "[{label}] ServerHandle::join returned allowed Windows \
+                 teardown noise (cosmetic since iter 4): {e}"
+            );
+        }
+        Ok(Err(e)) => panic!(
+            "[{label}] ServerHandle::join surfaced an unexpected \
+             XRaftError that previously would have been swallowed by \
+             `let _ = tokio::time::timeout(...).await`: {e:?}"
+        ),
+        Err(_elapsed) => panic!(
+            "[{label}] ServerHandle::join did not resolve within {:?} \
+             (possible shutdown deadlock; the discarded timeout future \
+             leaves driver / gRPC tasks running)",
+            STAGE_7_2_SHUTDOWN_TIMEOUT
+        ),
+    }
+}
 
 /// Bind 127.0.0.1:0 to obtain an unused port, then drop the
 /// listener. Matches the pattern in `server_lifecycle.rs`.
+///
+/// Suitable for tests that run **one** server at a time on the
+/// picked port — the inherent TOCTOU race between `drop(l)` and the
+/// server's own `bind(port)` is acceptable when the test does not
+/// concurrently start other servers. Tests that start multiple
+/// concurrent in-process servers (the 3-node and 4-node-observer
+/// scenarios in this file) must use [`pick_port_with_listener`]
+/// instead so the listener can be handed directly to
+/// [`Server::start_with_state_machine_and_listener`] — see iter-12
+/// fix note in this file's history.
 fn pick_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
     let p = l.local_addr().unwrap().port();
     drop(l);
     p
+}
+
+/// Bind `127.0.0.1:0` and KEEP the listener alive. Returns
+/// `(port, listener)`; callers MUST hand the listener through to
+/// [`Server::start_with_state_machine_and_listener`] (under
+/// `Some(listener)`) so the server takes ownership and skips its
+/// own `bind` call. Eliminates the bind-then-drop-then-rebind race
+/// that flakes multi-node tests under heavy workspace-gate
+/// parallelism (the failure mode that surfaced in iter-11 of the
+/// Stage 8.1 workstream — see
+/// `observer_replicates_log_without_counting_toward_quorum` for
+/// the structural fix).
+fn pick_port_with_listener() -> (u16, TcpListener) {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    let p = l.local_addr().unwrap().port();
+    (p, l)
 }
 
 /// Build a single-voter cluster config rooted at `data_dir` with
@@ -166,7 +243,7 @@ async fn single_node_cluster_elects_self_and_commits() {
     );
 
     handle.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.join()).await;
+    assert_clean_shutdown(handle, "single_node_cluster_elects_self_and_commits").await;
 }
 
 /// Scenario: bootstrap-voter-set — "Given a 3-node cluster
@@ -202,7 +279,7 @@ async fn bootstrap_persists_voter_set_and_recovers_on_restart() {
     // file is fully fsync'd before we read it under the test.
     tokio::time::sleep(Duration::from_millis(100)).await;
     handle.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.join()).await;
+    assert_clean_shutdown(handle, "bootstrap_persists_voter_set first boot").await;
 
     // Verify the on-disk file carries the voter_set field.
     let quorum_path = data_dir.join("state").join("quorum-state");
@@ -243,7 +320,7 @@ async fn bootstrap_persists_voter_set_and_recovers_on_restart() {
         .await
         .expect("restart with matching voter set must succeed");
     handle2.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle2.join()).await;
+    assert_clean_shutdown(handle2, "bootstrap_persists_voter_set restart").await;
 
     // The persisted file should still contain the same voter set
     // (the recovery branch must not mutate the file).
@@ -262,39 +339,62 @@ async fn bootstrap_persists_voter_set_and_recovers_on_restart() {
 /// rather than silently overwriting the persisted set — an
 /// operator changing the cluster topology by editing config and
 /// restarting is a misconfiguration, not a supported flow.
+///
+/// # Iter-10 (stage 8.1 evaluator item 2) port-race fix
+///
+/// Earlier this test used `pick_port()` (drop-the-listener-and-
+/// rebind) to pin the SAME ephemeral port across both boots, so
+/// the only configured difference was the UUID. Under workspace-
+/// parallel `cargo test`, the bind-then-drop-then-rebind window
+/// raced sibling test binaries claiming ephemeral ports and the
+/// first boot intermittently failed with `os error 10048` ("port
+/// in use"). The fix uses `pick_port_with_listener` for BOTH
+/// boots: each boot owns its own listener (handed through to
+/// [`Server::start_with_state_machine_and_listener`]), eliminating
+/// the rebind race entirely. Both boots now use DIFFERENT ports,
+/// which means the VoterSet on disk differs by both UUID AND
+/// endpoint — but the rejection logic checks set equality, not
+/// the specific drift dimension, so the assertion still verifies
+/// the intended behaviour.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_with_mismatched_voters_rejected_with_config_error() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().to_path_buf();
     let original_uuid = uuid::Uuid::new_v4().to_string();
     let drift_uuid = uuid::Uuid::new_v4().to_string();
-    let pinned_port = pick_port();
     assert_ne!(original_uuid, drift_uuid);
 
-    // First boot — persist original voter set.
+    // First boot — persist original voter set. Use the listener-
+    // handover pattern so workspace-parallel ephemeral-port races
+    // cannot steal the port between bind and start.
+    let (port1, listener1) = pick_port_with_listener();
     let cfg1 = server_config(single_voter_cluster_config_with_endpoint(
         data_dir.clone(),
         original_uuid.clone(),
-        pinned_port,
+        port1,
     ));
-    let handle = Server::start(cfg1).await.expect("first boot must succeed");
+    let handle =
+        Server::start_with_state_machine_and_listener(cfg1, NoOpStateMachine, Some(listener1))
+            .await
+            .expect("first boot must succeed");
     tokio::time::sleep(Duration::from_millis(80)).await;
     handle.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.join()).await;
+    assert_clean_shutdown(handle, "restart_with_mismatched_voters first boot").await;
 
-    // Second boot — same node_id + same port, different
-    // directory_id ⇒ VoterSet differs ⇒ identity drift ⇒ must
-    // reject. Pinning the port isolates the test from the
-    // ephemeral-port noise so the only difference between the
-    // two configs is the UUID we're actually probing.
+    // Second boot — different `directory_id` ⇒ VoterSet differs ⇒
+    // identity drift ⇒ must reject. Port may also differ; the
+    // rejection asserts on set equality (any drift dimension
+    // triggers it) so the test still pins the intended behaviour.
+    let (port2, listener2) = pick_port_with_listener();
     let cfg2 = server_config(single_voter_cluster_config_with_endpoint(
         data_dir.clone(),
         drift_uuid,
-        pinned_port,
+        port2,
     ));
-    let err = Server::start(cfg2)
-        .await
-        .expect_err("restart with mismatched voter set must reject");
+    let err =
+        Server::start_with_state_machine_and_listener(cfg2, NoOpStateMachine, Some(listener2))
+            .await
+            .expect_err("restart with mismatched voter set must reject");
     match err {
         XRaftError::Config(msg) => {
             assert!(
@@ -348,7 +448,7 @@ async fn add_voter_via_driver_handle_returns_unsupported() {
     );
 
     handle.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.join()).await;
+    assert_clean_shutdown(handle, "add_voter_via_driver_handle_returns_unsupported").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -365,7 +465,7 @@ async fn remove_voter_via_driver_handle_returns_unsupported() {
     assert!(matches!(err, XRaftError::Unsupported(_)));
 
     handle.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.join()).await;
+    assert_clean_shutdown(handle, "remove_voter_via_driver_handle_returns_unsupported").await;
 }
 
 /// Scenario: add-remove-voter-rejected (HTTP half) —
@@ -396,7 +496,7 @@ async fn http_add_voter_returns_501_unsupported() {
     );
 
     handle.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.join()).await;
+    assert_clean_shutdown(handle, "http_add_voter_returns_501_unsupported").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -423,7 +523,7 @@ async fn http_remove_voter_returns_501_unsupported() {
     );
 
     handle.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.join()).await;
+    assert_clean_shutdown(handle, "http_remove_voter_returns_501_unsupported").await;
 }
 
 /// Scenario: bootstrap-voter-set (multi-node half) — "Given a
@@ -461,7 +561,17 @@ async fn three_node_bootstrap_persists_same_voter_set_and_elects_leader() {
     let tmps: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
     let data_dirs: Vec<PathBuf> = tmps.iter().map(|t| t.path().to_path_buf()).collect();
     let uuids: Vec<String> = (0..3).map(|_| uuid::Uuid::new_v4().to_string()).collect();
-    let ports: Vec<u16> = (0..3).map(|_| pick_port()).collect();
+    // **iter-12 fix**: bind every voter's gRPC listener up-front and
+    // KEEP THE LISTENERS ALIVE through `Server::start_with_state_machine_and_listener`
+    // below. The legacy `pick_port` shape (bind, drop, then let the
+    // server re-bind) flakes under workspace-gate parallelism — a
+    // sibling test binary can grab the dropped port in the window
+    // before the server's own `bind()` call. Pre-binding the
+    // listener and handing it through eliminates the race entirely.
+    let port_pairs: Vec<(u16, TcpListener)> = (0..3).map(|_| pick_port_with_listener()).collect();
+    let ports: Vec<u16> = port_pairs.iter().map(|(p, _)| *p).collect();
+    let mut listeners: Vec<Option<TcpListener>> =
+        port_pairs.into_iter().map(|(_, l)| Some(l)).collect();
     // Shared voter roster — byte-identical across all three nodes
     // so the derived VoterSet is byte-identical when each node
     // persists it on first boot.
@@ -531,8 +641,9 @@ async fn three_node_bootstrap_persists_same_voter_set_and_elects_leader() {
             ports[i],
             voters.clone(),
         ));
+        let listener = listeners[i].take().expect("pre-bound listener present");
         handles.push(
-            Server::start(cfg)
+            Server::start_with_state_machine_and_listener(cfg, NoOpStateMachine, Some(listener))
                 .await
                 .unwrap_or_else(|e| panic!("node {} must start: {e:?}", i + 1)),
         );
@@ -583,9 +694,13 @@ async fn three_node_bootstrap_persists_same_voter_set_and_elects_leader() {
     // we read a quiesced file (the engine still mutates HardState
     // as the term advances; voter_set is write-once but the
     // surrounding JSON gets rewritten on every commit_index bump).
-    for h in handles {
+    for (_node_idx, h) in handles.into_iter().enumerate() {
         h.shutdown();
-        let _ = tokio::time::timeout(Duration::from_secs(5), h.join()).await;
+        assert_clean_shutdown(
+            h,
+            &format!("three_node_bootstrap drain node-{}", _node_idx + 1),
+        )
+        .await;
     }
 
     // Verify each node's persisted voter_set is byte-identical to
@@ -765,7 +880,18 @@ async fn observer_replicates_log_without_counting_toward_quorum() {
     let tmps: Vec<TempDir> = (0..4).map(|_| TempDir::new().unwrap()).collect();
     let data_dirs: Vec<PathBuf> = tmps.iter().map(|t| t.path().to_path_buf()).collect();
     let uuids: Vec<String> = (0..4).map(|_| uuid::Uuid::new_v4().to_string()).collect();
-    let ports: Vec<u16> = (0..4).map(|_| pick_port()).collect();
+    // **iter-12 fix**: pre-bind every node's gRPC listener and hand
+    // it through `Server::start_with_state_machine_and_listener`.
+    // The pick-port-and-drop pattern is racy under workspace-gate
+    // parallelism — with 4 in-process servers starting back-to-back
+    // and other test binaries grabbing ephemeral ports concurrently,
+    // one of the picked ports gets stolen and `Server::start`
+    // panics at `node N must start: ...`. This was the surface of
+    // the iter-11 forge-gate failure for `stage_7_2_static_voter_set`.
+    let port_pairs: Vec<(u16, TcpListener)> = (0..4).map(|_| pick_port_with_listener()).collect();
+    let ports: Vec<u16> = port_pairs.iter().map(|(p, _)| *p).collect();
+    let mut listeners: Vec<Option<TcpListener>> =
+        port_pairs.into_iter().map(|(_, l)| Some(l)).collect();
 
     // Voter roster: byte-identical across all 4 nodes so the
     // observer (which is also voter-roster-aware via its own
@@ -794,9 +920,11 @@ async fn observer_replicates_log_without_counting_toward_quorum() {
             observers.clone(),
             /*enable_check_quorum=*/ false,
         ));
-        let h = Server::start(cfg)
-            .await
-            .unwrap_or_else(|e| panic!("node {} must start: {e:?}", i + 1));
+        let listener = listeners[i].take().expect("pre-bound listener present");
+        let h =
+            Server::start_with_state_machine_and_listener(cfg, NoOpStateMachine, Some(listener))
+                .await
+                .unwrap_or_else(|e| panic!("node {} must start: {e:?}", i + 1));
         handles.push(Some(h));
     }
 
@@ -879,10 +1007,39 @@ async fn observer_replicates_log_without_counting_toward_quorum() {
 
     // Cross-check: the elected leader still reports role=Leader,
     // no voter has flipped into Observer, no node is Candidate.
+    //
+    // **Stage 7.2 iter-12 fix — converge-wait, not snapshot.** Under
+    // heavy parallel-test load (this binary alone runs 9 tests, and
+    // the workspace gate runs many more in parallel) a follower's
+    // election timer can race the leader's first heartbeats and the
+    // follower briefly enters `PreCandidate` before the leader
+    // contact arrives and steps it back to `Follower`. A single
+    // snapshot of `roles` would flake on that transient. We instead
+    // poll for the stable configuration (leader is Leader, observer
+    // is Observer, no node is Pre/Candidate) for up to 5 s, breaking
+    // as soon as it is observed. The previous single-shot snapshot
+    // was the cause of the iter-11 forge-gate `stage_7_2_static_voter_set`
+    // test failure.
+    let role_settle_deadline = Instant::now() + Duration::from_secs(5);
     let mut roles_seen: Vec<NodeRole> = Vec::with_capacity(4);
-    for slot in handles.iter().take(4) {
-        let st = slot.as_ref().unwrap().status().current().await;
-        roles_seen.push(st.role);
+    loop {
+        roles_seen.clear();
+        for slot in handles.iter().take(4) {
+            let st = slot.as_ref().unwrap().status().current().await;
+            roles_seen.push(st.role);
+        }
+        let leader_ok = matches!(roles_seen[leader_idx], NodeRole::Leader);
+        let observer_ok = matches!(roles_seen[3], NodeRole::Observer);
+        let no_candidates = roles_seen
+            .iter()
+            .all(|r| !matches!(r, NodeRole::Candidate | NodeRole::PreCandidate));
+        if leader_ok && observer_ok && no_candidates {
+            break;
+        }
+        if Instant::now() >= role_settle_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
         matches!(roles_seen[leader_idx], NodeRole::Leader),
@@ -896,7 +1053,7 @@ async fn observer_replicates_log_without_counting_toward_quorum() {
     for (i, r) in roles_seen.iter().enumerate() {
         assert!(
             !matches!(r, NodeRole::Candidate | NodeRole::PreCandidate),
-            "no node may be a candidate after election settled; node {} role = {r:?}; roles = {roles_seen:?}",
+            "no node may be a candidate after election settled (5s converge-wait expired); node {} role = {r:?}; roles = {roles_seen:?}",
             i + 1
         );
     }
@@ -918,7 +1075,11 @@ async fn observer_replicates_log_without_counting_toward_quorum() {
         }
         if let Some(h) = slot.take() {
             h.shutdown();
-            let _ = tokio::time::timeout(Duration::from_secs(5), h.join()).await;
+            assert_clean_shutdown(
+                h,
+                &format!("observer phase-2 drain non-leader voter-{}", i + 1),
+            )
+            .await;
             shut_down.push(i);
         }
     }
@@ -1026,10 +1187,14 @@ async fn observer_replicates_log_without_counting_toward_quorum() {
     );
 
     // Tear down survivors.
-    for slot in handles.iter_mut() {
+    for (survivor_idx, slot) in handles.iter_mut().enumerate() {
         if let Some(h) = slot.take() {
             h.shutdown();
-            let _ = tokio::time::timeout(Duration::from_secs(5), h.join()).await;
+            assert_clean_shutdown(
+                h,
+                &format!("observer end drain survivor-{}", survivor_idx + 1),
+            )
+            .await;
         }
     }
 }
