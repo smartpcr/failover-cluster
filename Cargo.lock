@@ -2580,6 +2580,7 @@ dependencies = [
 name = "xraft-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum 0.8.9",
  "bytes",
  "clap",
@@ -2624,11 +2625,20 @@ dependencies = [
 name = "xraft-test"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bincode",
+ "bytes",
  "rand 0.8.6",
+ "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "xraft-client",
  "xraft-core",
+ "xraft-server",
  "xraft-storage",
+ "xraft-transport",
 ]
 
 [[package]]

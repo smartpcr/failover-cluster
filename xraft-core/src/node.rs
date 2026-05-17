@@ -1351,14 +1351,70 @@ impl RaftNode {
         }
     }
 
+    /// Stage 8.1 iter-5 — stricter variant of
+    /// [`Self::leader_recently_active`] used SOLELY by
+    /// [`Self::build_pre_vote_response`] to decide whether to
+    /// advertise `leader_hint`.
+    ///
+    /// `leader_recently_active` is intentionally permissive (uses the
+    /// node's full randomized `timeout_ticks`) because it answers
+    /// "should I reject this PreVote on the grounds that a leader
+    /// exists?" — there, a generous window is safe (it errs toward
+    /// preserving the existing leader).
+    ///
+    /// Advertising `leader_hint`, however, must err the OTHER way:
+    /// if we emit a hint pointing at a dead leader, every
+    /// PreCandidate that receives our denial steps down to follow
+    /// the corpse and re-enters PreCandidate on its next timeout,
+    /// then we repeat — a 4-node surviving quorum loops forever
+    /// (this is the regression that broke the iter-5 failover test
+    /// when the hint gate used `leader_recently_active`).
+    ///
+    /// `election_timer.min_ticks()` is the tightest correct bound:
+    /// any node whose last leader contact is older than the
+    /// MINIMUM election window has seen multiple missed heartbeats
+    /// (heartbeat interval is ~election_min/4 typically), so the
+    /// leader is almost certainly failing or dead. We refuse to
+    /// advertise that hint, letting the natural election proceed.
+    fn leader_hint_is_fresh(&self) -> bool {
+        if self.role == NodeRole::Leader {
+            return true;
+        }
+        match self.last_leader_contact_tick {
+            Some(t) => {
+                let elapsed = self.logical_tick.saturating_sub(t);
+                elapsed < self.election_timer.min_ticks()
+            }
+            None => false,
+        }
+    }
+
     /// Construct the standard `PreVoteResponse` envelope.
+    ///
+    /// Stage 8.1 iter-5 — `leader_hint` is included ONLY when this
+    /// responder's leader contact is fresh under the stricter
+    /// [`Self::leader_hint_is_fresh`] window. This makes the hint a
+    /// positive liveness signal rather than a stale-cache echo:
+    ///
+    /// * Partition-recovery scenario: majority Follower's most
+    ///   recent heartbeat is within election_min → emits
+    ///   `Some(leader)`. Stranded PreCandidate steps down.
+    /// * Leader-failover scenario: every surviving voter's last
+    ///   contact is at least one election timeout ago by the time
+    ///   any PreCandidate is asking → emits `None`. PreCandidates
+    ///   are NOT spuriously stepped down. Natural election proceeds.
     fn build_pre_vote_response(&self, granted: bool) -> PreVoteResponse {
+        let leader_hint = if self.leader_hint_is_fresh() {
+            self.leader_id
+        } else {
+            None
+        };
         PreVoteResponse {
             cluster_id: self.config.cluster_id.clone(),
             leader_epoch: 0,
             term: self.hard_state.current_term,
             vote_granted: granted,
-            leader_hint: self.leader_id,
+            leader_hint,
         }
     }
 
@@ -1645,15 +1701,36 @@ impl RaftNode {
     /// 2. If `resp.term > current_term`, step down to follower at the new
     ///    term. This is term *reconciliation*, not inflation: another
     ///    voter has evidence the cluster has advanced.
-    /// 3. Otherwise act only while we are a `PreCandidate`. NOTE: We
-    ///    deliberately do **not** require `resp.term == current_term` ΓÇö
-    ///    pre-vote responders never bump their term (that is the entire
-    ///    point of Pre-Vote), so a lagging voter at a lower term can
-    ///    still legitimately grant a pre-vote (rubber-duck blocking
-    ///    issue #3). Stale grants from a previous pre-vote round are
-    ///    naturally bounded because [`become_pre_candidate`](Self::become_pre_candidate)
-    ///    clears `pre_votes_received` at the start of every round.
-    /// 4. Insert the granter into `pre_votes_received`; on pre-election
+    /// 3. **Operator answer `engine-pre-vote-recovery`** — if we are
+    ///    PreCandidate AND the response is a same-term denial AND it
+    ///    carries `leader_hint`, the responder is telling us a healthy
+    ///    leader exists at the current term. Step down to Follower
+    ///    (same term, no `PersistHardState` ΓÇö Pre-Vote's contract is
+    ///    "no term bump") with `leader_id = resp.leader_hint`. This
+    ///    unsticks a stranded PreCandidate (e.g. a partitioned
+    ///    minority that timed out and re-joined after the partition
+    ///    healed) without having to wait for a higher-term election
+    ///    to bring it back.
+    ///
+    ///    Why only on `same-term denial`:
+    ///    - **Lower-term denial**: the responder is stale; trusting
+    ///      its stale leader_hint would force us back to a follower
+    ///      under a non-existent leader.
+    ///    - **Same-term grant**: the responder is willing to pre-vote
+    ///      for us; the `leader_hint` is informational from before our
+    ///      pre-vote arrived. Stepping down would discard a granter.
+    ///    - **Higher-term**: already handled at step 2 (term
+    ///      reconciliation supersedes any leader hint).
+    /// 4. Otherwise act only while we are a `PreCandidate`. NOTE: We
+    ///    deliberately do **not** require `resp.term == current_term`
+    ///    on the grant path ΓÇö pre-vote responders never bump their
+    ///    term (that is the entire point of Pre-Vote), so a lagging
+    ///    voter at a lower term can still legitimately grant a
+    ///    pre-vote (rubber-duck blocking issue #3). Stale grants from
+    ///    a previous pre-vote round are naturally bounded because
+    ///    [`become_pre_candidate`](Self::become_pre_candidate) clears
+    ///    `pre_votes_received` at the start of every round.
+    /// 5. Insert the granter into `pre_votes_received`; on pre-election
     ///    quorum cascade to [`become_candidate`](Self::become_candidate).
     #[tracing::instrument(level = "debug", skip(self), fields(node_id = %self.id, current_term = %self.hard_state.current_term))]
     pub fn handle_pre_vote_response(&mut self, from: NodeId, resp: PreVoteResponse) -> Vec<Action> {
@@ -1666,6 +1743,57 @@ impl RaftNode {
 
         if resp.term > self.hard_state.current_term {
             return self.become_follower(resp.term, None);
+        }
+
+        // Operator answer `engine-pre-vote-recovery`: same-term denial
+        // with a leader_hint means a healthy leader exists at our
+        // current term ΓÇö step down so this stranded PreCandidate can
+        // resume fetching from the leader. See the doc comment above
+        // for why we restrict this to the same-term denial path.
+        if self.role == NodeRole::PreCandidate
+            && resp.term == self.hard_state.current_term
+            && !resp.vote_granted
+            && resp.leader_hint.is_some()
+        {
+            tracing::info!(
+                node_id = %self.id,
+                current_term = %self.hard_state.current_term,
+                from = %from,
+                leader_hint = ?resp.leader_hint,
+                "PreCandidate stepping down on same-term PreVoteResponse leader_hint"
+            );
+            let actions = self.become_follower(self.hard_state.current_term, resp.leader_hint);
+            // Stage 8.1 iter-8: the leader_hint we received is HEARSAY
+            // (a peer told us "the leader is X"), NOT direct evidence
+            // of leader liveness. `become_follower(_, Some(_))`
+            // unconditionally refreshes `last_leader_contact_tick`
+            // (line above; matches the "I just heard from leader X"
+            // semantic for the FetchResponse path). For the
+            // PreVote-hint path that semantic is WRONG and triggers an
+            // infinite step-down loop during failover:
+            //
+            // - Leader dies; followers' contact_tick is fresh from the
+            //   last heartbeat.
+            // - First PreCandidate sends PreVote; live peers respond
+            //   with `leader_hint = Some(dead_leader)` because their
+            //   own contact_tick is within `leader_hint_is_fresh`.
+            // - PreCandidate steps down ΓÇö buggy refresh marks its
+            //   contact_tick fresh too.
+            // - Election timer expires, next PreCandidate cycle;
+            //   every peer now has a freshly-refreshed contact_tick
+            //   (from its own prior step-down), so EVERY peer keeps
+            //   echoing leader_hint = Some(dead_leader). Loop forever.
+            //
+            // Restore prior contact_tick (None, since we just left
+            // PreCandidate which cleared it at `become_pre_candidate`).
+            // If the leader is actually alive, the impending Fetch
+            // will refresh contact_tick at the FetchResponse handler
+            // (the canonical "leader liveness proof" path); if the
+            // leader is dead, contact_tick stays stale and the next
+            // election timer fires normally, letting a real election
+            // proceed without spurious hint-driven step-downs.
+            self.last_leader_contact_tick = None;
+            return actions;
         }
 
         if self.role != NodeRole::PreCandidate {
@@ -4826,8 +4954,57 @@ port = 6001
         assert!(actions.is_empty());
     }
 
-    // ---- handle_pre_vote_response ---------------------------------------
+    /// Stage 8.1 iter-5 — `leader_hint` must be EMPTY when the
+    /// responder's own leader-active lease has expired. This prevents
+    /// a 4-node surviving quorum (leader-failover case) from echoing
+    /// `Some(dead_leader)` across each other's PreVoteResponses and
+    /// looping every PreCandidate back to `Follower(dead_leader)`
+    /// via the same-term step-down branch in
+    /// [`RaftNode::handle_pre_vote_response`].
+    #[test]
+    fn pre_vote_response_omits_leader_hint_when_leader_lease_expired() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        // Simulate "I used to follow node 7 at term 3, but the lease
+        // has gone stale" by setting leader_id while leaving
+        // `last_leader_contact_tick` at None (the constructor default)
+        // ΓÇö this forces `leader_recently_active()` to return false.
+        node.hard_state.current_term = Term(3);
+        node.leader_id = Some(NodeId(7));
+        node.last_leader_contact_tick = None;
 
+        let actions = node.handle_pre_vote_request(pre_vote_req("test", 4, NodeId(2), 0, 0));
+        let resp = extract_pre_vote_response(&actions);
+        assert_eq!(
+            resp.leader_hint, None,
+            "leader_hint must be None when responder's own leader lease has expired \
+             (else stranded PreCandidates step down to follow a dead leader)"
+        );
+    }
+
+    /// Stage 8.1 iter-5 — the converse: a fresh Follower that just
+    /// heard from the leader MUST include the hint. This is the
+    /// positive-liveness signal the partition-recovery scenario
+    /// depends on to unstrand a minority PreCandidate.
+    #[test]
+    fn pre_vote_response_includes_leader_hint_when_leader_lease_fresh() {
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        node.hard_state.current_term = Term(3);
+        node.leader_id = Some(NodeId(7));
+        // "Just heard from the leader at this tick" ΓÇö the elapsed
+        // distance (logical_tick - contact_tick) is 0, which is
+        // strictly less than the timer's timeout_ticks.
+        node.last_leader_contact_tick = Some(node.logical_tick);
+
+        let actions = node.handle_pre_vote_request(pre_vote_req("test", 4, NodeId(2), 0, 0));
+        let resp = extract_pre_vote_response(&actions);
+        assert_eq!(
+            resp.leader_hint,
+            Some(NodeId(7)),
+            "leader_hint must surface when responder's leader lease is fresh"
+        );
+    }
+
+    // ---- handle_pre_vote_response ---------------------------------------
     #[test]
     fn handle_pre_vote_response_quorum_transitions_to_candidate() {
         let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
@@ -4932,6 +5109,189 @@ port = 6001
         assert!(actions.is_empty());
         assert_eq!(node.role, NodeRole::Candidate);
         assert_eq!(node.current_term(), term);
+    }
+
+    // -- Operator answer `engine-pre-vote-recovery` -----------------------
+    // Same-term PreVoteResponse denial WITH leader_hint must step the
+    // stranded PreCandidate down to Follower at the SAME term (no
+    // PersistHardState) with leader_id = resp.leader_hint. The negative
+    // tests below pin the precise conditions under which the step-down
+    // must NOT fire (stale lower-term denial, same-term grant, no
+    // leader_hint) so a future regression cannot silently widen the
+    // step-down trigger.
+
+    /// Build a PreVoteResponse the way a voter would reply when it
+    /// already recognises a leader at the responder's current term.
+    fn pre_vote_resp_with_hint(
+        cluster_id: &str,
+        term: u64,
+        granted: bool,
+        hint: NodeId,
+    ) -> PreVoteResponse {
+        PreVoteResponse {
+            cluster_id: cluster_id.into(),
+            leader_epoch: 0,
+            term: Term(term),
+            vote_granted: granted,
+            leader_hint: Some(hint),
+        }
+    }
+
+    #[test]
+    fn handle_pre_vote_response_same_term_denial_with_hint_steps_down() {
+        // Stranded PreCandidate at term=4 receives a same-term denial
+        // from voter 2 with `leader_hint=Some(NodeId(3))`. Step down to
+        // Follower at term=4 (no PersistHardState ΓÇö Pre-Vote contract)
+        // and record leader_id=Some(NodeId(3)).
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        node.hard_state.current_term = Term(4);
+        let _ = node.become_pre_candidate();
+        assert_eq!(node.role, NodeRole::PreCandidate);
+
+        let actions = node.handle_pre_vote_response(
+            NodeId(2),
+            pre_vote_resp_with_hint("test", 4, false, NodeId(3)),
+        );
+        assert_eq!(node.role, NodeRole::Follower);
+        assert_eq!(node.current_term(), Term(4));
+        assert_eq!(node.leader_id, Some(NodeId(3)));
+        // Pre-Vote contract: same-term step-down MUST NOT persist
+        // (no term bump occurred, voted_for stays None).
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::PersistHardState)),
+            "same-term step-down must not persist; actions={actions:?}"
+        );
+        // Stepping down from PreCandidate should emit a StepDown action.
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::StepDown)),
+            "stepping down from PreCandidate must emit Action::StepDown; actions={actions:?}"
+        );
+    }
+
+    #[test]
+    fn handle_pre_vote_response_same_term_denial_with_hint_does_not_refresh_contact_tick() {
+        // Stage 8.1 iter-8 regression: the same-term step-down path
+        // MUST NOT refresh `last_leader_contact_tick` from the
+        // leader_hint. The hint is hearsay (a peer told us "X is the
+        // leader") and may echo a DEAD leader during a failover ΓÇö
+        // refreshing the contact stamp would cause this node's own
+        // future PreVoteResponses to keep emitting leader_hint=Some(X)
+        // for the dead leader, looping every surviving node back
+        // through this step-down path forever (the iter-7 failover
+        // test's actual failure mode).
+        //
+        // The post-condition is: `last_leader_contact_tick` is NOT
+        // refreshed by the step-down. Real proof of leader liveness
+        // must come from an inbound FetchResponse (which sets the
+        // stamp at the FetchResponse handler) ΓÇö never from a hint
+        // echoed by a peer.
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        node.hard_state.current_term = Term(4);
+        let _ = node.become_pre_candidate();
+        assert_eq!(node.role, NodeRole::PreCandidate);
+        // PreCandidate has cleared `last_leader_contact_tick` to None
+        // (see `become_pre_candidate`). Advance the logical_tick to
+        // simulate time passing during the pre-election; after the
+        // step-down, `last_leader_contact_tick` must STILL be None,
+        // not freshly stamped to the new `logical_tick`.
+        node.logical_tick = 1234;
+        assert_eq!(node.last_leader_contact_tick, None);
+
+        let _ = node.handle_pre_vote_response(
+            NodeId(2),
+            pre_vote_resp_with_hint("test", 4, false, NodeId(3)),
+        );
+        assert_eq!(node.role, NodeRole::Follower);
+        assert_eq!(node.leader_id, Some(NodeId(3)));
+        assert_eq!(
+            node.last_leader_contact_tick, None,
+            "iter-8 fix: same-term PreVote step-down must NOT refresh \
+             last_leader_contact_tick (hint is hearsay, not leader \
+             contact). Got {:?}; expected None.",
+            node.last_leader_contact_tick,
+        );
+        // `leader_recently_active` (which gates whether a PreVote
+        // would be denied) must report `false` so this freshly-
+        // stepped-down node does NOT echo the (possibly dead) leader
+        // back to its peers in a subsequent PreVoteResponse.
+        assert!(
+            !node.leader_recently_active(),
+            "iter-8 fix: after same-term hint step-down, this node \
+             must NOT report leader_recently_active=true (which would \
+             keep the dead-leader hint propagating across the cluster)"
+        );
+    }
+
+    #[test]
+    fn handle_pre_vote_response_same_term_denial_without_hint_does_not_step_down() {
+        // Same-term denial WITHOUT a leader_hint must NOT step down ΓÇö
+        // the responder simply rejected our pre-vote (e.g. its log is
+        // ahead, or it pre-voted for someone else this round). The
+        // PreCandidate stays in PreCandidate.
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        node.hard_state.current_term = Term(4);
+        let _ = node.become_pre_candidate();
+        assert_eq!(node.role, NodeRole::PreCandidate);
+
+        let actions = node.handle_pre_vote_response(NodeId(2), pre_vote_resp("test", 4, false));
+        assert_eq!(
+            node.role,
+            NodeRole::PreCandidate,
+            "denial without leader_hint must NOT trigger step-down"
+        );
+        assert!(actions.is_empty(), "no actions expected; got {actions:?}");
+    }
+
+    #[test]
+    fn handle_pre_vote_response_same_term_grant_with_hint_does_not_step_down() {
+        // A grant with leader_hint is informational (the responder is
+        // willing to pre-vote for us even though it has seen a leader
+        // recently). Stepping down would silently throw away a grant
+        // and stall the pre-election. Keep the grant; do not step
+        // down.
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        node.hard_state.current_term = Term(4);
+        let _ = node.become_pre_candidate();
+        assert_eq!(node.role, NodeRole::PreCandidate);
+
+        let _ = node.handle_pre_vote_response(
+            NodeId(2),
+            pre_vote_resp_with_hint("test", 4, true, NodeId(3)),
+        );
+        // 3-voter cluster ΓÇö self + NodeId(2) = quorum, so we cascade
+        // straight into Candidate. The point of this test is that we
+        // do NOT enter Follower on the grant+hint path.
+        assert_eq!(
+            node.role,
+            NodeRole::Candidate,
+            "grant with leader_hint must accumulate the grant, NOT step down"
+        );
+    }
+
+    #[test]
+    fn handle_pre_vote_response_lower_term_denial_with_hint_does_not_step_down() {
+        // A stale lower-term denial with a stale leader_hint must NOT
+        // force a step-down ΓÇö the responder is behind us and its hint
+        // could point at a leader that has since lost the cluster.
+        // PreCandidate ignores the denial and keeps soliciting.
+        let mut node = RaftNode::new_with_seed(three_voter_config(), 1).unwrap();
+        node.hard_state.current_term = Term(5);
+        let _ = node.become_pre_candidate();
+        assert_eq!(node.role, NodeRole::PreCandidate);
+
+        let actions = node.handle_pre_vote_response(
+            NodeId(2),
+            pre_vote_resp_with_hint("test", 3, false, NodeId(3)),
+        );
+        assert_eq!(
+            node.role,
+            NodeRole::PreCandidate,
+            "stale lower-term denial must NOT trigger step-down"
+        );
+        assert_eq!(node.current_term(), Term(5), "term must not regress");
+        assert!(actions.is_empty(), "no actions expected; got {actions:?}");
     }
 
     // ---- step() routing -------------------------------------------------
