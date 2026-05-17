@@ -677,4 +677,95 @@ mod tests {
             "render missing received counter: {render}"
         );
     }
+
+    // ─── Stage 7.3 observer → metric wiring (iter-5 / iter-8) ───────
+    //
+    // These tests exercise the `DriverObserver` trait surface — the
+    // path the real driver takes — so a regression in
+    // `XRaftMetrics`' impl of `on_snapshot_installed`,
+    // `on_log_compacted`, or `on_snapshot_taken` (e.g. wired to the
+    // wrong counter / histogram, or accidentally reverted to the
+    // default no-op) fails CI instead of being silently dropped on
+    // the floor.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_state_sets_log_end_offset_gauge() {
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(7)));
+        let mut s = sample_status();
+        s.last_log_index = 4321;
+        metrics.publish_state(s).await;
+        let render = metrics.render().await.unwrap();
+        assert!(
+            render.contains("xraft_log_end_offset 4321"),
+            "render missing log_end_offset gauge: {render}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_install_counter_increments_on_observer_hook() {
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        // Drive through the trait surface, not the helper method, so
+        // a wiring regression (e.g. `on_snapshot_installed` reverting
+        // to the default no-op) is caught.
+        DriverObserver::on_snapshot_installed(&*metrics);
+        DriverObserver::on_snapshot_installed(&*metrics);
+        let render = metrics.render().await.unwrap();
+        assert!(
+            render.contains("xraft_snapshot_installs_total 2"),
+            "render missing snapshot install counter: {render}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn log_compaction_counter_increments_on_observer_hook() {
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        // `removed` value is irrelevant to the counter (which only
+        // bumps by one per call) but exercises the new `u64`
+        // signature so a future signature change forces this test
+        // to be updated rather than silently slipping by.
+        DriverObserver::on_log_compacted(&*metrics, 50);
+        DriverObserver::on_log_compacted(&*metrics, 25);
+        DriverObserver::on_log_compacted(&*metrics, 10);
+        let render = metrics.render().await.unwrap();
+        assert!(
+            render.contains("xraft_log_compaction_events_total 3"),
+            "render missing log compaction counter: {render}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_taken_observer_feeds_duration_and_size_histograms() {
+        let metrics = XRaftMetrics::shared(NodeStatus::placeholder(NodeId(1)));
+        // Drive through the trait. Param order is (bytes, elapsed)
+        // per the iter-8 signature — swapping them silently would
+        // attribute byte counts to the duration histogram (and vice
+        // versa); the `_sum` assertions below would flag that.
+        DriverObserver::on_snapshot_taken(
+            &*metrics,
+            4096,
+            Duration::from_millis(75),
+        );
+        DriverObserver::on_snapshot_taken(
+            &*metrics,
+            16_384,
+            Duration::from_millis(150),
+        );
+        let render = metrics.render().await.unwrap();
+        assert!(
+            render.contains("xraft_snapshot_duration_seconds_count 2"),
+            "render missing snapshot-duration count: {render}"
+        );
+        assert!(
+            render.contains("xraft_snapshot_duration_seconds_sum"),
+            "render missing snapshot-duration sum: {render}"
+        );
+        assert!(
+            render.contains("xraft_snapshot_size_bytes_count 2"),
+            "render missing snapshot-size count: {render}"
+        );
+        assert!(
+            render.contains("xraft_snapshot_size_bytes_sum"),
+            "render missing snapshot-size sum: {render}"
+        );
+    }
 }
