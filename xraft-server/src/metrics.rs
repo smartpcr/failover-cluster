@@ -740,16 +740,8 @@ mod tests {
         // per the iter-8 signature — swapping them silently would
         // attribute byte counts to the duration histogram (and vice
         // versa); the `_sum` assertions below would flag that.
-        DriverObserver::on_snapshot_taken(
-            &*metrics,
-            4096,
-            Duration::from_millis(75),
-        );
-        DriverObserver::on_snapshot_taken(
-            &*metrics,
-            16_384,
-            Duration::from_millis(150),
-        );
+        DriverObserver::on_snapshot_taken(&*metrics, 4096, Duration::from_millis(75));
+        DriverObserver::on_snapshot_taken(&*metrics, 16_384, Duration::from_millis(150));
         let render = metrics.render().await.unwrap();
         assert!(
             render.contains("xraft_snapshot_duration_seconds_count 2"),
