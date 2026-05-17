@@ -14,10 +14,10 @@
 //!
 //! * **Latency** — every outbound RPC charges a configurable
 //!   `Duration` to the shared [`SimulatedClock`] BEFORE calling the
-//!   destination handler. As of iter-10 the latency is VIRTUAL: the
+//!   destination handler. Currently the latency is VIRTUAL: the
 //!   clock advances by the configured amount and the dispatch arm
-//!   yields once to the runtime, but NO wall-clock sleep happens
-//!   (iter-9 evaluator item 4). Latency is uniform per network (not
+//!   yields once to the runtime, but NO wall-clock sleep happens.
+//!   Latency is uniform per network (not
 //!   per peer); tests that need asymmetric latencies build separate
 //!   networks per cluster.
 //!
@@ -60,7 +60,7 @@ use xraft_server::DriverInboundHandler;
 
 use crate::clock::SimulatedClock;
 
-/// Per-RPC simulated VIRTUAL latency (iter-10: no wall-clock sleep).
+/// Per-RPC simulated VIRTUAL latency.
 /// Default to zero so tests that do not care about latency are not
 /// slowed down.
 const DEFAULT_LATENCY: Duration = Duration::ZERO;
@@ -80,7 +80,7 @@ const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(2);
 /// Shared in-process message-passing fabric for a [`SimulatedCluster`].
 pub struct SimulatedNetwork {
     inner: Mutex<NetworkInner>,
-    /// Virtual tick counter (iter-10: no wall-clock sleep). Every
+    /// Virtual tick counter. Every
     /// per-RPC latency window applied in [`SimulatedTransport::dispatch`]
     /// flows through [`SimulatedClock::delay`] so the clock is the
     /// single observable record of how much VIRTUAL transit time the
@@ -91,9 +91,9 @@ pub struct SimulatedNetwork {
     /// fresh deterministic RNG the first time a `(from, to)` link
     /// rolls a drop decision.
     ///
-    /// Iter-7 evaluator item 6: a single shared `StdRng` produced
+    /// A single shared `StdRng` produces
     /// non-replayable drop sequences under concurrent dispatch
-    /// because RNG observations were interleaved by mutex ordering.
+    /// because RNG observations get interleaved by mutex ordering.
     /// Per-link state — keyed by `(from, to)` and seeded from
     /// `mix(master_seed, from, to)` — makes every link's drop
     /// sequence deterministic regardless of when other links roll.
@@ -131,8 +131,7 @@ struct NetworkInner {
     /// Probability in `[0, 100]` that any single RPC is silently
     /// dropped. Sampled via the per-link RNG below.
     drop_pct: u8,
-    /// Per-RPC simulated VIRTUAL latency applied AFTER the drop check
-    /// (iter-10: no wall-clock sleep).
+    /// Per-RPC simulated VIRTUAL latency applied AFTER the drop check.
     latency: Duration,
     /// Per-RPC hard timeout applied to the in-process handler call.
     handler_timeout: Duration,
@@ -140,10 +139,9 @@ struct NetworkInner {
     /// use via `link_rng`. Each link's RNG is seeded from
     /// `mix(master_seed, from, to)`, so the sequence of drop
     /// decisions on any given link is fully deterministic regardless
-    /// of when OTHER links roll. This is the iter-7 fix for
-    /// evaluator item 6: a single shared RNG produced non-replayable
-    /// drop sequences because rolls were interleaved by mutex
-    /// ordering across concurrent dispatchers.
+    /// of when OTHER links roll. A single shared RNG would otherwise
+    /// produce non-replayable drop sequences, because rolls would be
+    /// interleaved by mutex ordering across concurrent dispatchers.
     link_rngs: HashMap<(NodeId, NodeId), StdRng>,
 }
 
@@ -275,8 +273,7 @@ impl SimulatedNetwork {
     }
 
     /// Configure the per-RPC simulated VIRTUAL latency. Charged to
-    /// the shared [`SimulatedClock`]; does NOT wall-clock sleep
-    /// (iter-10).
+    /// the shared [`SimulatedClock`]; does NOT wall-clock sleep.
     pub fn set_latency(&self, latency: Duration) {
         let mut g = self.lock();
         g.latency = latency;
@@ -326,8 +323,8 @@ impl SimulatedNetwork {
             // Each `(from, to)` link rolls against its own seeded
             // RNG, lazy-built on first use. This makes the drop
             // sequence on link `L` independent of when OTHER links
-            // sample — the iter-7 fix for the shared-mutex ordering
-            // hazard called out by evaluator item 6.
+            // sample — avoiding the shared-mutex ordering hazard
+            // that a single global RNG would introduce.
             let link_rng = g
                 .link_rngs
                 .entry((from, to))
@@ -416,8 +413,7 @@ impl SimulatedTransport {
         let (handler, latency, timeout) = self.network.route_decision(self.self_id, to)?;
         // Route latency through the shared SimulatedClock so it is the
         // single observable record of simulated transit time across
-        // the cluster (iter-5 wiring for Stage 8.1 "deterministic tick
-        // advancement"). `clock.delay` is a no-op when `latency`
+        // the cluster. `clock.delay` is a no-op when `latency`
         // is `Duration::ZERO`, preserving the prior fast path.
         if latency > Duration::ZERO {
             self.network.clock().delay(latency).await;
@@ -540,11 +536,11 @@ mod tests {
         assert!(!net.lock().dead.contains(&NodeId(3)));
     }
 
-    // Iter-6 evaluator item 8: cut_directed must be one-way. Iter-4's
+    // cut_directed must be one-way. A prior implementation's
     // route_decision rejected traffic in either direction whenever
     // `(from, to)` OR `(to, from)` was present in the cut set, which
-    // collapsed `cut_directed` into `partition`. Iter-5 fixed
-    // route_decision to check ONLY the `(from, to)` direction; this
+    // collapsed `cut_directed` into `partition`. The current
+    // route_decision checks ONLY the `(from, to)` direction; this
     // test pins the invariant so a future refactor cannot regress it.
     #[test]
     fn cut_directed_blocks_only_one_direction() {
@@ -562,7 +558,7 @@ mod tests {
         );
     }
 
-    // Iter-6 evaluator item 8 (paired): route_decision must reject
+    // route_decision must reject
     // traffic only along the cut direction. We don't register a real
     // handler — the partition check happens BEFORE handler lookup, so
     // the two directions produce distinguishable errors:
@@ -614,10 +610,10 @@ mod tests {
         );
     }
 
-    // Iter-7 evaluator item 6: per-link RNG state must produce
+    // Per-link RNG state must produce
     // deterministic, replayable drop sequences regardless of how
     // concurrent dispatchers interleave their drop rolls. With a
-    // single shared RNG (iter-6 and earlier) the sequence on link L
+    // single shared RNG the sequence on link L
     // depended on how many other links had rolled first, so a
     // re-run under different task scheduling produced a different
     // drop sequence even with the same master seed.
@@ -676,7 +672,7 @@ mod tests {
         );
     }
 
-    // Iter-7 evaluator item 6 (companion): different links seeded
+    // Different links seeded
     // from the same master must produce distinct sequences. If
     // mix_link_seed accidentally collapsed `(from, to)` and
     // `(to, from)` to the same value, a half-duplex test that

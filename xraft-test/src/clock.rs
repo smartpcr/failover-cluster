@@ -1,17 +1,16 @@
-//! [`SimulatedClock`] — virtual tick counter (iter-10: no wall-clock
-//! coupling) shared by the
+//! [`SimulatedClock`] — virtual tick counter shared by the
 //! [`SimulatedNetwork`](crate::network::SimulatedNetwork) and any test
 //! that wants to assert on the simulated time elapsed during a
 //! scenario.
 //!
-//! # What this type actually does (iter 7: scope widened; iter-10: virtual-only delay)
+//! # What this type actually does
 //!
 //! Every per-RPC latency window applied by
 //! [`SimulatedNetwork`](crate::network::SimulatedNetwork) goes through
 //! [`SimulatedClock::delay`], which atomically advances an internal
 //! tick counter denominated in microseconds and yields once to the
-//! tokio runtime. As of iter-10 the call NO LONGER wall-clock sleeps
-//! (iter-9 evaluator item 4): nonzero-latency simulated-network tests
+//! tokio runtime. Currently the call NO LONGER wall-clock sleeps,
+//! so nonzero-latency simulated-network tests
 //! are now scheduler-independent and run in pure virtual time. After a
 //! scenario, the test can read [`SimulatedClock::now_micros`] /
 //! [`SimulatedClock::elapsed`] to see exactly how much simulated
@@ -20,19 +19,19 @@
 //! changes, and per-RPC delivery delays all flow through one
 //! observable clock.
 //!
-//! # Deterministic driver-tick advancement (Stage 8.1 iter 7+)
+//! # Deterministic driver-tick advancement (Stage 8.1)
 //!
-//! Iter 7 added [`ManualTickSource`] — a
+//! The harness adds [`ManualTickSource`] — a
 //! [`xraft_server::TickSource`] implementation handed to (and woken
 //! by) the test [`SimulatedCluster`](crate::simulated::SimulatedCluster)
-//! harness. Iter 8 replaced the initial `tokio::sync::Notify`-backed
+//! harness. This version replaced the initial `tokio::sync::Notify`-backed
 //! wakeup with a per-listener
 //! [`tokio::sync::mpsc::UnboundedSender`] so ticks BUFFER when the
 //! driver is busy processing RPCs and are NEVER dropped.
 //! `Notify::notify_waiters` only wakes listeners currently parked on
 //! `notified()`; a driver that yields between a `tick().await` return
 //! and the next `tick().await` call loses every notify that fires
-//! during that gap (iter-7 evaluator finding 2). Per-listener
+//! during that gap. Per-listener
 //! unbounded mpsc guarantees one-to-one delivery: every controller
 //! `trigger()` enqueues one `()` into every registered listener's
 //! channel; each listener drains them in order via `recv().await`.
@@ -60,7 +59,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use xraft_server::TickSource;
 
-/// Virtual tick counter (iter-10: no wall-clock coupling). Cheap to
+/// Virtual tick counter. Cheap to
 /// clone via `Arc`.
 ///
 /// Internal storage is microseconds since construction (or last
@@ -87,14 +86,14 @@ impl SimulatedClock {
     /// dispatch path on every RPC so the clock is the single observable
     /// record of how much transit time the simulated network charged.
     ///
-    /// # Iter-9 evaluator item 4 (iter-10 fix)
+    /// # Pure virtual delay
     ///
-    /// Pre-iter-10 this method did `tokio::time::sleep(d).await`, which
+    /// An earlier version method did `tokio::time::sleep(d).await`, which
     /// coupled any nonzero-latency simulated-network scenario to the
     /// tokio scheduler — a 50 ms configured latency burned 50 ms of
     /// REAL wall-clock per RPC and made partition tests that issue
     /// thousands of RPCs intolerably slow AND scheduler-dependent.
-    /// Iter-10 makes the call PURE VIRTUAL: simulated time still
+    /// This version makes the call PURE VIRTUAL: simulated time still
     /// advances faithfully (so the harness's clock-elapsed observable
     /// is unchanged), but no wall-clock waiting happens. A single
     /// `yield_now()` is preserved so concurrent tasks still get
@@ -154,13 +153,13 @@ impl SimulatedClock {
 ///
 /// # Why per-listener mpsc, not a shared `Notify`
 ///
-/// Iter 7 first attempt used [`tokio::sync::Notify::notify_waiters`]
+/// An earlier attempt used [`tokio::sync::Notify::notify_waiters`]
 /// and lost any tick that fired while a driver was busy processing
-/// RPCs between `tick().await` calls (iter-7 evaluator finding 2).
+/// RPCs between `tick().await` calls.
 /// `notify_waiters` only wakes listeners CURRENTLY parked on
 /// `notified()`; a driver that yields between a `tick().await`
 /// return and the next `tick().await` call observes zero
-/// notifications during the gap. Iter 8 swaps in a per-listener
+/// notifications during the gap. The current version swaps in a per-listener
 /// [`UnboundedSender`] / [`UnboundedReceiver`] pair — every
 /// `trigger()` enqueues a unit `()` into every registered listener's
 /// channel, and each listener drains them in order via
@@ -314,16 +313,16 @@ mod tests {
         assert_eq!(c.now_micros(), 0);
     }
 
-    // Iter-10 (iter-9 evaluator item 4): `delay` must advance the
+    // `delay` must advance the
     // simulated clock by the supplied duration AND must NOT wall-clock
     // sleep. The whole call should complete in well under a
     // millisecond even for a multi-second simulated `d` — that's the
-    // determinism win the evaluator asked for.
+    // determinism win the harness contract requires.
     #[tokio::test]
     async fn delay_advances_counter_without_wall_sleep() {
         let c = SimulatedClock::new();
         let before = std::time::Instant::now();
-        // Ask for 5 SECONDS of simulated transit. Pre-iter-10 this
+        // Ask for 5 SECONDS of simulated transit. An earlier version
         // would burn 5 s of real wall-clock; post-fix it should be
         // sub-millisecond.
         c.delay(Duration::from_secs(5)).await;
@@ -346,7 +345,7 @@ mod tests {
         assert_eq!(c.now_micros(), 0);
     }
 
-    // Iter-7 item 4 + iter-8 item 2: ManualTickController.trigger
+    // ManualTickController.trigger
     // must advance the SimulatedClock AND deliver one tick to every
     // attached listener with PERFECT delivery — even when ticks
     // fire before the listener has called `tick().await`, AND when
@@ -354,9 +353,9 @@ mod tests {
     // one trigger; both wake (sequentially, NOT join!); clock
     // advances exactly once.
     //
-    // The iter-7 implementation used `Notify::notify_waiters()`
+    // the earlier implementation used `Notify::notify_waiters()`
     // which silently dropped this scenario — only currently-parked
-    // listeners woke. Iter-8 swapped to per-listener mpsc so the
+    // listeners woke. The current version swapped to per-listener mpsc so the
     // tick BUFFERS in each listener's channel and is delivered on
     // the next `tick().await`. This test pins that contract.
     #[tokio::test]
@@ -386,10 +385,10 @@ mod tests {
         );
     }
 
-    // Iter-8 evaluator item 2 regression: ticks must BUFFER for
+    // Ticks must BUFFER for
     // listeners that are busy doing other work when `trigger()`
-    // fires. This is the canonical scenario the iter-7 Notify
-    // implementation broke — a driver that returns from
+    // fires. This is the canonical scenario a `Notify`-based
+    // implementation would break — a driver that returns from
     // `tick().await`, processes an inbound RPC, then loops back to
     // `tick().await` would miss every `notify_waiters()` fired
     // during the processing gap.
@@ -437,7 +436,7 @@ mod tests {
         );
     }
 
-    // Iter-7 evaluator item 4 (paired): driver pumping through a
+    // driver pumping through a
     // ManualTickSource produces deterministic clock advancement —
     // ten triggers + ten ticks = ten quanta on the clock, with no
     // intervening wall-clock dependency.
@@ -473,7 +472,7 @@ mod tests {
         );
     }
 
-    // Iter-8 item 2: triggers fired while NO listener is registered
+    // triggers fired while NO listener is registered
     // simply advance the clock and drop on the floor — there is no
     // listener to deliver them to. This is the expected behaviour
     // and is documented here so a future refactor cannot

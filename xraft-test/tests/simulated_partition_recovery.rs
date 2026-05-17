@@ -6,10 +6,11 @@
 //!
 //! # Two scenarios, two engine paths
 //!
-//! Iter 4 of this test inflated election timeouts to 5-8 s so the
-//! minority never reached [`PreCandidate`](xraft_core::types::NodeRole)
-//! while partitioned — that "avoided the hard case" (iter-4 evaluator
-//! finding 4). Iter 5 exercises BOTH halves of the recovery path:
+//! An earlier shape of this test inflated election timeouts to 5-8 s
+//! so the minority never reached
+//! [`PreCandidate`](xraft_core::types::NodeRole) while partitioned —
+//! that avoided the hard case. This file exercises BOTH halves of
+//! the recovery path:
 //!
 //! * [`partitioned_minority_recovers_same_term_step_down`] — the
 //!   primary scenario. Cluster partitions, minority strands in
@@ -30,7 +31,7 @@
 //! Both tests use the engine's default 250-500 ms election window
 //! — no inflated timeouts, no hidden work-arounds.
 //!
-//! # Iter-9 evaluator items 3 + 4: deterministic-tick pump
+//! # Deterministic-tick pump
 //!
 //! Both tests detach the harness default wall-clock pump up-front
 //! and install the test-owned manual-trigger fast pump via
@@ -41,20 +42,11 @@
 //! deterministic replacement for `tokio::time::sleep` during the
 //! strand window), the test PAUSES the fast pump via
 //! [`SimulatedCluster::detach_tick_pump`] so no pump beat can
-//! interleave extra triggers with the burst (iter-9 finding 4),
-//! then re-installs the pump for the heal/recovery phase.
-//!
-//! # Iter-9 evaluator item 4: deterministic-tick pump
-//!
-//! Iter-7 flagged these tests as still relying on the default
-//! `tokio::time::interval(tick_quantum)` pump and on
-//! `tokio::time::sleep(election_max * 3)` for the strand window.
-//! Iter-9 converts them to the test-owned manual-trigger fast pump
-//! ([`SimulatedCluster::start_manual_pump`]) PLUS, for the strand
-//! inject, briefly abort the manual pump and burst-fire ticks via
-//! [`SimulatedCluster::advance_simulated_time`] so the
-//! pre-heal minority state is established by a precise number of
-//! triggers rather than racing the background pump.
+//! interleave extra triggers with the burst, then re-installs
+//! the pump for the heal/recovery phase. The strand-window burst
+//! uses [`SimulatedCluster::advance_simulated_time`] to fire a
+//! precise number of triggers rather than racing a background
+//! pump.
 
 use std::time::Duration;
 
@@ -78,8 +70,8 @@ async fn partitioned_minority_recovers_after_heal_via_higher_term_step_down() {
         .await
         .expect("cluster start must succeed");
 
-    // Iter-9 evaluator item 4: detach + install manual fast pump.
-    // Handle stored on the cluster; aborted by `shutdown()`.
+    // Detach + install manual fast pump. Handle stored on the
+    // cluster; aborted by `shutdown()`.
     cluster.detach_tick_pump().await;
     cluster.start_manual_pump(4);
 
@@ -125,10 +117,10 @@ async fn partitioned_minority_recovers_after_heal_via_higher_term_step_down() {
 
     // Confirm the majority has fully applied before sleeping into the
     // PreCandidate window — keeps the test's commit pipeline clearly
-    // ordered before the recovery phase. Iter-11 (evaluator item 5):
-    // route per-node waits through the cluster's sim-time helper so
-    // the deadline is interpreted in simulated time and the loop is
-    // event-driven on `ManualTickController`.
+    // ordered before the recovery phase. Per-node waits route through
+    // the cluster's sim-time helper so the deadline is interpreted in
+    // simulated time and the loop is event-driven on
+    // `ManualTickController`.
     for nid in &majority {
         cluster
             .await_node_applied_at_least(*nid, N_ENTRIES_TOTAL, Duration::from_secs(10))
@@ -141,11 +133,11 @@ async fn partitioned_minority_recovers_after_heal_via_higher_term_step_down() {
             });
     }
 
-    // Iter-9 evaluator item 4: detach the manual fast pump so the
-    // strand-inject burst is the SOLE driver of simulated time for
-    // this phase. `advance_simulated_time(election_max * 3)` advances
+    // Detach the manual fast pump so the strand-inject burst is the
+    // SOLE driver of simulated time for this phase.
+    // `advance_simulated_time(election_max * 3)` advances
     // `election_max * 3` of simulated time in microseconds wall-clock
-    // (300 ticks at the 5 ms harness tick_quantum). The harness now
+    // (300 ticks at the 5 ms harness tick_quantum). The harness
     // ASSERTS `tick_pump.is_none()` at the burst entry point to
     // structurally prevent pump interleaving.
     cluster.detach_tick_pump().await;
@@ -240,8 +232,8 @@ async fn partitioned_minority_recovers_after_heal_via_higher_term_step_down() {
         }
     }
 
-    // Iter-9: pump is owned by the cluster (in self.tick_pump) and
-    // aborted by `shutdown()` — no manual abort needed here.
+    // Pump is owned by the cluster (in self.tick_pump) and aborted
+    // by `shutdown()` — no manual abort needed here.
     cluster.shutdown().await;
 }
 
@@ -286,19 +278,19 @@ async fn propose_with_retry(cluster: &SimulatedCluster, payload: Bytes, entry_id
     }
 }
 
-/// Iter-5 primary scenario: minority strands in `PreCandidate`,
-/// partition heals, and the engine's same-term `leader_hint`
-/// step-down (Open Question `engine-pre-vote-recovery` →
+/// Primary scenario: minority strands in `PreCandidate`, partition
+/// heals, and the engine's same-term `leader_hint` step-down
+/// (Open Question `engine-pre-vote-recovery` →
 /// `yes-add-leader-hint-step-down`) brings the minority back to
 /// `Follower` WITHOUT requiring a leader kill.
 ///
 /// Differences vs the higher-term variant above:
 /// * No leader is killed; cluster continues running with the
 ///   original term throughout.
-/// * Recovery completes purely on the engine's iter-5 fix —
-///   minority `PreCandidate` receives same-term denials carrying
-///   `leader_hint = Some(orig_leader)`, recognises the cluster
-///   has a live leader, and steps down.
+/// * Recovery completes purely on the engine's same-term
+///   `leader_hint` step-down — minority `PreCandidate` receives
+///   same-term denials carrying `leader_hint = Some(orig_leader)`,
+///   recognises the cluster has a live leader, and steps down.
 /// * Shorter run (10 entries during partition) keeps the test
 ///   under ~6 s wall clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -311,8 +303,8 @@ async fn partitioned_minority_recovers_same_term_step_down() {
         .await
         .expect("cluster start must succeed");
 
-    // Iter-9 evaluator item 4: detach + install manual fast pump.
-    // Handle stored on the cluster; aborted by `shutdown()`.
+    // Detach + install manual fast pump. Handle stored on the
+    // cluster; aborted by `shutdown()`.
     cluster.detach_tick_pump().await;
     cluster.start_manual_pump(4);
 
@@ -364,11 +356,11 @@ async fn partitioned_minority_recovers_same_term_step_down() {
             });
     }
 
-    // Iter-9 evaluator item 4: detach the manual pump for the
-    // strand-inject burst, so simulated time advances by a precise
-    // number of triggers rather than racing the background pump.
-    // The harness asserts `tick_pump.is_none()` inside
-    // `advance_simulated_time` to make this structural.
+    // Detach the manual pump for the strand-inject burst, so
+    // simulated time advances by a precise number of triggers
+    // rather than racing the background pump. The harness asserts
+    // `tick_pump.is_none()` inside `advance_simulated_time` to make
+    // this structural.
     cluster.detach_tick_pump().await;
     cluster.advance_simulated_time(election_max * 3).await;
 
@@ -393,11 +385,11 @@ async fn partitioned_minority_recovers_same_term_step_down() {
     // Restart the manual pump for the recovery phase.
     cluster.start_manual_pump(4);
 
-    // Heal. With the iter-5 engine fix, the minority's next
-    // PreVote round produces same-term "no, here is the leader"
-    // replies carrying `leader_hint = Some(orig_leader)`. The
-    // engine then steps down to Follower → fetches → catches up.
-    // No leader kill needed.
+    // Heal. With the engine's same-term `leader_hint` step-down,
+    // the minority's next PreVote round produces same-term "no,
+    // here is the leader" replies carrying
+    // `leader_hint = Some(orig_leader)`. The engine then steps down
+    // to Follower → fetches → catches up. No leader kill needed.
     cluster.heal_all();
 
     if let Err(max) = cluster
@@ -449,20 +441,18 @@ async fn partitioned_minority_recovers_same_term_step_down() {
         }
     }
 
-    // Iter-9: pump is owned by the cluster; aborted by `shutdown()`.
+    // Pump is owned by the cluster; aborted by `shutdown()`.
     cluster.shutdown().await;
 }
 
 /// Snapshot every alive node's `(node_id, applied_count, role)` for
 /// use in panic-path diagnostics.
 ///
-/// Iter-13 evaluator item 1 (iter-14 fix): the prior shape always
-/// returned `None` for `role` because [`TestObserverHandle::status`]
-/// is `async` (it locks a [`tokio::sync::Mutex`] guarding the latest
-/// [`xraft_server::NodeStatus`]). The fix makes this helper itself
-/// `async` and awaits each node's published status, mapping
-/// `s.as_ref().map(|s| s.role)` into the result tuple — so when
-/// `partition_recovery` flakes the panic message includes WHICH
+/// This helper is `async` because [`TestObserverHandle::status`] is
+/// `async` (it locks a [`tokio::sync::Mutex`] guarding the latest
+/// [`xraft_server::NodeStatus`]); awaiting each node's published
+/// status and mapping `s.as_ref().map(|s| s.role)` into the result
+/// tuple lets `partition_recovery` flake messages report WHICH
 /// nodes are stuck in `PreCandidate` / `Candidate` instead of an
 /// uninformative `None`.
 async fn futures_per_node_snapshot(

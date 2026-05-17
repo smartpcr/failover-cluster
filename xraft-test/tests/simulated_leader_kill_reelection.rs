@@ -5,11 +5,11 @@
 //! killed and a new leader elected, then the new leader's
 //! `StateMachine` contains all 500 entries in order.
 //!
-//! # Iter-9 evaluator item 4: deterministic-tick pump
+//! # Deterministic-tick pump
 //!
-//! Iter-7 flagged that this test still relied on the harness's
-//! default wall-clock `tokio::time::interval(tick_quantum)` pump.
-//! Iter-9 replaces it with the test-owned manual-trigger fast pump
+//! The Stage 8.1 brief requires deterministic tick advancement
+//! rather than wall-clock `tokio::time::interval(tick_quantum)`.
+//! This test uses the test-owned manual-trigger fast pump
 //! ([`SimulatedCluster::start_manual_pump`]) so every tick the
 //! drivers observe flows through the
 //! [`xraft_test::ManualTickController`] — same controller the
@@ -31,8 +31,9 @@ async fn leader_kill_triggers_reelection_and_preserves_committed_entries() {
         .await
         .expect("cluster start must succeed");
 
-    // Iter-9 evaluator item 4: detach + install manual fast pump.
-    // Handle is stored on the cluster; aborted by `shutdown()`.
+    // Detach the harness default wall-clock pump and install the
+    // manual fast pump. The pump handle is stored on the cluster;
+    // `shutdown()` aborts it.
     cluster.detach_tick_pump().await;
     cluster.start_manual_pump(4);
 
@@ -134,7 +135,7 @@ async fn leader_kill_triggers_reelection_and_preserves_committed_entries() {
         );
     }
 
-    // Iter-9: pump is owned by the cluster (in self.tick_pump) and
+    // Pump is owned by the cluster (in self.tick_pump) and is
     // aborted by `shutdown()` — no manual abort needed here.
     cluster.shutdown().await;
 }

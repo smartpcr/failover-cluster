@@ -1,13 +1,13 @@
 //! Re-export shim for the canonical teardown-noise allowlist.
 //!
-//! # Why this is a shim (iter-13)
+//! # Why this is a shim
 //!
-//! Earlier iterations parked the predicate here, but Stage 8.1's
-//! `xraft-server` integration tests need to consume the same
+//! The canonical predicate body lives in `xraft-server` because
+//! `xraft-server`'s integration tests need to consume the same
 //! allowlist (see `xraft-server/tests/stage_7_2_static_voter_set.rs`
 //! `assert_clean_shutdown` helper). `xraft-server` cannot depend on
 //! `xraft-test` (the reverse dep already exists in `Cargo.toml`), so
-//! the canonical definition moved into
+//! the canonical definition lives in
 //! [`xraft_server::teardown`](xraft_server::teardown). This module
 //! is kept as a thin re-export so the rest of `xraft-test` keeps
 //! reading `crate::teardown::is_allowed_teardown_noise` without

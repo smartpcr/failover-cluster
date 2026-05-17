@@ -37,7 +37,7 @@ use xraft_core::types::LogIndex;
 #[derive(Debug, Clone, Default)]
 pub struct RecordingStateMachine {
     inner: Arc<Mutex<RecordingInner>>,
-    /// Iter-10 evaluator item 6: bumped on every `apply()` so the
+    /// Bumped on every `apply()` so the
     /// [`RecordingHandle::await_applied_at_least`] /
     /// [`crate::simulated::SimulatedCluster::await_applied_at_least`]
     /// wait loops are EVENT-DRIVEN instead of fixed-cadence polling.
@@ -133,11 +133,12 @@ impl RecordingHandle {
     /// until `deadline` elapses. Returns `Ok(())` on success, or the
     /// observed count on timeout.
     ///
-    /// # Iter-10 evaluator item 6: EVENT-DRIVEN
+    /// # Event-driven wait
     ///
-    /// Pre-iter-10 this slept `5 ms` between polls — a fixed
-    /// wall-clock cadence that compounded under workspace-parallel
-    /// scheduler pressure. Iter-10 wires it to the shared
+    /// A naive poll-based implementation would sleep `5 ms` between
+    /// polls — a fixed wall-clock cadence that compounds under
+    /// workspace-parallel scheduler pressure. This loop is wired to
+    /// the shared
     /// [`Notify`](tokio::sync::Notify) bumped by every
     /// [`RecordingStateMachine::apply`] call, so the loop wakes the
     /// instant an entry is applied. A `50 ms` periodic safety-net
@@ -183,7 +184,7 @@ impl StateMachine for RecordingStateMachine {
             .map_err(|e| xraft_core::error::XRaftError::Storage(format!("recording sm: {e}")))?;
         guard.applied.push((index.0, command.to_vec()));
         drop(guard);
-        // Iter-10 evaluator item 6: bump the shared notify so the
+        // Bump the shared notify so the
         // event-driven `await_applied_at_least` wait wakes
         // immediately on every apply.
         self.state_change.notify_waiters();

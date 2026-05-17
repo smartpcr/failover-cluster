@@ -68,10 +68,10 @@ const DEFAULT_TICK_MS: u64 = 5;
 /// runtime can starve nodes for >100 ms; with a tight 60-120 ms
 /// window some followers time out into `PreCandidate` BEFORE the
 /// newly-elected leader's first fetch reaches them. The KRaft
-/// engine NOW honors `PreVoteResponse.leader_hint` and steps a
+/// engine honors `PreVoteResponse.leader_hint` and steps a
 /// stranded `PreCandidate` back to `Follower`
-/// (`xraft-core/src/node.rs::handle_pre_vote_response`, iter-5
-/// landing for operator answer
+/// (see `xraft-core/src/node.rs::handle_pre_vote_response`,
+/// operator answer
 /// `engine-pre-vote-recovery → yes-add-leader-hint-step-down`), but
 /// a wide window is still preferable as a belt-and-suspenders
 /// safety margin: it keeps the engine on the happy path (followers
@@ -183,7 +183,7 @@ pub struct SimulatedCluster {
     /// Shared message-routing fabric. Tests use this to introduce
     /// faults (partitions, packet loss, latency).
     pub network: Arc<SimulatedNetwork>,
-    /// Virtual tick counter (iter-10: no wall-clock coupling).
+    /// Virtual tick counter.
     /// Shared with the [`SimulatedNetwork`] AND with every driver's
     /// [`ManualTickSource`](crate::clock::ManualTickSource) so every
     /// per-RPC latency window AND every driver tick atomically advance
@@ -201,15 +201,15 @@ pub struct SimulatedCluster {
     /// [`Self::tick_once`] for fully deterministic control —
     /// see [`Self::detach_tick_pump`].
     tick_pump: Option<JoinHandle<()>>,
-    /// Iter-10 evaluator item 6: ONE notify shared with every node's
+    /// ONE notify shared with every node's
     /// [`TestObserver`] and [`RecordingStateMachine`]. Bumped on every
     /// status publish and every SM apply, so
     /// [`Self::await_leader`] / [`Self::await_applied_at_least`] wake
     /// the instant ANY relevant state changes — replaces the fixed
-    /// `5 ms` polling cadence the iter-9 evaluator flagged as
+    /// `5 ms` polling cadence an earlier review flagged as
     /// scheduler-dependent.
     pub state_change: Arc<Notify>,
-    /// Iter-12 (iter-10 evaluator item 4): driver tasks that were
+    /// driver tasks that were
     /// aborted via [`Self::kill`] are PARKED here instead of being
     /// dropped, so [`Self::shutdown`] can `.await` each one and
     /// surface any panic that happened BEFORE the abort signal
@@ -236,12 +236,12 @@ impl SimulatedCluster {
         let clock = SimulatedClock::new();
         let network = SimulatedNetwork::new_with_clock(cfg.seed, clock.clone());
 
-        // Iter-10 evaluator item 6: ONE notify shared across every
+        // ONE notify shared across every
         // node's TestObserver and RecordingStateMachine so the
         // cluster-level event-driven await loops wake on any change.
         let state_change = Arc::new(Notify::new());
 
-        // Iter-7 evaluator item 4: every driver tick flows through a
+        // every driver tick flows through a
         // shared ManualTickController whose `trigger` atomically
         // advances `clock` by `tick_quantum`. The default pump task
         // below replaces what `tokio::time::interval` used to do
@@ -368,7 +368,7 @@ impl SimulatedCluster {
         hs_store.persist_voter_set(&voter_set)?;
 
         // ---- engine + state machine + observer ----------------------------
-        // Iter-7 evaluator item 5: derive a per-node deterministic
+        // derive a per-node deterministic
         // seed via `mix64(cfg.seed, node_id)` so the engine's election-
         // timer RNG is reproducible AND distinct across nodes
         // (`cfg.seed` alone would have every node fire at the same
@@ -391,7 +391,7 @@ impl SimulatedCluster {
             ..DriverConfig::default()
         };
 
-        // Iter-7 evaluator item 4: install the externally-driven
+        // install the externally-driven
         // ManualTickSource so the driver's `Input::Tick` cadence
         // flows through the shared ManualTickController instead of
         // a per-driver `tokio::time::interval`. Each tick atomically
@@ -442,12 +442,12 @@ impl SimulatedCluster {
     /// `(NodeId, term)` on success, or
     /// `XRaftError::ElectionTimeout` on deadline.
     ///
-    /// Iter-7 evaluator items 2 / 3: strict follower agreement is
+    /// Strict follower agreement is
     /// REQUIRED — returning as soon as one node sees itself as Leader
     /// races against follower convergence and lets proposing tests
     /// fire before any follower has acknowledged the new leader.
     ///
-    /// # Iter-9 evaluator items 3 + 6 (iter-10 fix) + iter-11 follow-up: event-driven sim-time deadline
+    /// # event-driven sim-time deadline
     ///
     /// `deadline` is measured in SIMULATED time, observed via
     /// [`SimulatedClock::elapsed`]. The simulated clock advances
@@ -456,7 +456,9 @@ impl SimulatedCluster {
     /// [`Self::tick_once`] calls), so this method's notion of "time
     /// passing" is decoupled from tokio scheduling.
     ///
-    /// **Iter-10 evaluator item 6**: the poll is event-driven on
+    /// # Event-driven wait
+    ///
+    /// The poll is event-driven on
     /// state change. The loop registers a
     /// [`Self::state_change`] notify waiter, bumped on every
     /// [`TestObserver::on_status`] publish, so an actual
@@ -465,7 +467,7 @@ impl SimulatedCluster {
     /// wake (bounded deadline-check cadence; defends against any
     /// residual missed-wake race).
     ///
-    /// **Iter-11**: an earlier event-driven variant ALSO raced a
+    /// An earlier event-driven variant ALSO raced a
     /// fresh [`crate::clock::ManualTickSource`] listener. That arm
     /// was REMOVED because when [`Self::start_manual_pump`] is
     /// running, the manual fast pump fires hundreds of triggers per
@@ -494,7 +496,7 @@ impl SimulatedCluster {
             if let Some(converged) = self.try_converged_leader().await {
                 return Ok(converged);
             }
-            // Iter-9 evaluator item 3: deadline is SIMULATED time.
+            // deadline is SIMULATED time.
             let sim_elapsed = self.clock.elapsed().saturating_sub(start_sim);
             if sim_elapsed >= deadline {
                 return Err(XRaftError::ElectionTimeout);
@@ -521,9 +523,9 @@ impl SimulatedCluster {
     /// progress requires either manual [`Self::tick_once`] calls or a
     /// re-attached [`Self::start_manual_pump`].
     ///
-    /// # Iter-9 evaluator item 2 (iter-10 fix)
+    /// # Async drain on cancellation
     ///
-    /// Pre-iter-10 this was a sync method that returned the previous
+    /// An earlier version was a sync method that returned the previous
     /// `Option<JoinHandle<()>>`; callers either dropped the handle or
     /// called `.abort()` themselves. Both shapes left a hazard: a
     /// `JoinHandle::abort()` only schedules cancellation, which
@@ -533,7 +535,7 @@ impl SimulatedCluster {
     /// supposedly-isolated `advance_simulated_time` deterministic
     /// burst that typically follows.
     ///
-    /// Iter-10 makes this `async`: after `abort()` we `await` the
+    /// This version makes this `async`: after `abort()` we `await` the
     /// handle to drain the cancellation, so by the time the function
     /// returns the pump task is GUARANTEED to have stopped firing
     /// triggers. Every call site must now be `cluster.detach_tick_pump().await`.
@@ -544,8 +546,7 @@ impl SimulatedCluster {
             // guaranteed to have stopped before this returns. Without
             // this, the just-aborted task could still fire one trigger
             // before reaching its next `.await` and interleave with
-            // the deterministic burst the caller is about to run
-            // (iter-9 evaluator item 2).
+            // the deterministic burst the caller is about to run.
             let _ = handle.await;
         }
     }
@@ -565,7 +566,7 @@ impl SimulatedCluster {
     /// handle is STORED on the cluster (in `self.tick_pump`) and
     /// will be aborted by [`Self::shutdown`].
     ///
-    /// # Iter-9 evaluator items 3 + 4
+    /// # Why long-running scenarios use this pump
     ///
     /// This is the path the long-running simulated scenarios
     /// (`simulated_propose_thousand_entries`,
@@ -583,14 +584,15 @@ impl SimulatedCluster {
     /// race-free burst-advance via [`Self::advance_simulated_time`]
     /// before resuming it.
     ///
-    /// # Iter-10 evaluator item 2: gate-scheduler-independent cadence
+    /// # Scheduler-independent cadence
     ///
-    /// Earlier iters paced this loop with `tokio::time::sleep(500 µs)`
+    /// A naive implementation would pace this loop with
+    /// `tokio::time::sleep(500 µs)`
     /// between bursts, which under workspace-parallel `cargo test` —
     /// where many test binaries each claim a multi-thread runtime —
-    /// got jittered into multi-second pauses by the OS timer subsystem
+    /// gets jittered into multi-second pauses by the OS timer subsystem
     /// (visible as `simulated_propose_thousand_entries` hanging past
-    /// 10 min under default `--test-threads=auto`). The iter-10 fix
+    /// 10 min under default `--test-threads=auto`). The current pump
     /// replaces the wall-clock sleep with a yield-based cadence —
     /// the pump pays [`Self::PUMP_DRAIN_YIELDS`]
     /// `tokio::task::yield_now().await` calls between bursts instead.
@@ -627,7 +629,7 @@ impl SimulatedCluster {
                 for _ in 0..ticks_per_burst {
                     controller.trigger();
                 }
-                // Iter-12: yields + sub-ms sleep so engine tasks on
+                // yields + sub-ms sleep so engine tasks on
                 // other worker threads make progress. yield_now()
                 // alone reschedules only the CURRENT task on its
                 // worker, leaving sibling-worker engine tasks
@@ -642,8 +644,7 @@ impl SimulatedCluster {
         self.tick_pump = Some(handle);
     }
 
-    /// Iter-8 evaluator item 4 (refined iter-9 + iter-10): burst-advance
-    /// simulated time by firing `count` ticks in batches of
+    /// Burst-advance simulated time by firing `count` ticks in batches of
     /// [`Self::ADVANCE_BATCH_SIZE`], yielding
     /// [`Self::PUMP_DRAIN_YIELDS`] times between batches so the
     /// drivers actually drain the queued ticks and emit heartbeats /
@@ -656,7 +657,7 @@ impl SimulatedCluster {
     ///
     /// # Why batched, not a single mass-trigger
     ///
-    /// An iter-9 dead end fired all `count` triggers in microseconds
+    /// An earlier dead end fired all `count` triggers in microseconds
     /// of wall-clock then yielded once. That dumped a 300-tick backlog
     /// onto every driver and serialised the way each engine
     /// processed it. In the `same_term_step_down` test, the leader
@@ -670,11 +671,11 @@ impl SimulatedCluster {
     /// then the runtime drains so heartbeats can flow before the
     /// next batch.
     ///
-    /// # Iter-9 structural enforcement
+    /// # Structural enforcement
     ///
     /// The harness asserts `tick_pump.is_none()` so a concurrent
     /// wall-clock or fast pump cannot interleave extra triggers
-    /// with the burst (iter-9 evaluator item 4). Tests using
+    /// with the burst. Tests using
     /// [`Self::start_manual_pump`] for the bulk of their run MUST
     /// call [`Self::detach_tick_pump`] before this burst and
     /// re-attach via another `start_manual_pump` after.
@@ -682,7 +683,7 @@ impl SimulatedCluster {
         assert!(
             self.tick_pump.is_none(),
             "advance_simulated_ticks requires detach_tick_pump() first \
-             (iter-9 evaluator item 4: prevents pump interleaving)"
+             (prevents pump interleaving)"
         );
         let batch = Self::ADVANCE_BATCH_SIZE;
         let mut remaining = count;
@@ -691,7 +692,7 @@ impl SimulatedCluster {
             for _ in 0..n {
                 self.tick_controller.trigger();
             }
-            // Iter-12: yields + sub-ms sleep so engine tasks on
+            // yields + sub-ms sleep so engine tasks on
             // sibling worker threads can drain queued ticks.
             for _ in 0..Self::PUMP_DRAIN_YIELDS {
                 tokio::task::yield_now().await;
@@ -706,7 +707,7 @@ impl SimulatedCluster {
     /// `at_least` rounds UP so callers asking for "election_max * 3"
     /// get strictly >= that much simulated time.
     ///
-    /// Iter-9: same `tick_pump.is_none()` assertion as
+    /// Uses the same `tick_pump.is_none()` assertion as
     /// [`Self::advance_simulated_ticks`]; same batched cadence so
     /// heartbeats can flow between election-timer increments.
     pub async fn advance_simulated_time(&self, at_least: Duration) {
@@ -726,7 +727,7 @@ impl SimulatedCluster {
     /// pays between bursts. Sized for the largest test cluster
     /// (5 nodes × ~3 awaits per tick-drain) with headroom.
     ///
-    /// **Iter-12**: yields alone are not sufficient on Windows
+    /// Yields alone are not sufficient on Windows
     /// multi-thread runtimes — `yield_now()` reschedules the
     /// current task but does not surrender the worker thread to the
     /// OS, so other engine tasks pinned to other workers do not
@@ -739,7 +740,7 @@ impl SimulatedCluster {
 
     /// Sub-millisecond wall-clock pause paid between tick bursts so
     /// engine tasks on other worker threads get scheduling time.
-    /// Iter-12 fix: 32 `yield_now()` calls alone proved insufficient
+    /// Empirically, 32 `yield_now()` calls alone proved insufficient
     /// to drain queued ticks on Windows multi-thread runtimes —
     /// observed as `simulated_three_node_election` failing in 0.00s
     /// (the harness completed its 100-poll budget before any engine
@@ -748,8 +749,7 @@ impl SimulatedCluster {
     /// the test's wall-clock budget.
     const PUMP_DRAIN_PAUSE_MICROS: u64 = 100;
 
-    /// Iter-8 evaluator items 4 & 5 (refined iter-10 item 2):
-    /// deterministic-tick-driven version of [`Self::await_leader`].
+    /// Deterministic-tick-driven version of [`Self::await_leader`].
     /// Caller is responsible for having already detached the
     /// wall-clock pump via [`Self::detach_tick_pump`]. Between each
     /// leader-status poll this advances the cluster clock by
@@ -763,9 +763,9 @@ impl SimulatedCluster {
     /// to drain `ticks_per_poll` buffered ticks per driver — see
     /// the constant's doc-comment for sizing.
     ///
-    /// Iter-10 evaluator item 2: previously this loop paced itself
-    /// with `tokio::time::sleep(500 µs)`, which under
-    /// workspace-parallel `cargo test` got jittered into
+    /// A naive implementation would pace this loop with
+    /// `tokio::time::sleep(500 µs)`, which under
+    /// workspace-parallel `cargo test` gets jittered into
     /// multi-second pauses by the OS timer subsystem. Yield-based
     /// pacing eliminates that dependency.
     ///
@@ -801,7 +801,7 @@ impl SimulatedCluster {
             for _ in 0..ticks_per_poll {
                 self.tick_controller.trigger();
             }
-            // Iter-12: yields + sub-ms sleep so engine tasks on
+            // yields + sub-ms sleep so engine tasks on
             // sibling worker threads can drain queued ticks. See
             // `PUMP_DRAIN_PAUSE_MICROS` doc for why yields alone
             // were insufficient.
@@ -907,7 +907,7 @@ impl SimulatedCluster {
     /// least `target` entries. Returns the highest observed apply
     /// count across all nodes on timeout.
     ///
-    /// # Iter-9 evaluator items 3 + 6 (iter-10 fix) + iter-11 follow-up
+    /// # Deadline semantics
     ///
     /// `deadline` is measured in SIMULATED time via
     /// [`SimulatedClock::elapsed`], matching [`Self::await_leader`].
@@ -915,8 +915,8 @@ impl SimulatedCluster {
     /// cluster's [`Self::state_change`] notify (bumped on every
     /// [`crate::state_machine::RecordingStateMachine::apply`] AND
     /// every observer status publish) plus a `50 ms` periodic safety
-    /// net. The tick-source arm present in iter-10 was REMOVED in
-    /// iter-11 for the same reason as [`Self::await_leader`]: under
+    /// net. A previously-present tick-source arm was REMOVED for
+    /// the same reason as [`Self::await_leader`]: under
     /// [`Self::start_manual_pump`] the listener drained buffered
     /// triggers faster than drivers could process them, starving
     /// apply progress. State-change notify is the correct signal —
@@ -933,7 +933,7 @@ impl SimulatedCluster {
         let wall_backstop = deadline.saturating_mul(10) + Duration::from_secs(30);
         loop {
             // Register state-change waiter BEFORE the predicate
-            // check (iter-10 evaluator item 6, missed-wake guard).
+            // check (missed-wake guard).
             let state_waiter = self.state_change.notified();
             tokio::pin!(state_waiter);
             state_waiter.as_mut().enable();
@@ -959,7 +959,7 @@ impl SimulatedCluster {
             if min_observed >= target {
                 return Ok(());
             }
-            // Iter-9 evaluator item 3: SIMULATED-time deadline.
+            // SIMULATED-time deadline.
             let sim_elapsed = self.clock.elapsed().saturating_sub(start_sim);
             if sim_elapsed >= deadline {
                 return Err(max_observed);
@@ -982,7 +982,7 @@ impl SimulatedCluster {
     /// `target` entries. Returns the observed apply count on timeout
     /// (or `usize::MAX` if `node_id` is unknown).
     ///
-    /// # Iter-10 evaluator item 6 + iter-11 follow-up: event-driven
+    /// # event-driven
     ///
     /// Uses the same `state_change` notify + 50 ms safety-net wake as
     /// [`Self::await_applied_at_least`]. Tolerates dead nodes: the
@@ -1049,19 +1049,20 @@ impl SimulatedCluster {
     /// with the [`Driver`], so a future `revive` (not implemented in
     /// this stage) would start from an empty log.
     ///
-    /// # Iter-12 (iter-10 evaluator item 4): killed handles are PARKED, not dropped
+    /// # killed handles are PARKED, not dropped
     ///
-    /// Earlier iters called `task.abort()` and then dropped the
-    /// [`JoinHandle`]. That hid one failure mode: if the driver task
+    /// A naive `task.abort()`-then-drop shape would hide one failure
+    /// mode: if the driver task
     /// PANICKED at any moment before the abort signal reached it, the
-    /// panic message died with the dropped handle and the test
-    /// reported `ok`. The iter-12 fix parks the (still-aborted) handle
+    /// panic message would die with the dropped handle and the test
+    /// would report `ok`. The current implementation parks the
+    /// (still-aborted) handle
     /// in [`Self::killed_tasks`]; [`Self::shutdown`] later `.await`s
     /// every parked handle and classifies a `JoinError::is_panic()`
     /// outcome as a fatal pre-existing panic regardless of when in
     /// the test's lifetime the abort fired.
     pub fn kill(&mut self, node_id: NodeId) {
-        // Iter-12: take the task first via a scoped borrow of
+        // take the task first via a scoped borrow of
         // `self.nodes`, then push into `self.killed_tasks` after the
         // borrow ends to keep the borrow checker happy.
         let mut taken_task: Option<JoinHandle<XResult<()>>> = None;
@@ -1075,7 +1076,7 @@ impl SimulatedCluster {
             }
         }
         if let Some(task) = taken_task {
-            // Iter-12: park the aborted handle so shutdown() can
+            // park the aborted handle so shutdown() can
             // surface a pre-existing panic. Dropping it here
             // would silently swallow `JoinError::is_panic()`.
             self.killed_tasks.push((node_id, task));
@@ -1107,18 +1108,18 @@ impl SimulatedCluster {
     /// Gracefully shut down every alive node and await their driver
     /// tasks. Idempotent — repeated calls are no-ops after the first.
     ///
-    /// # Iter-9 evaluator item 3 (iter-11 fix): teardown errors are NOT swallowed
+    /// # teardown errors are NOT swallowed
     ///
-    /// Prior iters used `let _ = tokio::time::timeout(2s, task).await;`
-    /// which silently discarded EVERY driver task outcome —
+    /// A naive `let _ = tokio::time::timeout(2s, task).await;`
+    /// would silently discard EVERY driver task outcome —
     /// `XRaftError` returns, task panics, and shutdown deadlocks alike
-    /// passed undetected. This shutdown now classifies every outcome
+    /// would pass undetected. This shutdown instead classifies every outcome
     /// via [`crate::teardown::is_allowed_teardown_noise`]:
     ///
     /// * `Ok(())` from the driver: clean exit, ignored.
     /// * `Err(XRaftError::Storage(...))` matching the Windows tempdir
     ///   teardown race (`rename ... os error 3 | 2`): logged via
-    ///   `tracing::warn` and ignored — cosmetic, tracked since iter 4.
+    ///   `tracing::warn` and ignored — cosmetic.
     /// * Any other `Err(XRaftError)`: aggregated into the failure
     ///   list; teardown panics at end so test runs cannot pass with
     ///   real driver / storage / transport bugs hidden.
@@ -1127,7 +1128,7 @@ impl SimulatedCluster {
     /// * Timeout after 2 s: aggregated as fatal — a shutdown deadlock
     ///   is a real bug.
     ///
-    /// # Iter-12 (iter-10 evaluator item 4): killed nodes are drained too
+    /// # killed nodes are drained too
     ///
     /// Nodes killed via [`Self::kill`] now PARK their (still-aborted)
     /// [`JoinHandle`] in [`Self::killed_tasks`] instead of dropping
@@ -1137,7 +1138,7 @@ impl SimulatedCluster {
     /// `JoinError::is_cancelled()` is tolerated.
     pub async fn shutdown(mut self) {
         // Stop the tick pump first so we don't keep poking dying
-        // drivers. Iter-10 (evaluator item 2): await the cancellation
+        // drivers. await the cancellation
         // — `JoinHandle::abort()` only schedules cancellation; without
         // the subsequent `await` the just-aborted task can still fire
         // one more `controller.trigger()` and race the driver
@@ -1167,7 +1168,7 @@ impl SimulatedCluster {
                         node = node_id,
                         error = %e,
                         "driver exited with allowed teardown noise \
-                         (Windows tempdir race; cosmetic since iter 4)"
+                         (Windows tempdir race; cosmetic)"
                     );
                 }
                 Ok(Ok(Err(e))) => {
@@ -1192,7 +1193,7 @@ impl SimulatedCluster {
                 }
             }
         }
-        // Iter-12 (iter-10 evaluator item 4): drain parked killed
+        // drain parked killed
         // tasks. A pre-existing PANIC must surface; a post-abort
         // CANCELLED outcome is expected and tolerated.
         for (node_id, task) in self.killed_tasks.drain(..) {
@@ -1245,7 +1246,7 @@ impl SimulatedCluster {
     }
 }
 
-/// Iter-7 evaluator item 5: tiny SplitMix64-style mixer used to
+/// tiny SplitMix64-style mixer used to
 /// derive a per-node deterministic seed from `(cluster_seed, node_id)`.
 /// Cheap, well-distributed, no external dep — and explicit so an
 /// "are these seeds correlated?" reviewer can verify the bit

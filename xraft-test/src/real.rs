@@ -34,18 +34,22 @@ use xraft_server::{Server, ServerConfig, ServerHandle};
 
 use crate::state_machine::{RecordingHandle, RecordingStateMachine};
 
-/// Tunables for [`RealCluster::start`]. Defaults match the values
-/// the rubber-duck design critique landed on:
+/// Tunables for [`RealCluster::start`]. Defaults are tuned to keep
+/// real-network tests fast yet stable under workspace-parallel
+/// `cargo test`:
 ///
-/// * `rpc_timeout_ms = 500` — tight enough that a failover finishes
-///   inside the test deadline budget.
+/// * `rpc_timeout_ms = 800` — generous enough to survive a busy CI
+///   box's scheduling jitter, tight enough that a failover still
+///   finishes inside the test deadline budget.
 /// * `connect_timeout_ms = 200` — local-only.
 /// * `max_rpc_retries = 1` — failover happens on first follower
 ///   timeout, not after exponential back-off.
 /// * `tick_interval_ms = 5`, `fetch_interval_ms = 10` — small enough
 ///   that 100 sequential proposals commit in under 10 s.
-/// * `election_timeout_min_ms = 80`, `election_timeout_max_ms = 160` —
-///   sub-second leader election even on a busy CI box.
+/// * `election_timeout_min_ms = 250`, `election_timeout_max_ms = 500` —
+///   sub-second leader election with enough headroom that the
+///   leader's first heart-beats reach every follower before any
+///   election timer fires under heavy parallel load.
 #[derive(Debug, Clone)]
 pub struct RealClusterConfig {
     /// Number of voter nodes in the cluster (3 or 5 for the Stage 8.1
@@ -148,13 +152,13 @@ pub struct RealCluster {
     /// Pre-allocated `(NodeId, port)` map. Tests read this to predict
     /// which TCP port a given node listens on after start.
     pub ports: Vec<(NodeId, u16)>,
-    /// Iter-12 (iter-10 evaluator item 4): server handles aborted via
+    /// server handles aborted via
     /// [`Self::kill`] are PARKED here instead of being dropped, so
     /// [`Self::shutdown`] can `.await` each one and surface a panic
     /// or unexpected error that happened BEFORE the abort signal
     /// reached the underlying driver / gRPC tasks.
     killed_handles: Vec<(NodeId, ServerHandle)>,
-    /// Iter-13 evaluator item 3 (iter-14 fix): ONE [`Notify`] shared
+    /// ONE [`Notify`] shared
     /// across every node's [`RecordingStateMachine`] via
     /// [`RecordingStateMachine::with_state_change`]. Bumped on each
     /// `apply()` call on ANY node. Replaces the fixed `25 ms` poll
@@ -175,9 +179,8 @@ impl RealCluster {
     ///
     /// # Why sequential and not parallel
     ///
-    /// Iter-13 evaluator item 2 (iter-14 fix): the prior doc claimed
-    /// "in parallel" but the implementation is — and intentionally
-    /// remains — sequential:
+    /// This startup is intentionally sequential — even though the
+    /// helper signature is `async`, peers are spawned one at a time:
     ///
     /// * Each peer is given a beat to finish its gRPC `bind` and
     ///   start listening before the next peer wakes up and tries to
@@ -189,7 +192,7 @@ impl RealCluster {
     /// * Sequential `info!()` lines per node make CI failures
     ///   readable (interleaved parallel startup logs hide the
     ///   `RealCluster node started` markers).
-    /// * The port-race hazard called out by iter-7 evaluator item 7
+    /// * The port-race hazard between port allocation and bind
     ///   is solved by pre-binding every TCP listener up-front (see
     ///   `bound_listeners` below) and handing each pre-bound socket
     ///   to its server via
@@ -212,7 +215,7 @@ impl RealCluster {
         // peer endpoints from `voters` (not from a separate
         // routing table).
         //
-        // Iter-7 evaluator item 7: keep each pre-bound listener
+        // keep each pre-bound listener
         // ALIVE here (in `bound_listeners`) so the kernel does not
         // release the port between `pick_port_with_listener` and the
         // server's actual `start_with_state_machine_and_listener`
@@ -236,9 +239,9 @@ impl RealCluster {
 
         // ---- spawn each node sequentially ---------------------------------
         // Sequential spawn keeps log output readable; the port-race
-        // hazard called out by iter-7 item 7 is now resolved by
+        // hazard between port allocation and bind is now resolved by
         // handing each pre-bound listener to the server below.
-        // Iter-14: ONE Notify shared across every node's
+        // ONE Notify shared across every node's
         // RecordingStateMachine so RealCluster::await_applied_at_least
         // wakes the instant ANY node's `apply()` fires (replacing
         // the previous 25 ms poll).
@@ -328,7 +331,7 @@ impl RealCluster {
     /// `leader_id == Some(leader)`. Returns `(NodeId, term)` on
     /// success.
     ///
-    /// Iter-7 evaluator items 2 / 3: strict follower agreement is
+    /// Strict follower agreement is
     /// REQUIRED before proposing tests fire — returning as soon as
     /// one node sees itself as Leader races against follower
     /// convergence and surfaces `NotLeader { leader_hint: None }`
@@ -441,12 +444,12 @@ impl RealCluster {
     /// least `target` entries. Returns the highest observed count on
     /// timeout for caller-side diagnostics.
     ///
-    /// # Iter-13 evaluator item 3 (iter-14 fix): EVENT-DRIVEN
+    /// # EVENT-DRIVEN
     ///
-    /// Pre-iter-14 this slept `25 ms` between polls — a fixed
+    /// An earlier version slept `25 ms` between polls — a fixed
     /// wall-clock cadence that compounded under workspace-parallel
-    /// scheduler pressure on slow CI (the evaluator flagged the
-    /// 25 ms loop as scheduler-dependent latency). Iter-14 wires it
+    /// scheduler pressure on slow CI (earlier reviews flagged the
+    /// 25 ms loop as scheduler-dependent latency). This version wires it
     /// to the cluster-wide [`Notify`] bumped by every
     /// [`crate::state_machine::RecordingStateMachine::apply`] call on
     /// ANY node (shared via
@@ -510,13 +513,13 @@ impl RealCluster {
     /// Equivalent to a `kill -9` in production. Returns `true` when
     /// the abort actually fired (false if the node was already dead).
     ///
-    /// # Iter-12 (iter-10 evaluator item 4): killed handles are PARKED, not dropped
+    /// # killed handles are PARKED, not dropped
     ///
-    /// Earlier iters called `handle.abort()` and dropped the
-    /// [`ServerHandle`]. That hid one failure mode: if any underlying
-    /// driver / gRPC task PANICKED before the abort signal reached
-    /// it, the panic message died with the dropped handle. The
-    /// iter-12 fix parks the (still-aborted) handle in
+    /// Earlier `handle.abort()`-then-drop shapes hid one failure
+    /// mode: if any underlying driver / gRPC task PANICKED before
+    /// the abort signal reached it, the panic message died with
+    /// the dropped handle. This method instead parks the
+    /// (still-aborted) handle in
     /// [`Self::killed_handles`]; [`Self::shutdown`] later calls
     /// `handle.join().await` on each parked handle and surfaces any
     /// pre-existing panic (a `Transport(...)` whose payload contains
@@ -533,7 +536,7 @@ impl RealCluster {
             }
         }
         if let Some(handle) = taken {
-            // Iter-12: park the aborted handle so shutdown() can
+            // park the aborted handle so shutdown() can
             // drain it and surface pre-existing panics.
             self.killed_handles.push((node_id, handle));
             true
@@ -555,7 +558,7 @@ impl RealCluster {
 
     /// Gracefully shut down every alive node. Idempotent.
     ///
-    /// # Shutdown sequence (iter-13)
+    /// # Shutdown sequence
     ///
     /// 1. [`Self::drain_alive_handles`] — graceful shutdown + join
     ///    for every node whose `handle` was still present.
@@ -566,18 +569,18 @@ impl RealCluster {
     ///    panic at the end so a real teardown bug cannot pass
     ///    silently.
     ///
-    /// # Iter-9 evaluator item 2 (iter-11 fix): teardown errors are NOT swallowed
+    /// # teardown errors are NOT swallowed
     ///
-    /// Prior iters used `let _ = tokio::time::timeout(5s, handle.join()).await;`
-    /// for each node, which silently discarded EVERY join outcome
+    /// A naive `let _ = tokio::time::timeout(5s, handle.join()).await;`
+    /// for each node would silently discard EVERY join outcome
     /// (driver errors, transport bugs, task panics, shutdown
-    /// deadlocks). This shutdown now classifies every outcome via
+    /// deadlocks). This shutdown instead classifies every outcome via
     /// [`crate::teardown::is_allowed_teardown_noise`]:
     ///
     /// * `Ok(())` from [`ServerHandle::join`]: clean exit, ignored.
     /// * `Err(XRaftError::Storage(...))` matching the Windows tempdir
     ///   teardown race (`rename ... os error 3 | 2`): logged via
-    ///   `tracing::warn` — cosmetic, tracked since iter 4.
+    ///   `tracing::warn` — cosmetic.
     /// * Any other `Err(XRaftError)`: aggregated as a fatal failure;
     ///   teardown panics so real shutdown bugs cannot pass silently.
     /// * Timeout after 30 s: aggregated as fatal. 30 s is a generous
@@ -590,18 +593,16 @@ impl RealCluster {
     ///   abort path). The panic ensures the test author SEES the
     ///   hang; OS process exit cleans up the leaked tasks.
     ///
-    /// # Iter-12 + iter-13 (iter-10 evaluator item 4 / iter-12 evaluator item 1): killed nodes are drained too
+    /// # killed nodes are drained too
     ///
     /// Nodes killed via [`Self::kill`] PARK their (still-aborted)
-    /// [`ServerHandle`] in [`Self::killed_handles`]. The iter-13
-    /// refactor splits the drain into two clearly-named helpers
+    /// [`ServerHandle`] in [`Self::killed_handles`]. The drain splits
+    /// into two clearly-named helpers
     /// ([`Self::drain_alive_handles`] +
-    /// [`Self::drain_killed_handles`]) so any reader (or evaluator)
+    /// [`Self::drain_killed_handles`]) so any reader (or reviewer)
     /// can see at a glance that BOTH sets of handles are drained —
-    /// the iter-12 evaluator's claim that `killed_handles` was never
-    /// drained was an artifact of reading only the alive-nodes
-    /// block; the explicit `drain_killed_handles` call in this
-    /// method body is now unmistakable.
+    /// the explicit `drain_killed_handles` call in this method body
+    /// is unmistakable.
     pub async fn shutdown(mut self) {
         let mut failures: Vec<String> = Vec::new();
         self.drain_alive_handles(&mut failures).await;
@@ -644,7 +645,7 @@ impl RealCluster {
                         node = node_id,
                         error = %e,
                         "ServerHandle::join returned allowed teardown noise \
-                         (Windows tempdir race; cosmetic since iter 4)"
+                         (Windows tempdir race; cosmetic)"
                     );
                 }
                 Ok((node_id, Ok(Err(e)))) => {
@@ -673,13 +674,13 @@ impl RealCluster {
     /// by [`Self::kill`]) and append any pre-existing panic or
     /// unexpected outcome to `failures`.
     ///
-    /// # Iter-12 (iter-11 evaluator item 2): classify EVERY task's outcome
+    /// # classify EVERY task's outcome
     ///
     /// `ServerHandle::join` returns only the FIRST error encountered
     /// across `(driver, grpc, admin)`. After [`ServerHandle::abort`]
     /// the driver task's `JoinError::is_cancelled()` surfaces first
     /// — masking a subsequent gRPC or admin task panic that would
-    /// otherwise be a real bug. The iter-12 fix calls the new
+    /// otherwise be a real bug. This helper calls the
     /// `xraft_server::ServerHandle::join_collect_all_errors()` which
     /// returns a `Vec<XRaftError>` covering ALL three tasks; the
     /// classifier below runs over EACH entry so a pre-existing
@@ -695,7 +696,7 @@ impl RealCluster {
     /// `failures`; the latter is expected post-abort and silently
     /// tolerated.
     ///
-    /// Iter-13 (iter-12 evaluator item 1): extracted from the
+    /// This helper is extracted from the
     /// inline shutdown body so this drain is unmistakably visible
     /// in `shutdown()` as `self.drain_killed_handles(...).await`.
     async fn drain_killed_handles(&mut self, failures: &mut Vec<String>) {
@@ -703,7 +704,7 @@ impl RealCluster {
         for (node_id, handle) in self.killed_handles.drain(..) {
             let nid = node_id.0;
             killed_drains.push(tokio::spawn(async move {
-                // Iter-12 (iter-11 evaluator item 2): drain EVERY
+                // drain EVERY
                 // task's outcome, not just the first error. Lets
                 // the classifier below surface a gRPC/admin panic
                 // even when the driver-task cancellation came first.
@@ -716,7 +717,7 @@ impl RealCluster {
         for j in killed_drains {
             match j.await {
                 Ok((nid, Ok(errors))) => {
-                    // Iter-12 (iter-11 evaluator item 2): classify
+                    // classify
                     // EACH error from EACH task individually. A
                     // benign driver `cancelled` in errors[0] does
                     // NOT mask a real panic in errors[1] (grpc)
@@ -807,8 +808,8 @@ fn build_cluster_config(
 /// assigned port together with the live listener so the caller can
 /// hand it directly to `Server::start_with_state_machine_and_listener`.
 ///
-/// Iter-7 evaluator item 7: the original `pick_port` bound, read the
-/// port, and immediately dropped the listener, leaving a window
+/// A naive `pick_port` helper would bind, read the
+/// port, and immediately drop the listener, leaving a window
 /// during which another `cargo test --test-threads=N>1` worker could
 /// grab the same ephemeral port before the server rebound it. By
 /// keeping the listener alive and passing it into the server, the

@@ -4,27 +4,22 @@
 //! election timeouts elapse, then exactly one leader is elected and
 //! every other node agrees on the term.
 //!
-//! # Deterministic-tick advancement (iter-10 rewrite)
+//! # Deterministic-tick advancement
 //!
-//! Iter 7's evaluator (finding 3) flagged that the simulated tests
-//! still ran on the harness's default wall-clock pump, so the Stage
-//! 8.1 deterministic-tick requirement was only partially exercised.
-//! This test detaches the wall-clock pump and uses
-//! [`SimulatedCluster::start_manual_pump`] for the election phase:
-//! every tick the drivers observe is fired by a test-owned manual
-//! pump task driven by [`xraft_test::ManualTickController::trigger`],
-//! NOT by a `tokio::time::interval` cadence.
+//! The Stage 8.1 brief requires the simulated tests to drive ticks
+//! deterministically rather than through a wall-clock
+//! `tokio::time::interval`. This test detaches the wall-clock pump
+//! and uses [`SimulatedCluster::start_manual_pump`] for the election
+//! phase: every tick the drivers observe is fired by a test-owned
+//! manual pump task driven by
+//! [`xraft_test::ManualTickController::trigger`], NOT by a
+//! `tokio::time::interval` cadence.
 //!
-//! Iter-10 evaluator item 2: previously this test used the
-//! single-task `await_leader_with_manual_ticks` helper, which under
-//! workspace-parallel `cargo test` interleaved its
-//! trigger+yield+poll loop on a single worker thread and starved
-//! the driver tasks (the yield-based cadence does not force
-//! cross-worker scheduling). Switching to the spawned manual pump +
-//! the notify-driven [`SimulatedCluster::await_leader`] decouples
-//! the tick source from the convergence check and lets the
-//! drivers run on their own workers; the test now passes under
-//! default `--test-threads=auto`.
+//! The manual pump runs in its own task so the convergence wait
+//! (notify-driven [`SimulatedCluster::await_leader`]) does not have
+//! to share a worker thread with the tick source. A shared worker
+//! starves the drivers under workspace-parallel `cargo test`
+//! because yield-based cadences do not force cross-worker scheduling.
 
 use std::time::Duration;
 
@@ -35,11 +30,10 @@ use xraft_test::{SimulatedCluster, SimulatedClusterConfig};
 async fn three_node_cluster_elects_one_leader() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    // 500-1000 ms randomised election window. Iter-8 keeps this
-    // window because the test now drives simulated time directly:
-    // the WALL-clock duration of the test is bounded by tokio
-    // scheduling latency, not by `election_max`. The 2 s simulated
-    // deadline below still binds the simulated-time budget the
+    // 500-1000 ms randomised election window. The test drives
+    // simulated time directly so the WALL-clock duration is bounded
+    // by tokio scheduling latency, not by `election_max`. The 2 s
+    // simulated deadline below binds the simulated-time budget the
     // engine has to elect.
     let cfg = SimulatedClusterConfig {
         election_min_ms: 500,
@@ -51,15 +45,14 @@ async fn three_node_cluster_elects_one_leader() {
         .await
         .expect("cluster start must succeed");
 
-    // Iter-8 evaluator item 3: detach the wall-clock pump so all
-    // subsequent tick advancement flows through the test-owned
-    // [`ManualTickController`].
+    // Detach the wall-clock pump so all subsequent tick advancement
+    // flows through the test-owned [`ManualTickController`].
     cluster.detach_tick_pump().await;
-    // Iter-10 evaluator item 2: spawn the manual fast pump in its
-    // own task so the convergence wait below (notify-driven
-    // [`SimulatedCluster::await_leader`]) does not have to share a
-    // worker thread with the tick source. `ticks_per_burst=4`
-    // matches the cadence used by all other simulated tests.
+    // Spawn the manual fast pump in its own task so the convergence
+    // wait below (notify-driven [`SimulatedCluster::await_leader`])
+    // does not have to share a worker thread with the tick source.
+    // `ticks_per_burst=4` matches the cadence used by all other
+    // simulated tests.
     cluster.start_manual_pump(4);
 
     // Brief requirement: "elects a leader within 2 election timeout

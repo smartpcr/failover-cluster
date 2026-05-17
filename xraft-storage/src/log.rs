@@ -206,8 +206,7 @@ impl LogStore for MemoryLogStore {
         // still filter by `first_valid_index`, so even if a future
         // out-of-order `append` reinserts an entry `<= first_valid_index`
         // it will stay invisible.
-        self.entries
-            .retain(|e| e.index > self.first_valid_index);
+        self.entries.retain(|e| e.index > self.first_valid_index);
         Ok(())
     }
 }
@@ -243,7 +242,6 @@ const ENTRY_HEADER_LEN: usize = 21;
 /// Metadata for a single WAL segment file.
 #[derive(Debug)]
 struct SegmentInfo {
-    #[expect(dead_code)]
     base_index: LogIndex,
     path: PathBuf,
 }
@@ -1276,7 +1274,10 @@ mod tests {
 
         let mut log = MemoryLogStore::new();
         let result = log.append(&[entry]);
-        assert!(result.is_err(), "Snapshot entries must be rejected by MemoryLogStore");
+        assert!(
+            result.is_err(),
+            "Snapshot entries must be rejected by MemoryLogStore"
+        );
     }
 
     // ---- purge_prefix --------------------------------------------------

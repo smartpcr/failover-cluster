@@ -30,7 +30,7 @@ use xraft_server::{DriverObserver, NodeStatus};
 pub struct TestObserver {
     inner: Arc<Mutex<Option<NodeStatus>>>,
     node_id: NodeId,
-    // Stage 7.3 iter-5: atomic counters so the DriverObserver callbacks
+    // Atomic counters so the DriverObserver callbacks
     // (which are synchronous `&self` methods) can record without
     // blocking on a tokio::sync::Mutex. `Relaxed` is sufficient — we
     // only need monotonic visibility, not cross-event ordering.
@@ -39,7 +39,7 @@ pub struct TestObserver {
     log_compactions: Arc<AtomicU64>,
     snapshot_bytes_total: Arc<AtomicU64>,
     log_entries_compacted_total: Arc<AtomicU64>,
-    /// Iter-10 evaluator item 6: bumped on every `on_status` so the
+    /// Bumped on every `on_status` so the
     /// event-driven
     /// [`crate::simulated::SimulatedCluster::await_leader`] wait wakes
     /// the instant the driver publishes a new status (role / term /
@@ -155,7 +155,7 @@ impl DriverObserver for TestObserver {
                 let mut g = slot.lock().await;
                 *g = Some(status);
             }
-            // Iter-10 evaluator item 6: wake the cluster-level
+            // Wake the cluster-level
             // event-driven await loops the moment any node publishes
             // a new status. Released the mutex first so a woken
             // waiter doesn't immediately contend with us.

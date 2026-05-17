@@ -7,19 +7,18 @@
 //! commit, the state machine's state contains all 1000 entries in
 //! order."
 //!
-//! # Iter-9 evaluator item 4: deterministic-tick pump (iter-12 doc refresh)
+//! # Deterministic-tick pump
 //!
-//! Iter-7 flagged that this test still ran on the default wall-clock
-//! `tokio::time::interval(tick_quantum)` pump. Iter-9 replaced that
-//! with the test-owned manual-trigger fast pump
+//! The Stage 8.1 brief requires deterministic tick advancement
+//! rather than wall-clock `tokio::time::interval(tick_quantum)`.
+//! This test uses the test-owned manual-trigger fast pump
 //! ([`SimulatedCluster::start_manual_pump`]) so every tick the
 //! drivers observe flows through the
 //! [`xraft_test::ManualTickController`] — the same controller the
 //! `simulated_three_node_election` deterministic test uses.
 //!
-//! The pump's per-beat cadence has since been re-tuned. The current
-//! shape (see [`SimulatedCluster::start_manual_pump`] for the
-//! authoritative source): each beat fires `ticks_per_burst = 4`
+//! Cadence shape (see [`SimulatedCluster::start_manual_pump`] for
+//! the authoritative source): each beat fires `ticks_per_burst = 4`
 //! triggers, then pays `PUMP_DRAIN_YIELDS = 32`
 //! `tokio::task::yield_now().await` calls **plus** a sub-millisecond
 //! `tokio::time::sleep(Duration::from_micros(PUMP_DRAIN_PAUSE_MICROS))`
@@ -47,9 +46,9 @@ async fn propose_thousand_entries_converges_in_order() {
         .await
         .expect("cluster start must succeed");
 
-    // Iter-9 evaluator item 4: detach the harness default wall-clock
-    // pump and install the manual-trigger fast pump. The pump's
-    // handle is stored on the cluster and aborted by `shutdown()`.
+    // Detach the harness default wall-clock pump and install the
+    // manual-trigger fast pump. The pump's handle is stored on the
+    // cluster and aborted by `shutdown()`.
     cluster.detach_tick_pump().await;
     cluster.start_manual_pump(4);
 
@@ -119,7 +118,7 @@ async fn propose_thousand_entries_converges_in_order() {
         );
     }
 
-    // Iter-9: pump is owned by the cluster (stored in self.tick_pump)
-    // and aborted by `shutdown()` — no need to abort manually here.
+    // Pump is owned by the cluster (stored in self.tick_pump) and
+    // aborted by `shutdown()` — no need to abort manually here.
     cluster.shutdown().await;
 }
