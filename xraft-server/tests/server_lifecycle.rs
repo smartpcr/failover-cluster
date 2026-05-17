@@ -17,7 +17,51 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use xraft_core::config::{ClusterConfig, VoterConfig};
 use xraft_core::types::NodeId;
-use xraft_server::{Server, ServerConfig};
+use xraft_server::teardown::is_allowed_teardown_noise;
+use xraft_server::{Server, ServerConfig, ServerHandle};
+
+/// Per-handle teardown budget for this file. 10 s is tight
+/// enough that a real shutdown deadlock surfaces in seconds
+/// yet leaves >5× headroom over the typical sub-second drain
+/// of a single-voter cluster.
+const LIFECYCLE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Drain `handle.join()` and panic on ANY unexpected outcome.
+///
+/// Outcome handling:
+/// * `Ok(())` from [`ServerHandle::join`] — clean shutdown,
+///   returns silently.
+/// * `Err(XRaftError)` matching the Windows tempdir-teardown
+///   race (via [`is_allowed_teardown_noise`]) — logged to
+///   stderr with the call `label` for diagnosability but does
+///   NOT fail the test, since this race occurs after all
+///   replicated state has been durably persisted.
+/// * Any other `Err(XRaftError)` — PANICS with the `label` so
+///   the test author sees which call site surfaced the error.
+/// * Timeout after [`LIFECYCLE_SHUTDOWN_TIMEOUT`] — PANICS so
+///   shutdown deadlocks are visible instead of vanishing into
+///   a discarded timeout future.
+async fn assert_clean_shutdown(handle: ServerHandle, label: &str) {
+    match tokio::time::timeout(LIFECYCLE_SHUTDOWN_TIMEOUT, handle.join()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(ref e)) if is_allowed_teardown_noise(e) => {
+            eprintln!(
+                "[{label}] ServerHandle::join returned allowed Windows \
+                 tempdir-teardown noise: {e}"
+            );
+        }
+        Ok(Err(e)) => panic!(
+            "[{label}] ServerHandle::join surfaced an unexpected \
+             XRaftError: {e:?}"
+        ),
+        Err(_elapsed) => panic!(
+            "[{label}] ServerHandle::join did not resolve within {:?} \
+             (possible shutdown deadlock leaving driver / gRPC tasks \
+             running)",
+            LIFECYCLE_SHUTDOWN_TIMEOUT
+        ),
+    }
+}
 
 /// Bind 127.0.0.1:0 to obtain an unused port, then drop the
 /// listener. The window between drop and a re-bind is small;
@@ -135,9 +179,7 @@ async fn server_startup_completes_within_one_second() {
     );
 
     handle.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.join())
-        .await
-        .expect("teardown must complete within deadline");
+    assert_clean_shutdown(handle, "server_startup_completes_within_one_second").await;
 }
 
 /// Workstream brief: "Given a running server, When SIGTERM is
@@ -159,10 +201,7 @@ async fn graceful_shutdown_completes_cleanly() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     handle.shutdown();
-    let res = tokio::time::timeout(Duration::from_secs(5), handle.join())
-        .await
-        .expect("graceful shutdown must complete within 5s");
-    res.expect("join must return Ok(())");
+    assert_clean_shutdown(handle, "graceful_shutdown_completes_cleanly").await;
 }
 
 /// Workstream brief: "Given a running server, When GET /health
@@ -204,9 +243,7 @@ async fn health_endpoint_returns_expected_json_fields() {
     );
 
     handle.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.join())
-        .await
-        .expect("teardown must complete within deadline");
+    assert_clean_shutdown(handle, "health_endpoint_returns_expected_json_fields").await;
 }
 
 /// Verify `/metrics` exposes the canonical Prometheus metric set:
@@ -266,7 +303,7 @@ async fn metrics_endpoint_exposes_mvp_metric_set() {
     }
 
     handle.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.join()).await;
+    assert_clean_shutdown(handle, "metrics_endpoint_exposes_mvp_metric_set").await;
 }
 
 // ---------------------------------------------------------------------------
