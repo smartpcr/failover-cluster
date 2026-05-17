@@ -1,0 +1,47 @@
+[package]
+name = "xraft-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+xraft-core = { path = "../xraft-core" }
+xraft-transport = { path = "../xraft-transport" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Reqwest is the consensus Rust HTTP client and brings request/connect
+# timeouts, response JSON decoding, and basic retry hooks out of the
+# box. We disable the default feature set (drops the bundled tokio-rt
+# / native-tls / cookies stack we do not need) and re-enable only the
+# pieces the admin client actually exercises:
+# - `json`     — `Response::json::<T>()` typed body decode used by
+#                `AdminClient::status()` / `health()` so the call sites
+#                do not have to hand-parse `serde_json::Value`.
+# - `rustls-tls` — make the admin client TLS-capable when an operator
+#                  fronts the admin HTTP endpoint behind HTTPS (no
+#                  OpenSSL dep — uses the pure-Rust `rustls` stack).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Equal-jitter exponential backoff for AdminClient retries (matches the
+# `xraft-transport` retry policy). Standard `rand` v0.8 is workspace-pinned.
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+axum = { workspace = true }
+# Real HTTP listener for AdminClient round-trip tests — using axum here
+# avoids hand-rolling a hyper service per test. Pulled in only for
+# tests; no production dependency on axum-server in this crate.
+tower = { version = "0.5", features = ["util"] }
+# Real tonic server for the Stage 6.2 peer-client-reconnect integration
+# test (`tests/peer_reconnect.rs`). Pulls the `transport` feature so the
+# test can drive `tonic::transport::Server::serve_with_shutdown` against
+# the same `RaftGrpcServer` adapter the production grpc transport uses.
+futures-util = "0.3"
+# Integration tests stand up real tonic servers via xraft-transport's
+# `RaftGrpcServer` to verify PeerClient reconnect + pool redirect over
+# real gRPC traffic; the stub handler emits a `SnapshotChunkStream`
+# (impl-Trait over `Stream`) that needs `futures::stream::iter`.
+futures = "0.3"

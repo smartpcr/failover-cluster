@@ -1,0 +1,27 @@
+[package]
+name = "xraft-transport"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+xraft-core = { path = "../xraft-core" }
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["transport", "tls"] }
+prost = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+async-trait = "0.1"
+futures = "0.3"
+futures-core = "0.3"
+tokio-stream = { version = "0.1", features = ["net"] }
+rand = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+rcgen = "0.13"
+tempfile = "3"

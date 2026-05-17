@@ -1,0 +1,36 @@
+[workspace]
+members = [
+    "xraft-core",
+    "xraft-storage",
+    "xraft-transport",
+    "xraft-server",
+    "xraft-client",
+    "xraft-test",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+bytes = { version = "1", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+prost = "0.13"
+tonic = "0.12"
+tonic-build = "0.12"
+uuid = { version = "1", features = ["v4", "serde"] }
+toml = "0.8"
+rand = "0.8"
+crc32fast = "1"
+axum = "0.8"
+prometheus-client = "0.23"
+clap = { version = "4", features = ["derive"] }

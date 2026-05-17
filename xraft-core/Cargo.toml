@@ -1,0 +1,29 @@
+[package]
+name = "xraft-core"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+bytes = { workspace = true }
+tracing = "0.1"
+thiserror = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+prost = { workspace = true }
+futures-core = "0.3"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tracing-test = "0.2"
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

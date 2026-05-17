@@ -1,0 +1,178 @@
+syntax = "proto3";
+
+package xraft;
+
+// ---------------------------------------------------------------------------
+// Election RPCs
+// ---------------------------------------------------------------------------
+
+// Real election vote request (term already incremented).
+// Universal identity/fencing fields: cluster_id, leader_epoch (architecture §2.3).
+message VoteRequest {
+  string cluster_id     = 1;
+  uint64 leader_epoch   = 2;
+  uint64 candidate_id   = 3;
+  uint64 term           = 4;
+  uint64 last_log_index = 5;
+  uint64 last_log_term  = 6;
+}
+
+message VoteResponse {
+  string cluster_id   = 1;
+  uint64 leader_epoch  = 2;
+  uint64 term          = 3;
+  bool   vote_granted  = 4;
+  optional uint64 leader_hint = 5;
+}
+
+// Pre-vote request — sent before incrementing term to check quorum reachability.
+message PreVoteRequest {
+  string cluster_id     = 1;
+  uint64 leader_epoch   = 2;
+  uint64 candidate_id   = 3;
+  uint64 term           = 4;
+  uint64 last_log_index = 5;
+  uint64 last_log_term  = 6;
+}
+
+message PreVoteResponse {
+  string cluster_id   = 1;
+  uint64 leader_epoch  = 2;
+  uint64 term          = 3;
+  bool   vote_granted  = 4;
+  optional uint64 leader_hint = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Pull-based log replication (KRaft-style Fetch)
+// ---------------------------------------------------------------------------
+
+message FetchRequest {
+  string cluster_id       = 1;
+  uint64 leader_epoch     = 2;
+  uint64 replica_id       = 3;
+  uint64 fetch_offset     = 4;
+  uint64 last_fetched_epoch = 5;
+}
+
+// Returned when the follower's log has diverged from the leader's.
+message DivergingEpoch {
+  uint64 epoch      = 1;
+  uint64 end_offset = 2;
+}
+
+message FetchResponse {
+  string cluster_id        = 1;
+  uint64 leader_epoch      = 2;
+  uint64 leader_id         = 3;
+  uint64 high_watermark    = 4;
+  repeated LogEntry entries = 5;
+  optional DivergingEpoch diverging_epoch = 6;
+  // Stage 5.2 (implementation-plan §5.2 step 4): leader-side
+  // snapshot redirect. Set when the follower's `fetch_offset` is at
+  // or below the leader's compacted prefix (snapshot anchor). The
+  // follower switches to FetchSnapshot to catch up. Mutually
+  // exclusive with `entries` and `diverging_epoch`.
+  optional SnapshotRedirect snapshot_redirect = 7;
+  // Stage 6.2: set to true ONLY when the responder is acting as the
+  // leader at the time of the response (i.e. it has actually served
+  // entries / a divergence reply / a snapshot redirect from leader
+  // state). Set to false on the `default_deny_fetch` path where the
+  // responder echoes `leader_id` as a best-effort hint rather than
+  // an authoritative claim. Clients use this to decide whether to
+  // CACHE the (`leader_id`, `leader_epoch`) tuple as a routing hint:
+  // a hint sourced from a non-authoritative response could otherwise
+  // pin a follower's view to a deposed leader (or to itself when the
+  // hint fallback is `self.id`).
+  bool is_leader = 8;
+}
+
+// Sent by the leader inside a FetchResponse when the follower's
+// `fetch_offset` falls at or below the leader's compacted prefix
+// (i.e. <= last_snapshot.last_included_index). Carries the snapshot
+// id + anchor so the follower can issue a FetchSnapshotRequest.
+message SnapshotRedirect {
+  string snapshot_id          = 1;
+  uint64 last_included_index  = 2;
+  uint64 last_included_term   = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Log entries
+// ---------------------------------------------------------------------------
+
+enum EntryType {
+  COMMAND  = 0;
+  NO_OP    = 1;
+  CONFIG   = 2;
+}
+
+message LogEntry {
+  uint64    index      = 1;
+  uint64    term       = 2;
+  EntryType entry_type = 3;
+  bytes     data       = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot transfer
+// ---------------------------------------------------------------------------
+
+message Endpoint {
+  string host = 1;
+  uint32 port = 2;
+}
+
+message VoterRecord {
+  uint64 node_id           = 1;
+  string directory_id      = 2;
+  repeated Endpoint endpoints = 3;
+}
+
+message VoterSet {
+  repeated VoterRecord voters = 1;
+}
+
+message SnapshotMetadata {
+  uint64   last_included_index = 1;
+  uint64   last_included_term  = 2;
+  VoterSet voter_set           = 3;
+  string   snapshot_id         = 4;
+  // Size of the snapshot payload data in bytes (populated by store on save/load).
+  optional uint64 size_bytes   = 5;
+  // CRC32 checksum of the snapshot payload, zero-extended to u64.
+  optional uint64 checksum     = 6;
+}
+
+message FetchSnapshotRequest {
+  string cluster_id   = 1;
+  uint64 leader_epoch = 2;
+  uint64 replica_id   = 3;
+  string snapshot_id  = 4;
+  // Byte offset into the snapshot payload for resumable transfer.
+  // 0 means start from the beginning.
+  uint64 offset       = 5;
+  // Maximum bytes to return in this response. 0 means no limit.
+  uint64 max_bytes    = 6;
+}
+
+message FetchSnapshotChunk {
+  string cluster_id            = 1;
+  uint64 leader_epoch          = 2;
+  uint64 chunk_index           = 3;
+  bytes  data                  = 4;
+  bool   done                  = 5;
+  optional SnapshotMetadata metadata = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Raft gRPC service
+// ---------------------------------------------------------------------------
+
+service RaftService {
+  rpc Vote(VoteRequest)                       returns (VoteResponse);
+  rpc PreVote(PreVoteRequest)                 returns (PreVoteResponse);
+  rpc Fetch(FetchRequest)                     returns (FetchResponse);
+  // Server-streaming: leader streams snapshot chunks to the requesting follower.
+  rpc FetchSnapshot(FetchSnapshotRequest)     returns (stream FetchSnapshotChunk);
+}
