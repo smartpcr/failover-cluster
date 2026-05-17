@@ -19,6 +19,7 @@ rand = { workspace = true }
 bytes = { workspace = true }
 bincode = { workspace = true }
 uuid = { workspace = true }
+thiserror = { workspace = true }
 tempfile = "3"
 async-trait = "0.1"
 

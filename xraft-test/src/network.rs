@@ -65,6 +65,45 @@ use crate::clock::SimulatedClock;
 /// slowed down.
 const DEFAULT_LATENCY: Duration = Duration::ZERO;
 
+/// Per-RPC simulated latency policy.
+///
+/// * [`LatencyMode::Fixed`] — every dispatch charges the same duration
+///   to the clock.
+/// * [`LatencyMode::Range`] — every dispatch rolls a uniform value in
+///   `[min, max]` from the per-link RNG (so latency draws are
+///   reproducible from `(master_seed, from, to)` and independent of
+///   when other links sample). This is what the Stage 8.2 chaos
+///   brief means by "random message delay (50-500 ms)" — the latency
+///   is uniformly distributed and rolled fresh per RPC, not pinned
+///   to a fixed value at config time.
+#[derive(Debug, Clone, Copy)]
+pub enum LatencyMode {
+    /// Apply the same latency to every RPC.
+    Fixed(Duration),
+    /// Roll latency uniformly in `[min, max]` for each RPC against the
+    /// per-link RNG. `min <= max` is enforced by the setter.
+    Range { min: Duration, max: Duration },
+}
+
+impl LatencyMode {
+    /// Charge a sample of this policy. Pure clock-advancement
+    /// abstraction — used by the network's route_decision to compute
+    /// the latency for an individual dispatch.
+    fn sample(self, rng: &mut StdRng) -> Duration {
+        match self {
+            LatencyMode::Fixed(d) => d,
+            LatencyMode::Range { min, max } => {
+                if max <= min {
+                    return min;
+                }
+                let span = (max - min).as_nanos() as u64;
+                let pick = rng.gen_range(0..=span);
+                min + Duration::from_nanos(pick)
+            }
+        }
+    }
+}
+
 /// Per-RPC hard timeout applied to the in-process handler call. Even
 /// with no simulated network failure, a stalled or aborted driver
 /// would otherwise hang an outbound RPC forever and stall the entire
@@ -131,8 +170,10 @@ struct NetworkInner {
     /// Probability in `[0, 100]` that any single RPC is silently
     /// dropped. Sampled via the per-link RNG below.
     drop_pct: u8,
-    /// Per-RPC simulated VIRTUAL latency applied AFTER the drop check.
-    latency: Duration,
+    /// Per-RPC simulated VIRTUAL latency policy. Charged AFTER the
+    /// drop check by sampling [`LatencyMode::sample`] against the
+    /// per-link RNG.
+    latency: LatencyMode,
     /// Per-RPC hard timeout applied to the in-process handler call.
     handler_timeout: Duration,
     /// Per-link RNG state keyed by `(from, to)`. Lazy-built on first
@@ -164,7 +205,7 @@ impl SimulatedNetwork {
                 cuts: HashSet::new(),
                 dead: HashSet::new(),
                 drop_pct: 0,
-                latency: DEFAULT_LATENCY,
+                latency: LatencyMode::Fixed(DEFAULT_LATENCY),
                 handler_timeout: DEFAULT_HANDLER_TIMEOUT,
                 link_rngs: HashMap::new(),
             }),
@@ -239,6 +280,24 @@ impl SimulatedNetwork {
         g.cuts.insert((from, to));
     }
 
+    /// Heal a single directed edge `(from, to)`. The reverse direction
+    /// is unaffected — paired with [`Self::cut_directed`] so chaos
+    /// scenarios can build per-cut tracking sets and undo exactly
+    /// the cuts they introduced (rather than calling [`Self::heal_all`]
+    /// which would clobber unrelated partitions).
+    pub fn heal_directed(&self, from: NodeId, to: NodeId) {
+        let mut g = self.lock();
+        g.cuts.remove(&(from, to));
+    }
+
+    /// Snapshot of every node currently registered with the network.
+    /// Used by chaos scenarios to enumerate "everyone else" when
+    /// isolating a node (cutting every directed edge between `node`
+    /// and its peers).
+    pub fn peer_ids(&self) -> Vec<NodeId> {
+        self.lock().handlers.keys().copied().collect()
+    }
+
     /// Symmetrically partition a `group` of nodes from everyone else
     /// registered with the network. Every node in `group` becomes
     /// unable to talk to any node outside `group`, while intra-group
@@ -272,11 +331,25 @@ impl SimulatedNetwork {
         g.drop_pct = pct.min(100);
     }
 
-    /// Configure the per-RPC simulated VIRTUAL latency. Charged to
-    /// the shared [`SimulatedClock`]; does NOT wall-clock sleep.
+    /// Configure the per-RPC simulated VIRTUAL latency as a fixed
+    /// value. Charged to the shared [`SimulatedClock`]; does NOT
+    /// wall-clock sleep. For Stage 8.2's "random 50-500 ms" model
+    /// use [`Self::set_latency_range`] instead.
     pub fn set_latency(&self, latency: Duration) {
         let mut g = self.lock();
-        g.latency = latency;
+        g.latency = LatencyMode::Fixed(latency);
+    }
+
+    /// Configure the per-RPC simulated VIRTUAL latency as a uniform
+    /// range `[min, max]`. Each dispatch rolls a fresh sample from
+    /// the per-link RNG, so consecutive RPCs on the same link see
+    /// independent random latencies in the range — this is exactly
+    /// the Stage 8.2 chaos brief's "random message delay (50-500ms)"
+    /// model. `max < min` is normalised to `min`.
+    pub fn set_latency_range(&self, min: Duration, max: Duration) {
+        let mut g = self.lock();
+        let (lo, hi) = if max >= min { (min, max) } else { (min, min) };
+        g.latency = LatencyMode::Range { min: lo, max: hi };
     }
 
     /// Configure the per-RPC handler timeout. Calls that exceed this
@@ -317,18 +390,27 @@ impl SimulatedNetwork {
                 from.0, to.0
             )));
         }
-        if g.drop_pct > 0 {
-            let drop_pct = g.drop_pct;
-            let master = self.master_seed;
-            // Each `(from, to)` link rolls against its own seeded
-            // RNG, lazy-built on first use. This makes the drop
-            // sequence on link `L` independent of when OTHER links
-            // sample — avoiding the shared-mutex ordering hazard
-            // that a single global RNG would introduce.
-            let link_rng = g
-                .link_rngs
-                .entry((from, to))
-                .or_insert_with(|| StdRng::seed_from_u64(mix_link_seed(master, from, to)));
+        // Snapshot the policy fields BEFORE acquiring a mutable
+        // borrow of the link RNG (the borrow checker forbids further
+        // immutable reads through `g` while `link_rng` is live).
+        let drop_pct = g.drop_pct;
+        let latency_mode = g.latency;
+        let timeout = g.handler_timeout;
+        let handler = g.handlers.get(&to).cloned().ok_or_else(|| {
+            XRaftError::Transport(format!(
+                "no simulated handler registered for node_id {}",
+                to.0
+            ))
+        })?;
+        let master = self.master_seed;
+        // Borrow the per-link RNG once for both the drop roll AND
+        // the latency sample so a single (from, to) link advances
+        // its RNG deterministically per dispatch.
+        let link_rng = g
+            .link_rngs
+            .entry((from, to))
+            .or_insert_with(|| StdRng::seed_from_u64(mix_link_seed(master, from, to)));
+        if drop_pct > 0 {
             let roll: u8 = link_rng.gen_range(0..100);
             if roll < drop_pct {
                 return Err(XRaftError::Transport(format!(
@@ -337,13 +419,12 @@ impl SimulatedNetwork {
                 )));
             }
         }
-        let handler = g.handlers.get(&to).cloned().ok_or_else(|| {
-            XRaftError::Transport(format!(
-                "no simulated handler registered for node_id {}",
-                to.0
-            ))
-        })?;
-        Ok((handler, g.latency, g.handler_timeout))
+        // Sample latency from the same link RNG so per-RPC random
+        // delays (LatencyMode::Range) are reproducible from
+        // (master_seed, from, to). Pure pass-through for
+        // LatencyMode::Fixed.
+        let latency = latency_mode.sample(link_rng);
+        Ok((handler, latency, timeout))
     }
 }
 

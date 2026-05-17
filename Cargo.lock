@@ -2630,6 +2630,7 @@ dependencies = [
  "bytes",
  "rand 0.8.6",
  "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
