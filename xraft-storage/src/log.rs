@@ -92,23 +92,26 @@ fn parse_segment_filename(path: &Path) -> Result<LogIndex> {
 /// In-memory log store backed by a simple `Vec`.
 ///
 /// **Not suitable for production** — entries are lost on restart.
-#[derive(Debug)]
+///
+/// # Purge contract
+///
+/// Mirrors [`FileLogStore`]'s low-watermark behaviour: after
+/// `purge_prefix(N)` returns, every read API
+/// (`get`, `get_range`, `term_at`, `last_index`, `last_term`) treats
+/// indices `<= N` as if the entries never existed — even if a later
+/// `append` re-inserts an entry at one of those indices. The
+/// watermark (`first_valid_index`) is monotonically non-decreasing,
+/// so an out-of-order `purge_prefix` call with a lower argument is a
+/// no-op. This makes the in-memory and file-backed stores satisfy
+/// the same `LogStore::purge_prefix` post-condition without relying
+/// on the absence of out-of-order appends.
+#[derive(Debug, Default)]
 pub struct MemoryLogStore {
     entries: Vec<Entry>,
-    /// Logical low-watermark advanced by [`LogStore::purge_prefix`].
-    /// Initialised to `LogIndex(1)` so a fresh log reports "every
-    /// index ≥ 1 is valid"; bumped to `through + 1` on each prefix
-    /// purge.
-    first_valid: LogIndex,
-}
-
-impl Default for MemoryLogStore {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            first_valid: LogIndex(1),
-        }
-    }
+    /// Low-watermark of the logically valid log. Entries with
+    /// `index <= first_valid_index` are dead and filtered out of every
+    /// read; the field only advances forward.
+    first_valid_index: LogIndex,
 }
 
 impl MemoryLogStore {
@@ -134,7 +137,7 @@ impl LogStore for MemoryLogStore {
     }
 
     fn get(&self, index: LogIndex) -> Result<Option<Entry>> {
-        if index.0 == 0 {
+        if index.0 == 0 || index <= self.first_valid_index {
             return Ok(None);
         }
         Ok(self.entries.iter().find(|e| e.index == index).cloned())
@@ -144,17 +147,29 @@ impl LogStore for MemoryLogStore {
         Ok(self
             .entries
             .iter()
-            .filter(|e| e.index >= start && e.index < end)
+            .filter(|e| e.index >= start && e.index < end && e.index > self.first_valid_index)
             .cloned()
             .collect())
     }
 
     fn last_index(&self) -> LogIndex {
-        self.entries.last().map_or(LogIndex(0), |e| e.index)
+        // Filter so a re-append at `<= first_valid_index` cannot
+        // become the reported tail. `entries` is not strictly ordered
+        // after such a re-append, so use `max()` rather than `last()`.
+        self.entries
+            .iter()
+            .filter(|e| e.index > self.first_valid_index)
+            .map(|e| e.index)
+            .max()
+            .unwrap_or(LogIndex(0))
     }
 
     fn last_term(&self) -> Term {
-        self.entries.last().map_or(Term(0), |e| e.term)
+        self.entries
+            .iter()
+            .filter(|e| e.index > self.first_valid_index)
+            .max_by_key(|e| e.index)
+            .map_or(Term(0), |e| e.term)
     }
 
     fn truncate_from(&mut self, index: LogIndex) -> Result<()> {
@@ -163,6 +178,9 @@ impl LogStore for MemoryLogStore {
     }
 
     fn term_at(&self, index: LogIndex) -> Result<Option<Term>> {
+        if index <= self.first_valid_index {
+            return Ok(None);
+        }
         Ok(self
             .entries
             .iter()
@@ -175,18 +193,22 @@ impl LogStore for MemoryLogStore {
     }
 
     fn purge_prefix(&mut self, through_index_inclusive: LogIndex) -> Result<()> {
-        // Volatile store: dropping in-memory entries is the entire
-        // purge. Idempotent — entries.retain on an already-purged
-        // store is a cheap no-op walk.
-        self.entries.retain(|e| e.index > through_index_inclusive);
-        if through_index_inclusive >= self.first_valid {
-            self.first_valid = LogIndex(through_index_inclusive.0 + 1);
+        // Monotonic watermark: a re-issued lower (or equal) floor is
+        // a no-op. This both satisfies the trait's idempotency
+        // contract and makes the in-memory store symmetric with
+        // `FileLogStore`'s persisted `first_valid_index`, so an
+        // out-of-order `append` at `<= first_valid_index` cannot
+        // silently resurface from any read API.
+        if through_index_inclusive > self.first_valid_index {
+            self.first_valid_index = through_index_inclusive;
         }
+        // Reclaim Vec space for entries the floor now hides. Reads
+        // still filter by `first_valid_index`, so even if a future
+        // out-of-order `append` reinserts an entry `<= first_valid_index`
+        // it will stay invisible.
+        self.entries
+            .retain(|e| e.index > self.first_valid_index);
         Ok(())
-    }
-
-    fn first_valid_index(&self) -> LogIndex {
-        self.first_valid
     }
 }
 
@@ -215,169 +237,13 @@ const SEGMENT_EXT: &str = "wal";
 /// resurrected entries on the next recovery.
 const PURGE_MARKER_FILE: &str = "purge.idx";
 
-/// Kafka-compatible leader-epoch checkpoint sidecar file (Stage 7.3
-/// surface, iter-5). Records the `(leader_epoch, start_offset)` tuples
-/// from which the divergence-detection path can reconstruct epoch
-/// boundaries after a crash or leader change.
-///
-/// Format (text, line-oriented, Kafka-equivalent):
-/// ```text
-/// 0
-/// <num_entries>
-/// <epoch_1> <start_offset_1>
-/// <epoch_2> <start_offset_2>
-/// …
-/// ```
-///
-/// Line 1 is the format version (`0`). Line 2 is the entry count.
-/// Subsequent lines hold space-separated `(epoch, start_offset)`
-/// tuples in ascending epoch order. See [`read_leader_epoch_checkpoint`]
-/// and [`write_leader_epoch_checkpoint`] for the I/O helpers.
-pub const LEADER_EPOCH_CHECKPOINT_FILE: &str = "leader-epoch-checkpoint";
-
-/// In-memory representation of a leader-epoch checkpoint entry.
-/// Mirrors Kafka's `EpochEntry`: every time a new leader is elected
-/// at epoch `e`, an entry `(e, first_offset_written_at_epoch_e)` is
-/// appended to the checkpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LeaderEpochEntry {
-    /// Leader epoch (Raft term).
-    pub epoch: u64,
-    /// First log offset (1-based) written under that epoch.
-    pub start_offset: u64,
-}
-
-/// Read `dir/leader-epoch-checkpoint` if it exists, returning the
-/// ordered list of `(epoch, start_offset)` entries. Returns `Ok(vec![])`
-/// when the file is absent — equivalent to "no epoch boundaries yet".
-///
-/// Errors: I/O failures (other than `NotFound`) or a malformed file
-/// (non-integer line, version mismatch, count mismatch) surface as
-/// `std::io::Error` so the caller can decide whether to fail recovery
-/// or reset the checkpoint. The parser is intentionally strict — a
-/// silently-truncated file should be loud, not subtly wrong.
-pub fn read_leader_epoch_checkpoint(dir: &Path) -> std::io::Result<Vec<LeaderEpochEntry>> {
-    use std::io::{BufRead, BufReader};
-    let path = dir.join(LEADER_EPOCH_CHECKPOINT_FILE);
-    let f = match std::fs::File::open(&path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let mut lines = BufReader::new(f).lines();
-    let version_line = lines.next().transpose()?.unwrap_or_default();
-    let version: u32 = version_line.trim().parse().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("leader-epoch-checkpoint: bad version line {version_line:?}: {e}"),
-        )
-    })?;
-    if version != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("leader-epoch-checkpoint: unsupported version {version}"),
-        ));
-    }
-    let count_line = lines.next().transpose()?.unwrap_or_default();
-    let expected: usize = count_line.trim().parse().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("leader-epoch-checkpoint: bad count line {count_line:?}: {e}"),
-        )
-    })?;
-    let mut out = Vec::with_capacity(expected);
-    for line in lines {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let mut parts = trimmed.split_ascii_whitespace();
-        let epoch: u64 = parts
-            .next()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("leader-epoch-checkpoint: missing epoch in {line:?}"),
-                )
-            })?
-            .parse()
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("leader-epoch-checkpoint: bad epoch in {line:?}: {e}"),
-                )
-            })?;
-        let start_offset: u64 = parts
-            .next()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("leader-epoch-checkpoint: missing offset in {line:?}"),
-                )
-            })?
-            .parse()
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("leader-epoch-checkpoint: bad offset in {line:?}: {e}"),
-                )
-            })?;
-        out.push(LeaderEpochEntry {
-            epoch,
-            start_offset,
-        });
-    }
-    if out.len() != expected {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "leader-epoch-checkpoint: count mismatch (header={expected}, found={})",
-                out.len()
-            ),
-        ));
-    }
-    Ok(out)
-}
-
-/// Atomically write `entries` to `dir/leader-epoch-checkpoint` using
-/// the write-to-temp-then-rename pattern so a crash mid-write never
-/// leaves a half-written file. `fsync`s the file before rename and
-/// the directory after rename — the same durability discipline used by
-/// the WAL segment writer.
-pub fn write_leader_epoch_checkpoint(
-    dir: &Path,
-    entries: &[LeaderEpochEntry],
-) -> std::io::Result<()> {
-    use std::io::Write;
-    let final_path = dir.join(LEADER_EPOCH_CHECKPOINT_FILE);
-    let tmp_path = dir.join(format!("{LEADER_EPOCH_CHECKPOINT_FILE}.tmp"));
-    {
-        let mut tmp = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_path)?;
-        writeln!(tmp, "0")?;
-        writeln!(tmp, "{}", entries.len())?;
-        for e in entries {
-            writeln!(tmp, "{} {}", e.epoch, e.start_offset)?;
-        }
-        tmp.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, &final_path)?;
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(())
-}
-
 /// Fixed byte overhead per entry: index(8) + term(8) + tag(1) + payload_len(4).
 const ENTRY_HEADER_LEN: usize = 21;
 
 /// Metadata for a single WAL segment file.
 #[derive(Debug)]
 struct SegmentInfo {
+    #[expect(dead_code)]
     base_index: LogIndex,
     path: PathBuf,
 }
@@ -407,16 +273,6 @@ pub struct FileLogStore {
     /// call. Persisted to [`PURGE_MARKER_FILE`] and consulted during
     /// recovery so segment frames that span the cut never resurface.
     first_valid_index: LogIndex,
-    /// Stage 7.3 iter-5: in-memory mirror of the on-disk leader-epoch
-    /// checkpoint (`leader-epoch-checkpoint`). One entry per
-    /// `(epoch, first_offset_under_that_epoch)` boundary, in ascending
-    /// epoch order. Mutated by `append`/`truncate_from`/`purge_prefix`
-    /// and persisted by `flush` when `epoch_dirty` is set.
-    epoch_entries: Vec<LeaderEpochEntry>,
-    /// True when `epoch_entries` has been mutated since the last
-    /// successful `write_leader_epoch_checkpoint`. `flush` consults
-    /// this so a no-op `flush` does not rewrite the checkpoint file.
-    epoch_dirty: bool,
 }
 
 // Manual impls not required — all fields are `Send + Sync`.
@@ -444,13 +300,10 @@ impl FileLogStore {
             offsets: BTreeMap::new(),
             max_segment_size,
             first_valid_index: LogIndex(0),
-            epoch_entries: Vec::new(),
-            epoch_dirty: false,
         };
 
         store.load_purge_marker()?;
         store.recover()?;
-        store.load_or_backfill_epoch_checkpoint()?;
         Ok(store)
     }
 
@@ -501,52 +354,6 @@ impl FileLogStore {
         }
         fs::rename(&tmp_path, &final_path).map_err(io_to_storage)?;
         Ok(())
-    }
-
-    /// Stage 7.3 iter-5 — load the on-disk leader-epoch checkpoint into
-    /// `epoch_entries`. When the file is absent (fresh dir or pre-iter-5
-    /// store) but the WAL replay produced entries, derive the boundary
-    /// list by scanning the replayed entries and mark the in-memory
-    /// state dirty so the next [`LogStore::flush`] persists it. This
-    /// lets a store opened against a pre-existing WAL (e.g. one
-    /// recovered from a Stage 7.2 snapshot) immediately answer
-    /// epoch-divergence queries without forcing the engine to re-write
-    /// every entry.
-    fn load_or_backfill_epoch_checkpoint(&mut self) -> Result<()> {
-        match read_leader_epoch_checkpoint(&self.dir) {
-            Ok(entries) => {
-                self.epoch_entries = entries;
-            }
-            Err(e) => {
-                return Err(storage_err(format!(
-                    "leader-epoch-checkpoint read failed: {e}"
-                )));
-            }
-        }
-        if self.epoch_entries.is_empty() && !self.entries.is_empty() {
-            let mut last_epoch: Option<u64> = None;
-            for (idx, entry) in self.entries.iter() {
-                if last_epoch != Some(entry.term.0) {
-                    self.epoch_entries.push(LeaderEpochEntry {
-                        epoch: entry.term.0,
-                        start_offset: idx.0,
-                    });
-                    last_epoch = Some(entry.term.0);
-                }
-            }
-            if !self.epoch_entries.is_empty() {
-                self.epoch_dirty = true;
-            }
-        }
-        Ok(())
-    }
-
-    /// Stage 7.3 iter-5 — borrow the in-memory leader-epoch checkpoint
-    /// snapshot. Exposed for tests and operator tooling that needs to
-    /// verify divergence-detection inputs without re-reading the
-    /// sidecar file.
-    pub fn epoch_entries(&self) -> &[LeaderEpochEntry] {
-        &self.epoch_entries
     }
 
     /// Scan existing segment files, replay valid frames, and truncate any
@@ -846,23 +653,6 @@ impl LogStore for FileLogStore {
             self.active_segment_size += frame.len() as u64;
             self.entries.insert(entry.index, entry.clone());
             self.offsets.insert(entry.index, (seg_idx, offset));
-
-            // Stage 7.3 iter-5: maintain the leader-epoch checkpoint.
-            // A new epoch entry is appended every time the term of the
-            // newly-appended entry differs from the term of the most
-            // recent epoch boundary. Same-term appends fall through
-            // (no new boundary). The checkpoint is flushed durably by
-            // [`Self::flush`] AFTER the WAL `sync_all` so a crash
-            // never leaves the checkpoint referencing a non-durable
-            // entry.
-            let last_epoch = self.epoch_entries.last().map(|e| e.epoch);
-            if last_epoch != Some(entry.term.0) {
-                self.epoch_entries.push(LeaderEpochEntry {
-                    epoch: entry.term.0,
-                    start_offset: entry.index.0,
-                });
-                self.epoch_dirty = true;
-            }
         }
         Ok(())
     }
@@ -919,16 +709,43 @@ impl LogStore for FileLogStore {
             f.set_len(byte_offset).map_err(io_to_storage)?;
         }
 
-        // Delete all subsequent segment files.
-        for seg in self.segments.drain(seg_idx + 1..) {
-            let _ = fs::remove_file(&seg.path);
+        // Delete all subsequent segment files. Propagate real I/O
+        // failures (permission denied, disk error, …) so callers learn
+        // that the WAL is no longer consistent with the in-memory log
+        // store; treat `NotFound` as idempotent so a retry after a
+        // partial prior truncation still succeeds. We pop from the
+        // back so that, on failure, every segment still on disk is
+        // also still tracked in `self.segments` — keeping the two
+        // views in sync for a follow-up retry.
+        while self.segments.len() > seg_idx + 1 {
+            let seg_path = self
+                .segments
+                .last()
+                .expect("len checked above")
+                .path
+                .clone();
+            match fs::remove_file(&seg_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_to_storage(e)),
+            }
+            self.segments.pop();
         }
 
         // If the truncated segment is now empty, remove it as well.
-        if byte_offset == 0
-            && let Some(seg) = self.segments.pop()
-        {
-            let _ = fs::remove_file(&seg.path);
+        // Same propagation + `NotFound` carve-out as the loop above;
+        // we delete the file *before* popping the in-memory entry so
+        // a mid-call failure leaves disk and memory consistent.
+        if byte_offset == 0 {
+            let last_path = self.segments.last().map(|s| s.path.clone());
+            if let Some(seg_path) = last_path {
+                match fs::remove_file(&seg_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(io_to_storage(e)),
+                }
+                self.segments.pop();
+            }
         }
 
         // Purge in-memory caches.
@@ -936,21 +753,6 @@ impl LogStore for FileLogStore {
         for k in &to_remove {
             self.entries.remove(k);
             self.offsets.remove(k);
-        }
-
-        // Stage 7.3 iter-5: drop any epoch boundaries that anchor at
-        // or past the truncation point. Boundaries with
-        // `start_offset < index.0` survive because their epoch
-        // pre-dates the divergence and still describes valid
-        // (now-tail) entries. This implements the
-        // "epoch-checkpoint divergence behaviour" required by
-        // `implementation-plan.md:367` — after a leader-conflict
-        // truncate, the checkpoint accurately reflects which
-        // epoch-starts remain on this replica.
-        let len_before = self.epoch_entries.len();
-        self.epoch_entries.retain(|e| e.start_offset < index.0);
-        if self.epoch_entries.len() != len_before {
-            self.epoch_dirty = true;
         }
 
         self.reopen_active_writer()
@@ -963,16 +765,6 @@ impl LogStore for FileLogStore {
     fn flush(&mut self) -> Result<()> {
         if let Some(ref w) = self.active_writer {
             w.sync_all().map_err(io_to_storage)?;
-        }
-        // Stage 7.3 iter-5: persist the leader-epoch checkpoint AFTER
-        // the WAL fsync so the on-disk checkpoint never points at an
-        // entry that is not yet durable. The checkpoint writer does
-        // its own write-to-tmp-then-rename + fsync so the file is
-        // crash-safe on its own.
-        if self.epoch_dirty {
-            write_leader_epoch_checkpoint(&self.dir, &self.epoch_entries)
-                .map_err(|e| storage_err(format!("leader-epoch-checkpoint flush failed: {e}")))?;
-            self.epoch_dirty = false;
         }
         Ok(())
     }
@@ -1064,34 +856,7 @@ impl LogStore for FileLogStore {
             }
         }
 
-        // Stage 7.3 iter-5: prune leader-epoch checkpoint entries that
-        // are entirely covered by the snapshot. An entry with
-        // `start_offset <= through` describes an epoch whose first
-        // offset is now compacted; the SnapshotMeta's
-        // `last_included_term` is the authoritative source of truth
-        // for indices ≤ through, so the boundary list only needs to
-        // anchor epochs whose first offset is still on-disk
-        // (`start_offset > through`). Rubber-duck flag: must run here
-        // AND in `truncate_from`, not just truncate_from.
-        let len_before = self.epoch_entries.len();
-        self.epoch_entries
-            .retain(|e| e.start_offset > through_index_inclusive.0);
-        if self.epoch_entries.len() != len_before {
-            self.epoch_dirty = true;
-        }
-
         Ok(())
-    }
-
-    fn first_valid_index(&self) -> LogIndex {
-        // Internal `first_valid_index` stores "every index ≤ this is
-        // compacted". The trait contract expects "lowest index still
-        // logically present" — for a fresh log that's `LogIndex(1)`;
-        // after a purge it's `internal + 1`. Translate accordingly so
-        // the `on_log_compacted` reclaim math the driver does
-        // (`through - (prev_first_valid - 1)`) lines up with the
-        // pre-iter-5 default of `LogIndex(1)`.
-        LogIndex(self.first_valid_index.0.saturating_add(1))
     }
 }
 
@@ -1104,44 +869,6 @@ mod tests {
     use super::*;
     use xraft_core::message::{Entry, EntryPayload};
     use xraft_core::storage::SnapshotMeta;
-
-    #[test]
-    fn leader_epoch_checkpoint_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        // Empty file is missing → reads as []
-        let read = read_leader_epoch_checkpoint(dir.path()).unwrap();
-        assert!(read.is_empty());
-        let entries = vec![
-            LeaderEpochEntry {
-                epoch: 1,
-                start_offset: 1,
-            },
-            LeaderEpochEntry {
-                epoch: 3,
-                start_offset: 17,
-            },
-            LeaderEpochEntry {
-                epoch: 4,
-                start_offset: 42,
-            },
-        ];
-        write_leader_epoch_checkpoint(dir.path(), &entries).unwrap();
-        let round = read_leader_epoch_checkpoint(dir.path()).unwrap();
-        assert_eq!(round, entries);
-        // Header version line must be `0`
-        let raw = std::fs::read_to_string(dir.path().join(LEADER_EPOCH_CHECKPOINT_FILE)).unwrap();
-        let mut lines = raw.lines();
-        assert_eq!(lines.next(), Some("0"));
-        assert_eq!(lines.next(), Some("3"));
-    }
-
-    #[test]
-    fn leader_epoch_checkpoint_bad_version_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(LEADER_EPOCH_CHECKPOINT_FILE), "99\n0\n").unwrap();
-        let err = read_leader_epoch_checkpoint(dir.path()).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    }
 
     fn make_entry(index: u64, term: u64) -> Entry {
         Entry {
@@ -1224,22 +951,9 @@ mod tests {
 
     // -- FileLogStore tests ------------------------------------------------
 
-    /// Create a fresh temp directory for a test, cleaning up any
-    /// prior run. Names are scoped by `(test-name, pid,
-    /// per-process counter)` so a second cargo-test invocation —
-    /// or a parallel test binary that happens to reuse a test name
-    /// — can never collide with a still-open file handle from an
-    /// earlier run. The earlier shared-name design was prone to
-    /// Windows `os error 5: Access is denied` flakes because the
-    /// OS lags file-handle release across process exits.
+    /// Create a fresh temp directory for a test, cleaning up any prior run.
     fn test_dir(name: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let pid = std::process::id();
-        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir()
-            .join("xraft-wal-tests")
-            .join(format!("{name}-{pid}-{seq}"));
+        let dir = std::env::temp_dir().join("xraft-wal-tests").join(name);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -1558,10 +1272,7 @@ mod tests {
 
         let mut log = MemoryLogStore::new();
         let result = log.append(&[entry]);
-        assert!(
-            result.is_err(),
-            "Snapshot entries must be rejected by MemoryLogStore"
-        );
+        assert!(result.is_err(), "Snapshot entries must be rejected by MemoryLogStore");
     }
 
     // ---- purge_prefix --------------------------------------------------
@@ -1619,6 +1330,56 @@ mod tests {
         for i in 8..=10 {
             assert!(log.get(LogIndex(i)).unwrap().is_some());
         }
+    }
+
+    /// MemoryLogStore: an out-of-order `append` at an index `<= N`
+    /// AFTER `purge_prefix(N)` MUST NOT surface from any read API.
+    /// This is the precise bypass the watermark closes — before the
+    /// `first_valid_index` field existed, `purge_prefix` only
+    /// scrubbed the `Vec`, so a subsequent re-append at a purged
+    /// index would resurrect the entry on the next `get` /
+    /// `get_range` / `term_at` / `last_index` / `last_term` call,
+    /// breaking the trait's purge post-condition. Regression test
+    /// for review feedback on `xraft-storage/src/log.rs:164`.
+    #[test]
+    fn memory_reappend_below_purge_floor_stays_invisible() {
+        let mut log = MemoryLogStore::new();
+        log.append(&(1..=10).map(|i| make_entry(i, 1)).collect::<Vec<_>>())
+            .unwrap();
+
+        log.purge_prefix(LogIndex(5)).unwrap();
+
+        // Out-of-order re-append at an index covered by the purge
+        // floor. Use a distinctive term so any leak would be obvious.
+        log.append(&[make_entry(3, 99)]).unwrap();
+
+        assert!(
+            log.get(LogIndex(3)).unwrap().is_none(),
+            "re-appended entry at purged index must stay invisible to get()",
+        );
+        assert!(
+            log.term_at(LogIndex(3)).unwrap().is_none(),
+            "re-appended entry at purged index must stay invisible to term_at()",
+        );
+
+        let range = log.get_range(LogIndex(1), LogIndex(6)).unwrap();
+        for e in &range {
+            assert!(
+                e.index > LogIndex(5),
+                "get_range returned entry at index {} (must be > purge floor 5)",
+                e.index.0,
+            );
+        }
+        assert_eq!(
+            range.len(),
+            0,
+            "no entry in [1, 6) should survive the purge floor",
+        );
+
+        // The resurrected entry at index 3 with term 99 must not
+        // hijack the reported tail.
+        assert_eq!(log.last_index(), LogIndex(10));
+        assert_eq!(log.last_term(), Term(1));
     }
 
     /// FileLogStore: after `purge_prefix(N)` and a restart, entries
@@ -1701,223 +1462,5 @@ mod tests {
             assert_eq!(e.index, LogIndex(i));
         }
         assert_eq!(log.last_index(), LogIndex(20));
-    }
-
-    // -- Stage 7.3 iter-5: leader-epoch checkpoint integration -------------
-
-    #[test]
-    fn file_log_append_records_new_epoch_boundary() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut log = FileLogStore::open(dir.path()).unwrap();
-        // Same-term appends create exactly ONE boundary.
-        log.append(&[make_entry(1, 1), make_entry(2, 1), make_entry(3, 1)])
-            .unwrap();
-        assert_eq!(
-            log.epoch_entries(),
-            &[LeaderEpochEntry {
-                epoch: 1,
-                start_offset: 1,
-            }]
-        );
-        // A term bump opens a new boundary at the entry that triggered it.
-        log.append(&[make_entry(4, 2), make_entry(5, 2)]).unwrap();
-        assert_eq!(
-            log.epoch_entries(),
-            &[
-                LeaderEpochEntry {
-                    epoch: 1,
-                    start_offset: 1,
-                },
-                LeaderEpochEntry {
-                    epoch: 2,
-                    start_offset: 4,
-                },
-            ]
-        );
-        // Skipping a term is fine — the next boundary records that.
-        log.append(&[make_entry(6, 5)]).unwrap();
-        assert_eq!(log.epoch_entries().last().unwrap().epoch, 5);
-        assert_eq!(log.epoch_entries().last().unwrap().start_offset, 6);
-    }
-
-    #[test]
-    fn file_log_flush_persists_epoch_checkpoint() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let mut log = FileLogStore::open(dir.path()).unwrap();
-            log.append(&[make_entry(1, 1), make_entry(2, 2), make_entry(3, 3)])
-                .unwrap();
-            log.flush().unwrap();
-        }
-        // Reopen: the on-disk checkpoint should be the authoritative
-        // source (no backfill needed).
-        let log = FileLogStore::open(dir.path()).unwrap();
-        assert_eq!(
-            log.epoch_entries(),
-            &[
-                LeaderEpochEntry {
-                    epoch: 1,
-                    start_offset: 1,
-                },
-                LeaderEpochEntry {
-                    epoch: 2,
-                    start_offset: 2,
-                },
-                LeaderEpochEntry {
-                    epoch: 3,
-                    start_offset: 3,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn file_log_open_backfills_epoch_checkpoint_when_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            // Append entries WITHOUT flushing → no checkpoint file
-            // written. To simulate a pre-iter-5 store, manually remove
-            // any checkpoint file the new append path may have created
-            // in-memory but never persisted.
-            let mut log = FileLogStore::open(dir.path()).unwrap();
-            log.append(&[
-                make_entry(1, 1),
-                make_entry(2, 1),
-                make_entry(3, 2),
-                make_entry(4, 4),
-            ])
-            .unwrap();
-            // Sync only the WAL (not the checkpoint): the WAL fsync is
-            // implicit on drop because the OS will buffer-flush, but
-            // to keep the test deterministic on platforms with weaker
-            // close semantics we force-sync just the WAL.
-            // (We deliberately do NOT call `log.flush()` — that would
-            //  also write the checkpoint.)
-            // Touch the active writer to force a fdatasync-equivalent:
-            if let Some(ref w) = log.active_writer {
-                w.sync_all().unwrap();
-            }
-            drop(log);
-            // Remove any stale checkpoint (defensive — none should
-            // exist because we never called flush()).
-            let chk = dir.path().join(LEADER_EPOCH_CHECKPOINT_FILE);
-            if chk.exists() {
-                std::fs::remove_file(&chk).unwrap();
-            }
-        }
-        let log = FileLogStore::open(dir.path()).unwrap();
-        // Backfill walks the recovered WAL entries and reconstructs
-        // every (term, first_offset) boundary.
-        assert_eq!(
-            log.epoch_entries(),
-            &[
-                LeaderEpochEntry {
-                    epoch: 1,
-                    start_offset: 1,
-                },
-                LeaderEpochEntry {
-                    epoch: 2,
-                    start_offset: 3,
-                },
-                LeaderEpochEntry {
-                    epoch: 4,
-                    start_offset: 4,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn file_log_truncate_from_prunes_epoch_checkpoint() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut log = FileLogStore::open(dir.path()).unwrap();
-        log.append(&[
-            make_entry(1, 1),
-            make_entry(2, 1),
-            make_entry(3, 2),
-            make_entry(4, 3),
-            make_entry(5, 3),
-        ])
-        .unwrap();
-        // Truncate from index 3 → boundary at start_offset 3 (epoch 2)
-        // and 4 (epoch 3) are dropped; the epoch-1 boundary survives.
-        log.truncate_from(LogIndex(3)).unwrap();
-        assert_eq!(
-            log.epoch_entries(),
-            &[LeaderEpochEntry {
-                epoch: 1,
-                start_offset: 1,
-            }]
-        );
-        // Flush + reopen: the pruned checkpoint persists.
-        log.flush().unwrap();
-        drop(log);
-        let log = FileLogStore::open(dir.path()).unwrap();
-        assert_eq!(
-            log.epoch_entries(),
-            &[LeaderEpochEntry {
-                epoch: 1,
-                start_offset: 1,
-            }]
-        );
-    }
-
-    #[test]
-    fn file_log_purge_prefix_prunes_epoch_checkpoint() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut log = FileLogStore::open(dir.path()).unwrap();
-        log.append(&[
-            make_entry(1, 1),
-            make_entry(2, 2),
-            make_entry(3, 2),
-            make_entry(4, 3),
-            make_entry(5, 3),
-        ])
-        .unwrap();
-        // Snapshot through index 3 → entries with start_offset <= 3
-        // are dropped; only the epoch-3 boundary (start_offset = 4)
-        // survives.
-        log.purge_prefix(LogIndex(3)).unwrap();
-        assert_eq!(
-            log.epoch_entries(),
-            &[LeaderEpochEntry {
-                epoch: 3,
-                start_offset: 4,
-            }]
-        );
-        log.flush().unwrap();
-        drop(log);
-        let log = FileLogStore::open(dir.path()).unwrap();
-        assert_eq!(
-            log.epoch_entries(),
-            &[LeaderEpochEntry {
-                epoch: 3,
-                start_offset: 4,
-            }]
-        );
-    }
-
-    #[test]
-    fn file_log_first_valid_index_translates_default_and_after_purge() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut log = FileLogStore::open(dir.path()).unwrap();
-        // Fresh log: trait first_valid_index is LogIndex(1) (matches
-        // the default trait impl) so the driver's reclaim math
-        // (`through + 1 - prev`) computes a correct count on first
-        // compaction.
-        assert_eq!(log.first_valid_index(), LogIndex(1));
-        log.append(&[
-            make_entry(1, 1),
-            make_entry(2, 1),
-            make_entry(3, 1),
-            make_entry(4, 2),
-        ])
-        .unwrap();
-        log.purge_prefix(LogIndex(2)).unwrap();
-        // After purge through 2, lowest valid index is 3.
-        assert_eq!(log.first_valid_index(), LogIndex(3));
-        // Idempotent re-purge through 2 leaves it unchanged.
-        log.purge_prefix(LogIndex(2)).unwrap();
-        assert_eq!(log.first_valid_index(), LogIndex(3));
     }
 }
