@@ -59,6 +59,8 @@ use xraft_core::storage::{HardStateStore, LogStore, SnapshotMeta, SnapshotStore}
 use xraft_core::transport::{RaftMessageHandler, SnapshotChunkStream, Transport};
 use xraft_core::types::{LogIndex, NodeId, NodeRole, Term};
 
+use xraft_client::pool::ConnectionPool;
+
 use crate::status::NodeStatus;
 
 // ---------------------------------------------------------------------------
@@ -723,6 +725,18 @@ pub struct MessageRouter<T: Transport + Send + Sync + 'static> {
     /// an `OutboundResult::Error { kind: "fetch_snapshot" }` so the
     /// task surfaces and forward progress is preserved.
     fetch_snapshot_deadline: Duration,
+    /// Stage 6.2 (evaluator iter 2 follow-up): when present, the
+    /// router routes outbound `FetchRequest` dispatches through
+    /// [`ConnectionPool::fetch_via_leader`] instead of the raw
+    /// [`Transport::send_fetch`]. This gives the server's outbound
+    /// path the redirect-aware behaviour the work item describes —
+    /// the pool consults its per-peer leader-hint cache to pick a
+    /// target (falling back to the engine's chosen peer), and bounces
+    /// once toward a responder-advertised leader on
+    /// `is_leader=false`. Bypassing the pool (i.e. `None`) keeps the
+    /// router useful with mock transports in driver-level unit tests
+    /// where no real `ConnectionPool` exists.
+    pool: Option<ConnectionPool>,
 }
 
 impl<T: Transport + Send + Sync + 'static> MessageRouter<T> {
@@ -769,7 +783,26 @@ impl<T: Transport + Send + Sync + 'static> MessageRouter<T> {
             tx,
             tasks: JoinSet::new(),
             fetch_snapshot_deadline,
+            pool: None,
         }
+    }
+
+    /// Stage 6.2 (evaluator iter 2 follow-up): attach a shared
+    /// [`ConnectionPool`] so subsequent outbound `FetchRequest`
+    /// dispatches go through [`ConnectionPool::fetch_via_leader`]
+    /// instead of the raw [`Transport::send_fetch`].
+    ///
+    /// Calling this is what wires the internal peer-RPC client's
+    /// redirect-aware routing into the server's real outbound path.
+    /// Without it the router still works against any `Transport`
+    /// implementation (used by mock-transport unit tests), but the
+    /// engine's fetches will not benefit from the pool's cached
+    /// leader hint or one-hop redirect on `is_leader=false`. The
+    /// production server-assembly path (`server.rs`) always calls
+    /// this builder before spawning the driver loop.
+    pub fn with_connection_pool(mut self, pool: ConnectionPool) -> Self {
+        self.pool = Some(pool);
+        self
     }
 
     /// Dispatch a single outbound message to `peer`. Spawns the RPC on
@@ -813,8 +846,23 @@ impl<T: Transport + Send + Sync + 'static> MessageRouter<T> {
                 });
             }
             OutboundMessage::FetchRequest(req) => {
+                // Stage 6.2 (evaluator iter 2 follow-up): when a
+                // `ConnectionPool` is attached (production server
+                // assembly), route through `fetch_via_leader` so the
+                // outbound fetch path honours the per-peer leader-hint
+                // cache and performs a bounded one-hop redirect when
+                // the responder advertises a different leader. When
+                // the pool is absent (driver-level unit tests with a
+                // mock transport) fall back to the raw
+                // `Transport::send_fetch` path so test transports keep
+                // observing the engine's chosen peer directly.
+                let pool = self.pool.clone();
                 self.tasks.spawn(async move {
-                    let result = transport.send_fetch(peer, req).await;
+                    let result = if let Some(pool) = pool {
+                        pool.fetch_via_leader(peer, req).await
+                    } else {
+                        transport.send_fetch(peer, req).await
+                    };
                     let out = match result {
                         Ok(resp) => OutboundResult::Fetch {
                             peer,
@@ -1640,6 +1688,18 @@ where
     /// "SimulatedClock for deterministic tick advancement".
     pub fn with_tick_source(mut self, src: Box<dyn TickSource>) -> Self {
         self.tick = src;
+        self
+    }
+
+    /// Stage 6.2 (evaluator iter 2 follow-up): attach a shared
+    /// [`ConnectionPool`] so outbound `FetchRequest` dispatches go
+    /// through [`ConnectionPool::fetch_via_leader`] (cached leader-hint
+    /// preference + bounded one-hop redirect on `is_leader=false`)
+    /// instead of the raw [`Transport::send_fetch`]. The
+    /// server-assembly path always wires this in production; tests
+    /// that exercise the driver with a mock transport leave it unset.
+    pub fn with_connection_pool(mut self, pool: ConnectionPool) -> Self {
+        self.router = self.router.with_connection_pool(pool);
         self
     }
 

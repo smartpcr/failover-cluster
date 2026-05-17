@@ -918,7 +918,17 @@ impl Server {
             transport,
             driver_cfg,
         )
-        .with_observer(metrics.clone() as Arc<_>);
+        .with_observer(metrics.clone() as Arc<_>)
+        // Stage 6.2 (evaluator iter 2 follow-up): wire the shared
+        // ConnectionPool into the driver's outbound MessageRouter so
+        // FetchRequest dispatches go through
+        // `ConnectionPool::fetch_via_leader` — honouring the cached
+        // per-peer leader hint and performing a bounded one-hop
+        // redirect when the responder is not the leader. Without this
+        // call the router falls back to raw `Transport::send_fetch`
+        // and the redirect-aware client surface is unused on the
+        // server's outbound path.
+        .with_connection_pool(connection_pool.clone());
 
         let driver_handle = driver.handle();
         let driver_task = tokio::spawn(async move { driver.run().await });

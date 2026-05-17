@@ -635,4 +635,151 @@ mod tests {
             "no duplicate insert on shared cache"
         );
     }
+
+    /// Build a 5-node cluster (node_id = 1 is self, peers = 2..=5)
+    /// to exercise the workstream's `connection-pool-lazy-init`
+    /// scenario verbatim. We keep this helper local to the test
+    /// module so the production type stays tied to its `From<
+    /// ClusterConfig>` builder rather than carrying a multi-cluster
+    /// fixture catalogue.
+    fn five_node_cluster() -> ClusterConfig {
+        let mut cluster = three_node_cluster();
+        cluster.voters.push(VoterConfig {
+            node_id: 4,
+            directory_id: "550e8400-e29b-41d4-a716-446655440003".into(),
+            host: "10.0.0.4".into(),
+            port: 6000,
+        });
+        cluster.voters.push(VoterConfig {
+            node_id: 5,
+            directory_id: "550e8400-e29b-41d4-a716-446655440004".into(),
+            host: "10.0.0.5".into(),
+            port: 6000,
+        });
+        cluster
+    }
+
+    #[test]
+    fn connection_pool_lazy_init_five_node_cluster_reuses_channel_on_repeat_node_3_lookup() {
+        // Scenario (verbatim from the workstream brief):
+        //   "connection-pool-lazy-init — Given a ConnectionPool for
+        //    a 5-node cluster, When a PeerClient for node 3 is
+        //    requested twice, Then the same channel is reused
+        //    without creating a new connection."
+        //
+        // The existing `peer_client_lazy_init_returns_same_instance
+        // _on_repeat_lookup` test covers the same logic against a
+        // 3-node fixture; this scenario-exact variant guards the
+        // wording from drift if the brief is ever consulted by an
+        // operator triaging a regression.
+        let cluster = five_node_cluster();
+        let pool = ConnectionPool::from_cluster_config(&cluster).expect("pool builds");
+        assert_eq!(
+            pool.len(),
+            4,
+            "5 voters minus self = 4 reachable peers in the pool"
+        );
+        assert_eq!(
+            pool.cached_peer_client_count(),
+            0,
+            "cache must start empty before the first lookup"
+        );
+
+        let first = pool
+            .peer_client(NodeId(3))
+            .expect("first node-3 lookup must succeed");
+        let second = pool
+            .peer_client(NodeId(3))
+            .expect("second node-3 lookup must succeed");
+
+        // Only one cache entry — proves the second lookup did NOT
+        // construct a fresh PeerClient (and therefore did not open
+        // a fresh channel via `RaftGrpcClient`).
+        assert_eq!(
+            pool.cached_peer_client_count(),
+            1,
+            "repeat lookup for node 3 must NOT insert a duplicate entry"
+        );
+
+        // Same underlying transport Arc (channel pool) on both
+        // handles — the workstream's "same channel is reused without
+        // creating a new connection" assertion in test form.
+        assert!(
+            Arc::ptr_eq(&first.transport(), &second.transport()),
+            "both PeerClient handles for node 3 must share the same Arc<RaftGrpcClient>"
+        );
+
+        // And the cached PeerClient targets the requested node.
+        assert_eq!(first.peer(), NodeId(3));
+        assert_eq!(second.peer(), NodeId(3));
+    }
+
+    #[test]
+    fn leader_hint_tracking_routes_subsequent_rpcs_without_rediscovery() {
+        // Scenario (verbatim from the workstream brief):
+        //   "leader-hint-tracking — Given a follower that receives a
+        //    FetchResponse with leader_id=2, When subsequent RPCs
+        //    need leader routing, Then the cached leader hint is
+        //    used without additional discovery."
+        //
+        // We exercise this at the pool level: after a FetchResponse
+        // observation pins leader=2 on peer 2's hint cache, the
+        // pool's `leader_client()` resolves to node 2 directly and
+        // `leader_hint()` surfaces the cached node-id without
+        // consulting any other peer's hint cache.
+        let cluster = three_node_cluster();
+        let pool = ConnectionPool::from_cluster_config(&cluster).expect("pool builds");
+
+        // Simulate a FetchResponse from peer 2 advertising leader=2
+        // at epoch 5. The cache_hint_for_test hook is the same code
+        // path that `PeerClient::fetch` follows when `is_leader=true`
+        // (see `peer.rs::fetch`), so this is a behaviourally-faithful
+        // simulation of the wire-side event without standing up a
+        // tonic server.
+        let pc2 = pool.peer_client(NodeId(2)).expect("peer 2");
+        assert!(
+            pc2.cache_hint_for_test(Some(NodeId(2)), 5),
+            "first FetchResponse hint observation must install the cache entry"
+        );
+
+        // The pool's aggregate hint reflects the cached entry.
+        assert_eq!(
+            pool.leader_hint(),
+            Some(NodeId(2)),
+            "pool's leader_hint must surface the cached leader-id without further discovery"
+        );
+        assert_eq!(
+            pool.leader_hint_entry(),
+            Some((NodeId(2), 5)),
+            "pool's leader_hint_entry must carry the epoch-fenced (NodeId, epoch) tuple"
+        );
+
+        // `leader_client()` is the routing API the engine consults
+        // to send the next RPC. It MUST resolve to node 2 directly
+        // (lazy-init the PeerClient for node 2 if needed) without
+        // contacting any other peer or re-running discovery.
+        let routed = pool
+            .leader_client()
+            .expect("leader_client must not error when a hint is cached")
+            .expect("a hint to peer 2 (in roster) must yield Some PeerClient");
+        assert_eq!(
+            routed.peer(),
+            NodeId(2),
+            "leader_client must target the hinted leader, not re-probe other peers"
+        );
+
+        // And the routed PeerClient is the SAME cached instance
+        // (Arc identity over the transport) so the routing decision
+        // does not pay a fresh-channel cost.
+        let direct = pool.peer_client(NodeId(2)).expect("direct peer_client(2)");
+        assert!(
+            Arc::ptr_eq(&routed.transport(), &direct.transport()),
+            "leader_client must reuse the cached PeerClient (shared transport Arc)"
+        );
+
+        // Repeated `leader_hint()` calls keep returning the same
+        // cached value — "without additional discovery."
+        assert_eq!(pool.leader_hint(), Some(NodeId(2)));
+        assert_eq!(pool.leader_hint(), Some(NodeId(2)));
+    }
 }
