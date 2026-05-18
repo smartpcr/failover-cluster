@@ -24,10 +24,13 @@
 //! ports — the [`RealCluster`](crate::real::RealCluster) harness covers
 //! that for the real-network scenarios in the same brief.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use tempfile::TempDir;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -36,10 +39,13 @@ use uuid::Uuid;
 use xraft_core::RaftNode;
 use xraft_core::config::{ClusterConfig, VoterConfig};
 use xraft_core::error::{Result as XResult, XRaftError};
-use xraft_core::storage::HardStateStore;
+use xraft_core::storage::{HardStateStore, LogStore, SnapshotStore};
 use xraft_core::types::{NodeId, NodeRole};
 
-use xraft_storage::{MemoryHardStateStore, MemoryLogStore, MemorySnapshotStore};
+use xraft_storage::{
+    FileHardStateStore, FileLogStore, FileSnapshotStore, MemoryHardStateStore, MemoryLogStore,
+    MemorySnapshotStore,
+};
 
 use xraft_server::driver::DriverChannels;
 use xraft_server::{Driver, DriverConfig, DriverHandle, DriverObserver, NodeStatus};
@@ -85,9 +91,67 @@ const DEFAULT_ELECTION_MAX_MS: u64 = 1000;
 /// race each other on the in-process transport.
 const DEFAULT_FETCH_MS: u64 = 10;
 
+/// Per-driver-task wall-clock budget [`SimulatedCluster::shutdown`]
+/// waits for each node's driver task to exit after signalling
+/// `driver.shutdown()`.
+///
+/// # Why 15 s and not "a couple of seconds"
+///
+/// The driver's [`Driver::run`](xraft_server::Driver::run) graceful
+/// shutdown path is allowed to spend up to
+/// `DriverConfig::shutdown_drain_deadline` (5 s by default in
+/// `xraft-server`) draining queued events in `graceful_drain`, AND
+/// another `shutdown_drain_deadline` budget draining in-flight
+/// outbound RPC tasks inside `shutdown_sequence`, before the final
+/// hard-state persist + log flush. That gives a legitimate worst
+/// case of `2 * shutdown_drain_deadline ≈ 10 s` for a single driver
+/// even when the driver is behaving exactly to spec. Under the
+/// `stress::throughput::sustained_1000_per_second_for_60s_*` test
+/// the engine arrives at shutdown with thousands of recently-acked
+/// AppendEntries still mid-replication; the drain genuinely needs
+/// most of that budget on a busy machine.
+///
+/// An earlier `Duration::from_secs(2)` timeout consistently
+/// false-positived this test as a "shutdown deadlock" even though
+/// every driver was about to exit cleanly within its own budget.
+/// 15 s covers `2 * 5 s + 5 s` of slack for tokio scheduler
+/// contention on a CI box running `--test-threads=1` after several
+/// minutes of other stress tests; it is still tight enough that a
+/// real shutdown deadlock (drivers genuinely stuck forever) will
+/// fail the test loudly rather than blocking it until the suite's
+/// per-test wall-clock timeout fires.
+const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(15);
+
 // ---------------------------------------------------------------------------
 // SimulatedClusterConfig
 // ---------------------------------------------------------------------------
+
+/// A `(min_ms, max_ms)` election timeout window. Used for per-node
+/// election-window overrides via
+/// [`SimulatedClusterConfig::per_node_election_overrides`] (the
+/// Stage 8.2 clock-skew scenarios).
+///
+/// Named-field form (rather than a raw `(u64, u64)` tuple) so a
+/// mis-ordered `min`/`max` is a compile error rather than a silent
+/// runtime swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElectionWindow {
+    /// Minimum election timeout in milliseconds.
+    pub min_ms: u64,
+    /// Maximum election timeout in milliseconds. Must be ≥ `min_ms`.
+    pub max_ms: u64,
+}
+
+impl ElectionWindow {
+    /// Build an [`ElectionWindow`]. Panics if `max_ms < min_ms`.
+    pub fn new(min_ms: u64, max_ms: u64) -> Self {
+        assert!(
+            max_ms >= min_ms,
+            "ElectionWindow: max_ms ({max_ms}) must be >= min_ms ({min_ms})",
+        );
+        Self { min_ms, max_ms }
+    }
+}
 
 /// Tunables for [`SimulatedCluster::start`]. All fields have sensible
 /// defaults via [`SimulatedClusterConfig::default`].
@@ -107,6 +171,42 @@ pub struct SimulatedClusterConfig {
     pub election_max_ms: u64,
     /// Follower fetch cadence.
     pub fetch_ms: u64,
+    /// **Per-node election-window overrides** (Stage 8.2 clock-skew
+    /// scenarios). Any node id present here uses the override's
+    /// `(min_ms, max_ms)` in place of the cluster's default
+    /// `election_min_ms` / `election_max_ms`. Nodes NOT present
+    /// fall back to the defaults. Use a [`BTreeMap`] (not [`HashMap`])
+    /// so node-iteration in spawn order is deterministic and so
+    /// `Debug` output is stable for test diagnostics.
+    ///
+    /// # Why this lives at config level (not a builder method)
+    ///
+    /// The cluster has ONE entry point ([`SimulatedCluster::start`]);
+    /// the per-node override is a property of how the engine is
+    /// CONFIGURED, so it belongs in the same struct rather than as a
+    /// separate fluent-builder method that callers might forget to
+    /// invoke before `start`.
+    pub per_node_election_overrides: BTreeMap<NodeId, ElectionWindow>,
+    /// When `true`, each node uses file-backed storage
+    /// ([`FileLogStore`] / [`FileHardStateStore`] /
+    /// [`FileSnapshotStore`]) against a per-node sub-directory under
+    /// a process-temp root owned by [`SimulatedCluster`]. The
+    /// sub-directory survives [`SimulatedCluster::kill`] so a
+    /// subsequent [`SimulatedCluster::restart`] re-opens the SAME
+    /// WAL / quorum-state / snapshot files and the engine recovers
+    /// its persisted state — true process-restart-with-durable-disk
+    /// semantics, not node-replacement-with-fresh-disk.
+    ///
+    /// When `false` (default for back-compat with Stage 8.1 tests),
+    /// each node uses in-memory stores; a restart spawns a fresh
+    /// node that must catch up via `AppendEntries` / `InstallSnapshot`
+    /// from the leader.
+    ///
+    /// Stage 8.2 chaos/restart scenarios (e.g.
+    /// `random_node_kill_and_restart_committed_entries_survive`)
+    /// enable this so the kill+restart path exercises durable
+    /// crash recovery as the brief requires.
+    pub use_durable_storage: bool,
 }
 
 impl Default for SimulatedClusterConfig {
@@ -118,6 +218,8 @@ impl Default for SimulatedClusterConfig {
             election_min_ms: DEFAULT_ELECTION_MIN_MS,
             election_max_ms: DEFAULT_ELECTION_MAX_MS,
             fetch_ms: DEFAULT_FETCH_MS,
+            per_node_election_overrides: BTreeMap::new(),
+            use_durable_storage: false,
         }
     }
 }
@@ -217,6 +319,30 @@ pub struct SimulatedCluster {
     /// when the [`JoinHandle`] dropped — silently turning a real bug
     /// into a clean test pass.
     killed_tasks: Vec<(NodeId, JoinHandle<XResult<()>>)>,
+    /// Captured config + voter set so [`Self::restart`] can re-spawn
+    /// a killed node with the SAME `node_id` and the SAME voter set
+    /// (and, when [`SimulatedClusterConfig::use_durable_storage`] is
+    /// enabled, the SAME per-node disk directory — so the engine
+    /// recovers from its persisted log + hard-state + snapshot
+    /// instead of needing leader-driven catch-up).
+    restart_cfg: SimulatedClusterConfig,
+    /// Voter set captured at [`Self::start`] time so [`Self::restart`]
+    /// uses the same voter records (directory_id, host:port) when
+    /// re-spawning. Without this the engine would generate fresh
+    /// `directory_id`s on every restart, which the peer-membership
+    /// equality checks treat as a different node.
+    voters: Vec<VoterConfig>,
+    /// Per-node data directory used when
+    /// [`SimulatedClusterConfig::use_durable_storage`] is `true`.
+    /// Empty otherwise. The directories live under [`Self::_data_root`]
+    /// and survive [`Self::kill`] so [`Self::restart`] can re-open
+    /// them via the file-backed stores.
+    node_dirs: BTreeMap<NodeId, PathBuf>,
+    /// Root temp directory owning every per-node sub-directory. The
+    /// underscored field name marks it as "owned for RAII cleanup
+    /// only" — the [`TempDir`] is removed when [`SimulatedCluster`]
+    /// is dropped. `None` when `use_durable_storage = false`.
+    _data_root: Option<TempDir>,
 }
 
 impl SimulatedCluster {
@@ -232,6 +358,26 @@ impl SimulatedCluster {
             cfg.election_max_ms,
             cfg.election_min_ms,
         );
+        // Validate per-node election overrides up front so a typo in a
+        // clock-skew test surfaces at start() rather than after the
+        // driver task has spawned (which would surface as an opaque
+        // election-never-fires hang).
+        for (node_id, w) in &cfg.per_node_election_overrides {
+            assert!(
+                node_id.0 >= 1 && (node_id.0 as usize) <= cfg.size,
+                "per_node_election_overrides: node id {} is out of range \
+                 (cluster size = {})",
+                node_id.0,
+                cfg.size,
+            );
+            assert!(
+                w.max_ms >= w.min_ms,
+                "per_node_election_overrides[{}]: max_ms ({}) must be >= min_ms ({})",
+                node_id.0,
+                w.max_ms,
+                w.min_ms,
+            );
+        }
 
         let clock = SimulatedClock::new();
         let network = SimulatedNetwork::new_with_clock(cfg.seed, clock.clone());
@@ -262,15 +408,47 @@ impl SimulatedCluster {
             })
             .collect();
 
+        // Build per-node data directories if durable storage was
+        // requested. The TempDir owns the entire tree; per-node
+        // sub-directories survive node kills and get re-opened on
+        // restart (true crash-recovery semantics).
+        let (data_root, node_dirs) = if cfg.use_durable_storage {
+            let root = tempfile::Builder::new()
+                .prefix("xraft-test-sim-")
+                .tempdir()
+                .map_err(|e| {
+                    XRaftError::Storage(format!(
+                        "SimulatedCluster::start: tempdir for durable storage: {e}"
+                    ))
+                })?;
+            let mut dirs = BTreeMap::new();
+            for i in 1..=cfg.size as u64 {
+                let dir = root.path().join(format!("node-{i}"));
+                std::fs::create_dir_all(&dir).map_err(|e| {
+                    XRaftError::Storage(format!(
+                        "SimulatedCluster::start: create per-node dir {}: {e}",
+                        dir.display()
+                    ))
+                })?;
+                dirs.insert(NodeId(i), dir);
+            }
+            (Some(root), dirs)
+        } else {
+            (None, BTreeMap::new())
+        };
+
         let mut nodes = Vec::with_capacity(cfg.size);
         for i in 1..=cfg.size as u64 {
+            let node_id = NodeId(i);
+            let dir = node_dirs.get(&node_id).map(|p| p.as_path());
             let node = Self::spawn_node(
-                NodeId(i),
+                node_id,
                 voters.clone(),
                 &cfg,
                 network.clone(),
                 tick_controller.tick_source(),
                 state_change.clone(),
+                dir,
             )?;
             nodes.push(node);
         }
@@ -309,11 +487,22 @@ impl SimulatedCluster {
             tick_pump: Some(pump),
             state_change,
             killed_tasks: Vec::new(),
+            restart_cfg: cfg,
+            voters,
+            node_dirs,
+            _data_root: data_root,
         })
     }
 
     /// Build + spawn a single node. Extracted so the `start` loop and
     /// the future `revive(node_id)` path share assembly.
+    ///
+    /// When `data_dir` is `Some`, the node uses file-backed storage
+    /// against that directory ([`FileLogStore`] / [`FileHardStateStore`]
+    /// / [`FileSnapshotStore`]) — so a restart against the same dir
+    /// recovers the node's persisted Raft state. When `data_dir` is
+    /// `None`, the node uses volatile in-memory stores (current Stage
+    /// 8.1 default).
     fn spawn_node(
         node_id: NodeId,
         voters: Vec<VoterConfig>,
@@ -321,20 +510,32 @@ impl SimulatedCluster {
         network: Arc<SimulatedNetwork>,
         tick_source: Box<dyn xraft_server::TickSource>,
         state_change: Arc<Notify>,
+        data_dir: Option<&Path>,
     ) -> XResult<SimulatedNode> {
+        // Apply per-node election-window override if one was set in
+        // the cluster config — this is the lever the Stage 8.2
+        // clock-skew scenarios use to model differential election-
+        // timer rates across nodes.
+        let (election_min_ms, election_max_ms) = match cfg.per_node_election_overrides.get(&node_id)
+        {
+            Some(w) => (w.min_ms, w.max_ms),
+            None => (cfg.election_min_ms, cfg.election_max_ms),
+        };
         let cluster_cfg = ClusterConfig {
             node_id,
             cluster_id: "simulated".into(),
             listen_addr: format!("127.0.0.1:{}", 10_000 + node_id.0 as u16),
             peers: vec![],
             voters: voters.clone(),
-            election_timeout_min_ms: cfg.election_min_ms,
-            election_timeout_max_ms: cfg.election_max_ms,
+            election_timeout_min_ms: election_min_ms,
+            election_timeout_max_ms: election_max_ms,
             fetch_interval_ms: cfg.fetch_ms,
             tick_interval_ms: cfg.tick_ms,
             snapshot_interval: 10_000,
             max_log_entries_before_compaction: 100_000,
-            data_dir: std::path::PathBuf::from("."),
+            data_dir: data_dir
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from(".")),
             snapshot_retention_count: 3,
             tls_enabled: false,
             tls_cert_path: None,
@@ -353,20 +554,6 @@ impl SimulatedCluster {
             check_quorum_interval_ms: None,
         };
 
-        // ---- storage ------------------------------------------------------
-        let log_store = MemoryLogStore::new();
-        let mut hs_store = MemoryHardStateStore::new();
-        let snapshot_store = MemorySnapshotStore::default();
-
-        // Persist the static voter set BEFORE constructing the
-        // RaftNode so the engine recovers the same voter set the
-        // cluster config carries — mirrors what
-        // `Server::start_with_state_machine` does at first boot.
-        let voter_set = cluster_cfg
-            .build_voter_set()?
-            .ok_or_else(|| XRaftError::Config("voter set is empty".into()))?;
-        hs_store.persist_voter_set(&voter_set)?;
-
         // ---- engine + state machine + observer ----------------------------
         // derive a per-node deterministic
         // seed via `mix64(cfg.seed, node_id)` so the engine's election-
@@ -374,7 +561,7 @@ impl SimulatedCluster {
         // (`cfg.seed` alone would have every node fire at the same
         // tick offset, defeating leader election).
         let node_seed = mix_seed(cfg.seed, node_id.0);
-        let raft_node = RaftNode::new_with_seed(cluster_cfg.clone(), node_seed)?;
+        let mut raft_node = RaftNode::new_with_seed(cluster_cfg.clone(), node_seed)?;
         let sm = RecordingStateMachine::with_state_change(state_change.clone());
         let recording = sm.handle();
         let observer = TestObserver::with_state_change(node_id, state_change);
@@ -391,25 +578,137 @@ impl SimulatedCluster {
             ..DriverConfig::default()
         };
 
-        // install the externally-driven
-        // ManualTickSource so the driver's `Input::Tick` cadence
-        // flows through the shared ManualTickController instead of
-        // a per-driver `tokio::time::interval`. Each tick atomically
-        // advances the cluster's SimulatedClock.
-        let driver = Driver::with_channels(
-            channels,
-            raft_node,
-            log_store,
-            hs_store,
-            snapshot_store,
-            sm,
-            transport.clone(),
-            driver_cfg,
-        )
-        .with_observer(Arc::new(observer) as Arc<dyn DriverObserver>)
-        .with_tick_source(tick_source);
-        let driver_handle = driver.handle();
-        let task = tokio::spawn(async move { driver.run().await });
+        // ---- storage ------------------------------------------------------
+        // Two assembly paths because the storage traits use static
+        // dispatch through generics on `Driver::with_channels`; we
+        // can't mix-and-match File* and Memory* at the same call
+        // site without trait-object plumbing. Both branches end with
+        // the SAME `SimulatedNode` shape so the caller doesn't see
+        // the storage-type leak.
+        let voter_set = cluster_cfg
+            .build_voter_set()?
+            .ok_or_else(|| XRaftError::Config("voter set is empty".into()))?;
+
+        let (driver_handle, task) = if let Some(dir) = data_dir {
+            let log_store = FileLogStore::open(dir).map_err(|e| {
+                XRaftError::Storage(format!(
+                    "spawn_node({node_id:?}): FileLogStore::open({}): {e}",
+                    dir.display()
+                ))
+            })?;
+            let mut hs_store = FileHardStateStore::open(dir).map_err(|e| {
+                XRaftError::Storage(format!(
+                    "spawn_node({node_id:?}): FileHardStateStore::open({}): {e}",
+                    dir.display()
+                ))
+            })?;
+            let snapshot_store = FileSnapshotStore::open(dir).map_err(|e| {
+                XRaftError::Storage(format!(
+                    "spawn_node({node_id:?}): FileSnapshotStore::open({}): {e}",
+                    dir.display()
+                ))
+            })?;
+            // Persist the static voter set BEFORE constructing the
+            // RaftNode so the engine recovers the same voter set the
+            // cluster config carries — mirrors what
+            // `Server::start_with_state_machine` does at first boot.
+            // Idempotent: subsequent opens of the same dir already
+            // carry the voter_set in the quorum-state file.
+            hs_store.persist_voter_set(&voter_set)?;
+
+            // ---- engine recovery from disk (iter-9 item #2) -------
+            // Mirror the production recovery path in
+            // `xraft-server::Server::start_with_state_machine`
+            // (xraft-server/src/server.rs §"engine recovery").
+            // Without these three steps the file-backed branch was
+            // structurally identical to the in-memory branch: the
+            // RaftNode started with default hard_state (term 0,
+            // voted_for None, commit_index 0) and last_log_(index,
+            // term) = (0, 0) even when the on-disk log already had
+            // committed entries from a prior boot. That made
+            // `durable_storage_survives_*` chaos tests pass for the
+            // wrong reason (catch-up from the surviving quorum
+            // re-replicated everything as if the disk were empty).
+            //
+            // Step 1 — recover HardState (term, voted_for,
+            // commit_index). Required for Raft term monotonicity
+            // and to skip already-committed entries on the apply
+            // pump's first pass.
+            let recovered_hs = hs_store.load().map_err(|e| {
+                XRaftError::Storage(format!("spawn_node({node_id:?}): hs_store.load(): {e}"))
+            })?;
+            if let Some(hs) = recovered_hs {
+                raft_node.hard_state = hs;
+            }
+            // Step 2 — seed last_log_(index, term) from the durable
+            // log so election eligibility and replication probes
+            // are accurate immediately, not after the first tick.
+            raft_node.set_last_log(log_store.last_index(), log_store.last_term());
+            // Step 3 — recover snapshot baseline if a snapshot
+            // exists on disk; raise commit_index/last_applied to
+            // the snapshot's last_included_index so the apply pump
+            // doesn't re-apply pre-snapshot entries.
+            if let Some((meta, _data)) = snapshot_store.load_latest_snapshot().map_err(|e| {
+                XRaftError::Storage(format!(
+                    "spawn_node({node_id:?}): snapshot_store.load_latest_snapshot(): {e}"
+                ))
+            })? {
+                if raft_node.commit_index < meta.last_included_index {
+                    raft_node.commit_index = meta.last_included_index;
+                }
+                if raft_node.last_applied < meta.last_included_index {
+                    raft_node.last_applied = meta.last_included_index;
+                }
+                if raft_node.last_snapshot_meta.is_none() {
+                    raft_node.last_snapshot_meta = Some(meta);
+                }
+            }
+            // Step 4 — defense-in-depth clamp: raise commit_index
+            // from the recovered hard-state checkpoint, but never
+            // above the durable log tip. Matches server.rs
+            // "Stage 7.2 iter-3 finding #1" comment.
+            let persisted_commit_clamped =
+                std::cmp::min(raft_node.hard_state.commit_index, log_store.last_index());
+            if persisted_commit_clamped > raft_node.commit_index {
+                raft_node.commit_index = persisted_commit_clamped;
+            }
+
+            let driver = Driver::with_channels(
+                channels,
+                raft_node,
+                log_store,
+                hs_store,
+                snapshot_store,
+                sm,
+                transport.clone(),
+                driver_cfg,
+            )
+            .with_observer(Arc::new(observer) as Arc<dyn DriverObserver>)
+            .with_tick_source(tick_source);
+            let handle = driver.handle();
+            let task = tokio::spawn(async move { driver.run().await });
+            (handle, task)
+        } else {
+            let log_store = MemoryLogStore::new();
+            let mut hs_store = MemoryHardStateStore::new();
+            let snapshot_store = MemorySnapshotStore::default();
+            hs_store.persist_voter_set(&voter_set)?;
+            let driver = Driver::with_channels(
+                channels,
+                raft_node,
+                log_store,
+                hs_store,
+                snapshot_store,
+                sm,
+                transport.clone(),
+                driver_cfg,
+            )
+            .with_observer(Arc::new(observer) as Arc<dyn DriverObserver>)
+            .with_tick_source(tick_source);
+            let handle = driver.handle();
+            let task = tokio::spawn(async move { driver.run().await });
+            (handle, task)
+        };
 
         Ok(SimulatedNode {
             node_id,
@@ -1085,6 +1384,120 @@ impl SimulatedCluster {
         self.network.kill(node_id);
     }
 
+    /// Bring a previously-[`Self::kill`]ed node back online.
+    ///
+    /// When [`SimulatedClusterConfig::use_durable_storage`] is `true`
+    /// (opt-in; the chaos-suite default constructor
+    /// `cluster_harness::chaos_cluster_config` sets it to `false`),
+    /// the replacement node re-opens the SAME per-node
+    /// sub-directory the killed node owned — the engine recovers
+    /// its [`HardState`](xraft_core::storage::HardState) (current
+    /// term, voted-for, commit_index, voter_set), replays the WAL,
+    /// restores the latest snapshot, and resumes from the
+    /// recovered apply cursor. This is the durable
+    /// process-restart-with-disk-preserved semantics that the
+    /// dedicated `durable_storage_survives_full_cluster_kill_restart`
+    /// chaos scenario uses.
+    ///
+    /// When `use_durable_storage` is `false` (the chaos-suite
+    /// default), the replacement [`SimulatedNode`] reuses the
+    /// killed node's `NodeId` and voter record but starts with an
+    /// empty log, empty hard state, and empty snapshot store — the
+    /// model is "the node's process crashed AND its disk was
+    /// wiped"; the cluster's leader must replicate every committed
+    /// entry back to the restarted node via `AppendEntries` (and,
+    /// for far-behind followers, `InstallSnapshot`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(XRaftError::Config)` if no node with `node_id` is
+    /// currently in [`Self::nodes`] OR if the named node is still
+    /// alive (`node.is_alive()` is true). The caller MUST call
+    /// [`Self::kill`] first.
+    pub async fn restart(&mut self, node_id: NodeId) -> XResult<()> {
+        // Find the killed slot.
+        let slot = self
+            .nodes
+            .iter()
+            .position(|n| n.node_id == node_id)
+            .ok_or_else(|| {
+                XRaftError::Config(format!("restart({node_id:?}): no such node in cluster"))
+            })?;
+        if self.nodes[slot].is_alive() {
+            return Err(XRaftError::Config(format!(
+                "restart({node_id:?}): node is still alive — call kill() first"
+            )));
+        }
+
+        // Reap the parked-killed handle so we don't carry a dangling
+        // aborted JoinHandle once the node is restarted. We `.await`
+        // with a short timeout to surface any pre-existing panic the
+        // kill() docstring promises — if the task panicked BEFORE the
+        // abort signal reached it, that panic is fatal regardless of
+        // restart intent.
+        let reaped: Option<JoinHandle<XResult<()>>> = {
+            let mut idx_to_remove = None;
+            for (i, (id, _)) in self.killed_tasks.iter().enumerate() {
+                if *id == node_id {
+                    idx_to_remove = Some(i);
+                    break;
+                }
+            }
+            idx_to_remove.map(|i| self.killed_tasks.swap_remove(i).1)
+        };
+        if let Some(task) = reaped {
+            // Aborted tasks return `JoinError::is_cancelled()` — fine.
+            // A `JoinError::is_panic()` would mean the task panicked
+            // before our abort landed and the panic must surface.
+            match tokio::time::timeout(Duration::from_millis(500), task).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    if e.is_panic() {
+                        return Err(XRaftError::Config(format!(
+                            "restart({node_id:?}): pre-existing panic in killed driver task: \
+                             cannot safely restart a node that panicked: {e:?}"
+                        )));
+                    }
+                    // is_cancelled() — expected for an aborted task.
+                }
+                Err(_) => {
+                    // Task didn't reap within timeout — leave it; the
+                    // shutdown path will handle it eventually.
+                }
+            }
+        }
+
+        // Spawn a fresh node with the SAME node_id and the SAME
+        // voter set the cluster was started with. When durable
+        // storage is enabled, pass the SAME per-node dir back so the
+        // file-backed stores re-open the persisted files.
+        let dir = self.node_dirs.get(&node_id).map(|p| p.as_path());
+        let replacement = Self::spawn_node(
+            node_id,
+            self.voters.clone(),
+            &self.restart_cfg,
+            self.network.clone(),
+            self.tick_controller.tick_source(),
+            self.state_change.clone(),
+            dir,
+        )?;
+        self.nodes[slot] = replacement;
+
+        // Re-mark the node alive in the network. spawn_node's
+        // network.register() call adds the new handler, but the
+        // `dead` set still carries the kill() marker; without revive,
+        // every outbound RPC to/from the new driver would be dropped.
+        self.network.revive(node_id);
+
+        info!(
+            target: "xraft_test::simulated",
+            node_id = node_id.0,
+            durable = self.restart_cfg.use_durable_storage,
+            "SimulatedCluster::restart re-spawned node"
+        );
+        Ok(())
+    }
+
     /// Symmetrically partition `a` from `b`. Both directions are cut.
     pub fn partition(&self, a: NodeId, b: NodeId) {
         self.network.partition(a, b);
@@ -1110,7 +1523,7 @@ impl SimulatedCluster {
     ///
     /// # teardown errors are NOT swallowed
     ///
-    /// A naive `let _ = tokio::time::timeout(2s, task).await;`
+    /// A naive `let _ = tokio::time::timeout(15s, task).await;`
     /// would silently discard EVERY driver task outcome —
     /// `XRaftError` returns, task panics, and shutdown deadlocks alike
     /// would pass undetected. This shutdown instead classifies every outcome
@@ -1125,8 +1538,11 @@ impl SimulatedCluster {
     ///   real driver / storage / transport bugs hidden.
     /// * `JoinError::is_panic()`: aggregated as fatal — driver task
     ///   panics MUST be surfaced.
-    /// * Timeout after 2 s: aggregated as fatal — a shutdown deadlock
-    ///   is a real bug.
+    /// * Timeout after [`SHUTDOWN_TASK_TIMEOUT`]: aggregated as fatal
+    ///   — a shutdown deadlock is a real bug. The timeout is sized
+    ///   to cover the driver's own
+    ///   `2 * shutdown_drain_deadline` budget plus scheduler slack;
+    ///   see the constant's doc for the rationale.
     ///
     /// # killed nodes are drained too
     ///
@@ -1158,7 +1574,7 @@ impl SimulatedCluster {
                 continue; // already killed via Self::kill (parked separately)
             };
             let node_id = node.node_id.0;
-            match tokio::time::timeout(Duration::from_secs(2), task).await {
+            match tokio::time::timeout(SHUTDOWN_TASK_TIMEOUT, task).await {
                 Ok(Ok(Ok(()))) => {
                     // clean exit
                 }
@@ -1188,7 +1604,8 @@ impl SimulatedCluster {
                 }
                 Err(_elapsed) => {
                     failures.push(format!(
-                        "node {node_id}: driver did not exit within 2 s (possible shutdown deadlock)"
+                        "node {node_id}: driver did not exit within {:?} (possible shutdown deadlock)",
+                        SHUTDOWN_TASK_TIMEOUT
                     ));
                 }
             }
@@ -1198,7 +1615,7 @@ impl SimulatedCluster {
         // CANCELLED outcome is expected and tolerated.
         for (node_id, task) in self.killed_tasks.drain(..) {
             let nid = node_id.0;
-            match tokio::time::timeout(Duration::from_secs(2), task).await {
+            match tokio::time::timeout(SHUTDOWN_TASK_TIMEOUT, task).await {
                 Ok(Ok(Ok(()))) => {
                     // Driver completed cleanly before the abort
                     // signal landed — acceptable.
@@ -1229,9 +1646,11 @@ impl SimulatedCluster {
                 }
                 Err(_elapsed) => {
                     // The runtime should resolve an aborted task
-                    // within 2 s; if it doesn't, surface it.
+                    // promptly; if it doesn't within the same budget
+                    // we apply to graceful driver exits, surface it.
                     failures.push(format!(
-                        "node {nid} (killed): aborted task did not resolve within 2 s"
+                        "node {nid} (killed): aborted task did not resolve within {:?}",
+                        SHUTDOWN_TASK_TIMEOUT
                     ));
                 }
             }

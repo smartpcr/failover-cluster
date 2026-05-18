@@ -145,8 +145,9 @@ impl RaftMessageHandler for StubHandler {
         &self,
         _req: FetchSnapshotRequest,
     ) -> XResult<SnapshotChunkStream> {
-        let stream: SnapshotChunkStream =
-            Box::pin(futures::stream::iter(Vec::<XResult<FetchSnapshotChunk>>::new()));
+        let stream: SnapshotChunkStream = Box::pin(futures::stream::iter(Vec::<
+            XResult<FetchSnapshotChunk>,
+        >::new()));
         Ok(stream)
     }
 }
@@ -263,8 +264,8 @@ fn build_outbound_grpc_transport(
     cluster: &ClusterConfig,
     pool: &ConnectionPool,
 ) -> Arc<GrpcTransport<StubHandler>> {
-    let mut cfg = GrpcTransportConfig::from_cluster_config(cluster)
-        .expect("transport config from cluster");
+    let mut cfg =
+        GrpcTransportConfig::from_cluster_config(cluster).expect("transport config from cluster");
     // Force a no-op listen address (the test does not start the
     // transport's inbound server — only its outbound `Transport`
     // methods are exercised).
@@ -282,8 +283,7 @@ fn build_outbound_grpc_transport(
 async fn router_with_pool_uses_redirect_aware_fetch_path() {
     let follower_port = pick_free_port();
     let leader_port = pick_free_port();
-    let follower_addr: std::net::SocketAddr =
-        format!("127.0.0.1:{follower_port}").parse().unwrap();
+    let follower_addr: std::net::SocketAddr = format!("127.0.0.1:{follower_port}").parse().unwrap();
     let leader_addr: std::net::SocketAddr = format!("127.0.0.1:{leader_port}").parse().unwrap();
 
     let follower_handler = StubHandler::follower_pointing_to(LEADER_NODE_ID);
@@ -359,7 +359,10 @@ async fn router_with_pool_uses_redirect_aware_fetch_path() {
     drop(router); // joinset reaping; not strictly necessary but explicit.
     sh_f.notify_one();
     sh_l.notify_one();
-    let _ = jh_f.await.expect("follower join").map_err(|e| e.to_string());
+    let _ = jh_f
+        .await
+        .expect("follower join")
+        .map_err(|e| e.to_string());
     let _ = jh_l.await.expect("leader join").map_err(|e| e.to_string());
 }
 
@@ -373,8 +376,7 @@ async fn router_with_pool_uses_redirect_aware_fetch_path() {
 async fn router_without_pool_uses_raw_transport_send_fetch() {
     let follower_port = pick_free_port();
     let leader_port = pick_free_port();
-    let follower_addr: std::net::SocketAddr =
-        format!("127.0.0.1:{follower_port}").parse().unwrap();
+    let follower_addr: std::net::SocketAddr = format!("127.0.0.1:{follower_port}").parse().unwrap();
     let leader_addr: std::net::SocketAddr = format!("127.0.0.1:{leader_port}").parse().unwrap();
 
     let follower_handler = StubHandler::follower_pointing_to(LEADER_NODE_ID);
@@ -446,7 +448,10 @@ async fn router_without_pool_uses_raw_transport_send_fetch() {
     drop(router);
     sh_f.notify_one();
     sh_l.notify_one();
-    let _ = jh_f.await.expect("follower join").map_err(|e| e.to_string());
+    let _ = jh_f
+        .await
+        .expect("follower join")
+        .map_err(|e| e.to_string());
     let _ = jh_l.await.expect("leader join").map_err(|e| e.to_string());
     drop(pool);
 }
@@ -544,8 +549,7 @@ async fn server_assembly_wires_connection_pool_into_driver() {
     // Clean shutdown — the test purpose is the assembly assertion
     // above; we don't need to exercise runtime behaviour.
     handle.shutdown();
-    let join_result =
-        tokio::time::timeout(Duration::from_secs(10), handle.join()).await;
+    let join_result = tokio::time::timeout(Duration::from_secs(10), handle.join()).await;
     match join_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("server join surfaced non-fatal teardown noise: {e}"),

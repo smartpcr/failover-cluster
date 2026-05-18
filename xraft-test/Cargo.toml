@@ -24,3 +24,9 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Stage 8.2 chaos / stress tests use `futures::executor::block_on`
+# inside `panic!` diagnostic formatters where an `async` snapshot
+# helper must be invoked from a non-async context. This is the
+# minimum-footprint dependency for that single use; pulled into
+# dev-dependencies only.
+futures = "0.3"

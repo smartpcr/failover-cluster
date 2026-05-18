@@ -11,6 +11,7 @@
 //!   used by the brief's real-network 3-node and 5-node scenarios.
 
 pub mod clock;
+pub mod fault_injection;
 pub mod network;
 pub mod observer;
 pub mod real;
@@ -19,8 +20,9 @@ pub mod state_machine;
 pub mod teardown;
 
 pub use clock::{ManualTickController, ManualTickSource, SimulatedClock};
+pub use fault_injection::{ChaosScheduleConfig, FaultEvent, FaultInjector, FaultSchedule};
 pub use network::{SimulatedNetwork, SimulatedTransport};
 pub use observer::{TestObserver, TestObserverHandle};
 pub use real::{RealCluster, RealClusterConfig, RealNode};
-pub use simulated::{SimulatedCluster, SimulatedClusterConfig, SimulatedNode};
+pub use simulated::{ElectionWindow, SimulatedCluster, SimulatedClusterConfig, SimulatedNode};
 pub use state_machine::{RecordingHandle, RecordingStateMachine};

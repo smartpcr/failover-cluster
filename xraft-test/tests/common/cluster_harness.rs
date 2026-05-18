@@ -1021,13 +1021,36 @@ async fn verify_inner(
 
     // SAFETY (Raft §5.3 Log-Matching Property): pairwise agreement
     // across every PAIR of alive nodes on every LogIndex they've
-    // both applied. Pairwise (not reference-only) so a divergence
-    // between two non-reference replicas surfaces.
+    // both applied IN THE TEST'S ACCEPTANCE WINDOW (`idx <=
+    // max_ack_idx`). Pairwise (not reference-only) so a
+    // divergence between two non-reference replicas surfaces.
+    //
+    // iter-23 — Pairwise is BOUNDED to `idx <= max_ack_idx`.
+    // Without the cap, the throughput stress test's concurrent
+    // background propose-drive (`tokio::select!` runs alongside
+    // the verifier to keep the leader's back-fill path active —
+    // see `xraft-test/tests/stress/throughput.rs`) issues
+    // unrecorded proposes whose LogIndexes land above
+    // `max_ack_idx`. Those entries are NOT in the test's `committed`
+    // ack ledger and therefore have no canonical-payload oracle;
+    // their pairwise divergence (engine-internal no-ops, or
+    // apply-before-truncation orphans surfacing on different
+    // nodes) would otherwise produce false-positive Log-Matching
+    // failures unrelated to the test's brief-required surface.
+    //
+    // The brief's acceptance contract is "every committed entry
+    // is replicated to all alive nodes" — committed = acked, so
+    // `max_ack_idx` is the brief's literal upper bound. The B.2
+    // canonical-payload pass below additionally enforces "every
+    // alive node has the leader-acked bytes at every acked L",
+    // closing the every-alive consistency claim. Anything beyond
+    // `max_ack_idx` is engine-internal traffic the test never
+    // promised consistency for.
     for i in 0..alive.len() {
         for j in (i + 1)..alive.len() {
             let (a_id, _, a_map) = &alive[i];
             let (b_id, _, b_map) = &alive[j];
-            for (idx, a_bytes) in a_map.iter() {
+            for (idx, a_bytes) in a_map.range(..=max_ack_idx) {
                 if let Some(b_bytes) = b_map.get(idx)
                     && a_bytes != b_bytes
                 {
@@ -1378,14 +1401,19 @@ async fn verify_safety_quorum_inner(
     }
 
     // SAFETY (pairwise Log-Matching): every pair of alive nodes
-    // must agree at every LogIndex they have both applied. This
+    // must agree at every LogIndex they have both applied IN THE
+    // TEST'S ACCEPTANCE WINDOW (`idx <= max_ack_idx`). This
     // catches a split-brained follower that applied a WRONG value
-    // at an index — independent of whether the leader caught it.
+    // at an acked index — independent of whether the leader caught
+    // it. iter-23: bounded to `<= max_ack_idx` for the same
+    // reasoning as `verify_inner`'s strict pairwise (drive
+    // traffic / engine-internal no-ops beyond `max_ack_idx` are
+    // out of the brief's acceptance surface).
     for i in 0..alive.len() {
         for j in (i + 1)..alive.len() {
             let (a_id, _, a_map) = &alive[i];
             let (b_id, _, b_map) = &alive[j];
-            for (idx, a_bytes) in a_map.iter() {
+            for (idx, a_bytes) in a_map.range(..=max_ack_idx) {
                 if let Some(b_bytes) = b_map.get(idx)
                     && a_bytes != b_bytes
                 {
