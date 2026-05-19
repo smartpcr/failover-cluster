@@ -16,7 +16,7 @@
 //! # Why this differs from chaos/node_failure.rs::rapid_leader_churn_recovery
 //!
 //! The chaos test runs a SEQUENTIAL propose loop (one in flight at
-//! a time) which measures end-to-end LATENCY under churn — useful
+//! a time) which measures end-to-end LATENCY under churn ΓÇö useful
 //! for safety verification but uninteresting for throughput. This
 //! stress test runs a pipelined `FuturesUnordered` loop (up to
 //! [`MAX_IN_FLIGHT`] in flight) so the leader's append-and-replicate
@@ -28,7 +28,7 @@
 //! # Why a duration-based stop (not a fixed proposal count)
 //!
 //! At ~700-2000 prop/s observed throughput, a fixed N=5000 proposal
-//! count finishes in ~2.5 s of wall-clock — BEFORE the first 3-s
+//! count finishes in ~2.5 s of wall-clock ΓÇö BEFORE the first 3-s
 //! churn beat fires. The rubber-duck pass flagged this as a
 //! correctness bug: the test would be a false pass because the
 //! churn never overlaps the propose pipeline. This implementation
@@ -53,14 +53,14 @@ use crate::common::cluster_harness::{
 };
 
 /// Total simulated duration the churn schedule covers. Sized so 3-4
-/// churn beats fire DURING the propose phase (interval = 4 s →
+/// churn beats fire DURING the propose phase (interval = 4 s ΓåÆ
 /// 15 s yields ~3 churn beats with margin for the first beat's
 /// startup delay).
 const CHURN_DURATION: Duration = Duration::from_secs(15);
 
 /// Simulated time between churn beats (each beat partitions the
 /// current leader). Sized so followers have time to catch up between
-/// re-elections — under shorter intervals the engine's incremental
+/// re-elections ΓÇö under shorter intervals the engine's incremental
 /// fetch loop can fall arbitrarily behind on a node that was
 /// recently the partitioned leader (it must rewind to its
 /// commit_index and stream forward), and the post-recovery
@@ -84,8 +84,8 @@ const CHURN_HEAL_AFTER: Duration = Duration::from_millis(1500);
 /// by the leader's per-tick replicate budget, so keeping the
 /// in-flight queue smaller leaves the leader more time per tick to
 /// service rejoining followers' fetch backlog. Empirically: 64 in
-/// flight ⇒ followers can lag 6000+ entries after 11 s and never
-/// drain; 16 in flight ⇒ followers drain within the recovery
+/// flight ΓçÆ followers can lag 6000+ entries after 11 s and never
+/// drain; 16 in flight ΓçÆ followers drain within the recovery
 /// deadline on commodity hardware.
 const MAX_IN_FLIGHT: usize = 16;
 
@@ -163,13 +163,13 @@ fn make_churn_propose_future<'a>(
 ///
 /// Asserts:
 ///
-/// * Throughput ≥ [`MIN_THROUGHPUT_UNDER_CHURN`] (sustained
+/// * Throughput ΓëÑ [`MIN_THROUGHPUT_UNDER_CHURN`] (sustained
 ///   ack rate, not peak).
 /// * **Pairwise Log-Matching** across every alive node at every
-///   LogIndex applied by both (Raft §5.3) — no committed entry
+///   LogIndex applied by both (Raft ┬º5.3) ΓÇö no committed entry
 ///   diverges between any pair of nodes that both applied it.
 /// * **Quorum-presence** at every LogIndex in `1..=q_frontier`
-///   (Raft §5.4.2 — committed = present on a majority of voters)
+///   (Raft ┬º5.4.2 ΓÇö committed = present on a majority of voters)
 ///   via [`verify_committed_entries_safety_quorum`]. A minority
 ///   of alive followers MAY lag the frontier; that is engine
 ///   LIVENESS lag (eventual catch-up), not safety. The verifier's
@@ -220,7 +220,7 @@ async fn sustained_throughput_with_leader_churn() {
     // outer loop also dispatches churn-schedule events when their
     // sim-time offset comes due. This is structurally the same shape
     // as `harness::run_chaos_with_proposals` except the propose half
-    // is PIPELINED instead of sequential — that's what makes this a
+    // is PIPELINED instead of sequential ΓÇö that's what makes this a
     // throughput test rather than a latency test.
     let mut inflight = FuturesUnordered::new();
     while inflight.len() < MAX_IN_FLIGHT {
@@ -258,9 +258,9 @@ async fn sustained_throughput_with_leader_churn() {
             // over yielding to the pump task. Without `biased` we'd
             // sometimes yield even with ready futures, slowing
             // throughput.
-            Some((seq, _payload, res)) = inflight.next() => {
+            Some((_seq, payload_bytes, res)) = inflight.next() => {
                 match res {
-                    Ok(idx) => committed.push((idx, seq.to_be_bytes().to_vec())),
+                    Ok(idx) => committed.push((idx, payload_bytes.to_vec())),
                     Err(_) => failed_proposals += 1,
                 }
                 if !stop.load(Ordering::Relaxed) {
@@ -273,7 +273,7 @@ async fn sustained_throughput_with_leader_churn() {
                 }
             }
             _ = tokio::task::yield_now() => {
-                // No future ready yet — yield so the pump task can
+                // No future ready yet ΓÇö yield so the pump task can
                 // advance simulated time.
             }
         }
@@ -281,9 +281,9 @@ async fn sustained_throughput_with_leader_churn() {
 
     // Drain remaining in-flight futures so all `&cluster` borrows
     // end before the strict verifier runs.
-    while let Some((_seq, _payload, res)) = inflight.next().await {
+    while let Some((_seq, payload_bytes, res)) = inflight.next().await {
         match res {
-            Ok(idx) => committed.push((idx, _seq.to_be_bytes().to_vec())),
+            Ok(idx) => committed.push((idx, payload_bytes.to_vec())),
             Err(_) => failed_proposals += 1,
         }
     }
@@ -324,7 +324,7 @@ async fn sustained_throughput_with_leader_churn() {
     // propose window. Under sustained churn the engine's
     // per-follower next_index recalibration after each
     // partition-heal can leave a minority lagging by thousands of
-    // entries — this is Raft LIVENESS lag (eventual catch-up
+    // entries ΓÇö this is Raft LIVENESS lag (eventual catch-up
     // guarantee), not SAFETY violation. The strict every-alive
     // verifier ([`verify_committed_entries_replicated`]) is the
     // right tool for tests whose chaos window CLOSES (e.g.
@@ -336,10 +336,10 @@ async fn sustained_throughput_with_leader_churn() {
     //
     // The quorum verifier still enforces:
     //   1. Pairwise Log-Matching across every PAIR of alive nodes
-    //      (Raft §5.3 Log-Matching Property — split-brain catcher).
+    //      (Raft ┬º5.3 Log-Matching Property ΓÇö split-brain catcher).
     //   2. Quorum-presence at every LogIndex in
-    //      `1..=converged_commit_index` (Raft §5.3 Leader
-    //      Completeness — a committed entry is on a majority).
+    //      `1..=converged_commit_index` (Raft ┬º5.3 Leader
+    //      Completeness ΓÇö a committed entry is on a majority).
     //
     // What it relaxes vs the strict verifier: a minority of nodes
     // MAY lag at the time of the snapshot. Lagging followers are
