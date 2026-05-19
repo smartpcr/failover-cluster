@@ -2629,6 +2629,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "bytes",
+ "futures",
  "rand 0.8.6",
  "tempfile",
  "tokio",

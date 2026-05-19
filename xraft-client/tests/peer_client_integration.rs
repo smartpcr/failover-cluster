@@ -508,8 +508,7 @@ async fn pool_fetch_via_leader_follows_advertised_leader() {
 async fn pool_fetch_via_leader_ignores_stale_hint_when_engine_epoch_is_newer() {
     let follower_port = pick_free_port();
     let leader_port = pick_free_port();
-    let follower_addr: std::net::SocketAddr =
-        format!("127.0.0.1:{follower_port}").parse().unwrap();
+    let follower_addr: std::net::SocketAddr = format!("127.0.0.1:{follower_port}").parse().unwrap();
     let leader_addr: std::net::SocketAddr = format!("127.0.0.1:{leader_port}").parse().unwrap();
 
     let follower_handler = StubHandler::follower_pointing_to(2);
@@ -618,8 +617,7 @@ async fn pool_fetch_via_leader_ignores_stale_hint_when_engine_epoch_is_newer() {
 async fn pool_fetch_via_leader_uses_cached_hint_when_strictly_newer_than_engine_epoch() {
     let follower_port = pick_free_port();
     let leader_port = pick_free_port();
-    let follower_addr: std::net::SocketAddr =
-        format!("127.0.0.1:{follower_port}").parse().unwrap();
+    let follower_addr: std::net::SocketAddr = format!("127.0.0.1:{follower_port}").parse().unwrap();
     let leader_addr: std::net::SocketAddr = format!("127.0.0.1:{leader_port}").parse().unwrap();
 
     let follower_handler = StubHandler::follower_pointing_to(2);
