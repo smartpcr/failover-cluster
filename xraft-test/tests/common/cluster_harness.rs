@@ -1813,6 +1813,28 @@ async fn await_quorum_convergence(
 
 /// Drive the cluster to FULL convergence after a chaos run:
 ///
+/// 1. Find the current alive leader; read its `commit_index` as the
+///    convergence target.
+/// 2. Wait until every alive node's recording state machine has
+///    `last_applied >= target` (i.e. the leader's committed prefix
+///    is fully replicated AND applied on every alive replica).
+/// 3. Re-snapshot the leader. If the leader changed OR the
+///    `commit_index` advanced, set the new target and loop. If the
+///    leader+term+commit_index were stable across two consecutive
+///    poll passes AND every alive node was already caught up, the
+///    cluster has converged: return `Ok(converged_commit_index)`.
+///
+/// Uses a single GLOBAL `recovery_deadline` measured in simulated
+/// time (plus a generous wall-clock backstop) — leader churn or
+/// late-fetching followers can extend the wait, but cannot
+/// indefinitely refresh the deadline.
+///
+/// Returns `Ok(converged_commit_index)` on success or a diagnostic
+/// `String` on timeout. The string includes per-node
+/// `(node_id, last_applied, commit_index)` snapshots so the operator
+/// can see which replica stalled.
+/// Drive the cluster to FULL convergence after a chaos run:
+///
 /// 1. Find the current alive leader; verify there's exactly one.
 /// 2. Wait until every alive node's recording state machine has
 ///    `last_applied >= target_idx` (i.e. the test's leader-acked
