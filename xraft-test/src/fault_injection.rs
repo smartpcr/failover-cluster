@@ -356,16 +356,28 @@ impl FaultInjector {
             }
             // Counter-event so the cluster has a chance to converge
             // between faults.
+            //
+            // The sampler above only emits `PartitionGroup`,
+            // `SetDropPct`, `SetLatency`, or `Kill`. All other
+            // `FaultEvent` variants are unreachable here; we make
+            // that invariant explicit with `unreachable!` so a
+            // future extension of `max_kind` cannot silently pick a
+            // semantically wrong inverse (e.g. mapping
+            // `KillCurrentLeader` to `HealAll` would leave the
+            // killed node permanently dead and drop the cluster
+            // below quorum).
             let counter = match &event {
-                FaultEvent::PartitionGroup(_)
-                | FaultEvent::PartitionCurrentLeader
-                | FaultEvent::KillCurrentLeader
-                | FaultEvent::RestartKilledLeader => FaultEvent::HealAll,
+                FaultEvent::PartitionGroup(_) => FaultEvent::HealAll,
                 FaultEvent::SetDropPct(_) => FaultEvent::SetDropPct(0),
                 FaultEvent::SetLatency(_) => FaultEvent::SetLatency(Duration::ZERO),
-                FaultEvent::HealAll => FaultEvent::HealAll,
                 FaultEvent::Kill(nid) => FaultEvent::Restart(*nid),
-                FaultEvent::Restart(_) => FaultEvent::HealAll,
+                FaultEvent::HealAll
+                | FaultEvent::Restart(_)
+                | FaultEvent::PartitionCurrentLeader
+                | FaultEvent::KillCurrentLeader
+                | FaultEvent::RestartKilledLeader => {
+                    unreachable!("not sampled by build_chaos_schedule")
+                }
             };
             events.push((at, counter));
             let gap_us = self.rng.gen_range(lo..=hi);
