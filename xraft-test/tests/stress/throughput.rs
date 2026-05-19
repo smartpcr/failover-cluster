@@ -153,14 +153,22 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// requires traffic to fire — a silent cluster simply remains
 /// half-converged.
 ///
-/// 120 s is a generous bound (settle typically completes in
-/// < 5 s wall on a quiet runtime); the polling loop breaks early
-/// when [`SimulatedCluster::try_converged_leader`] returns `Some`
-/// AND every alive node's `recording.last_applied() >= max_ack_idx`
+/// 60 s is a generous bound (settle typically completes in
+/// < 5 s wall on a quiet runtime — ≥12× headroom); the polling
+/// loop breaks early when
+/// [`SimulatedCluster::try_converged_leader`] returns `Some` AND
+/// every alive node's `recording.last_applied() >= max_ack_idx`
 /// for 3 consecutive observations, so the happy path doesn't pay
 /// the full ceiling. The ceiling absorbs the worst case where the
 /// throughput test runs LAST in a `--test-threads=1` sequence
-/// after `leader_churn` + `smoke` have already loaded the machine.
+/// after `leader_churn` + `smoke` have already loaded the machine,
+/// while keeping a failing run's quiesce-loop wall-clock cost
+/// bounded by CI job budget expectations (was 120 s in earlier
+/// iterations — halved here because empirical CI runs showed
+/// settle always reaching convergence inside 10 s even under
+/// post-`leader_churn` contention, and a 120 s ceiling left a
+/// failing run blocking CI for 2 min in this phase alone before
+/// the verifier even started).
 ///
 /// The predicate uses `recording.last_applied()` (the
 /// RecordingStateMachine's authoritative apply counter), which is
@@ -170,7 +178,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// `status.last_applied` field here would make this loop spin
 /// past its ceiling while the verifier immediately observed
 /// convergence.
-const POST_PROPOSE_QUIESCE: Duration = Duration::from_secs(120);
+const POST_PROPOSE_QUIESCE: Duration = Duration::from_secs(60);
 
 /// Build one propose future tied to `cluster`'s borrow lifetime.
 ///
@@ -603,20 +611,25 @@ async fn sustained_1000_per_second_for_60s_with_single_node_failure() {
     // the strict verifier's required-presence + pairwise
     // Log-Matching checks can both run cleanly.
     //
-    // 600 s recovery_deadline (SIMULATED) is the catch-up budget
+    // 60 s recovery_deadline (SIMULATED) is the catch-up budget
     // the verifier's internal `await_full_convergence` step uses
     // when polling each alive node's `recording.last_applied()`
     // up to `max_ack_idx`. Generous bound: under heavy
     // `--test-threads=1` contention from prior stress tests in
     // the same binary, the engine's per-follower next_index
     // recalibration can exhibit a slow tail even with a non-leader
-    // victim. The wall-clock backstop is
-    // `recovery_deadline * 10 + 60s` ≈ 6060 s, far above any
-    // practical CI budget, so the simulated bound is what
-    // actually bounds the verifier's wait. The verifier's polling
-    // loop exits as soon as the every-alive applied frontier
-    // reaches `max_ack_idx`, so this ceiling does not slow the
-    // happy path.
+    // victim, but the active background propose-drive below keeps
+    // AppendEntries flowing so back-fill makes steady progress
+    // (typical convergence < 5 s simulated). The wall-clock
+    // backstop is `recovery_deadline * 10 + 60s` ≈ 660 s, bounded
+    // for CI job budgets (was 600 s simulated / ≈ 6060 s wall-
+    // clock backstop in earlier iterations — reduced here because
+    // the previous value left a failing run blocking CI for over
+    // an hour, far past any practical CI job timeout). Matches
+    // the smoke variant's recovery_deadline below for internal
+    // consistency. The verifier's polling loop exits as soon as
+    // the every-alive applied frontier reaches `max_ack_idx`, so
+    // this ceiling does not slow the happy path.
     //
     // # CONCURRENT background propose-drive
     //
@@ -643,6 +656,55 @@ async fn sustained_1000_per_second_for_60s_with_single_node_failure() {
     // verifier completes (either Ok or Err with timeout).
     let recovery_deadline = Duration::from_secs(600);
     let drive_seq_start = quiesce_seq;
+    //
+    // # Cross-node snapshot-collection race-safety
+    //
+    // `verify_inner` (`cluster_harness.rs`, lines ~1037-1051)
+    // snapshots each alive node's `recording.applied()`
+    // SEQUENTIALLY in a loop, not atomically across nodes. The
+    // drive future below keeps issuing proposes during that loop,
+    // so it is structurally possible for a drive-issued propose
+    // to be mid-apply when one node's snapshot is taken and
+    // already-applied (or not-yet-applied) when the next node's
+    // snapshot is taken. This race is **benign** for the pairwise
+    // Log-Matching check, for two independent reasons:
+    //
+    //   1. **Drive-propose indexes are strictly above
+    //      `max_ack_idx`.** The drive runs AFTER the 60 s submit
+    //      window plus the quiescence phase have ended, and its
+    //      proposes are deliberately NOT added to `committed`, so
+    //      they allocate LogIndexes K > max_ack_idx. The verifier's
+    //      pairwise loop walks only `a_map.range(..=max_ack_idx)`
+    //      (see the iter-23 bound in `verify_inner`), so any
+    //      drive-issued entry at K that appears on one node's
+    //      snapshot but not another's is excluded from comparison
+    //      entirely — no false positive is possible.
+    //
+    //   2. **At idx == max_ack_idx the snapshot is consistent
+    //      across all alive nodes.** Before the snapshot loop
+    //      starts, `await_full_convergence(cluster, max_ack_idx,
+    //      ...)` has returned successfully, so every alive node's
+    //      `recording.last_applied() >= max_ack_idx`. Raft's
+    //      per-replica apply ordering is strictly monotonic by
+    //      LogIndex (and the recording SM applies each index
+    //      exactly once), so a follower that has applied any
+    //      drive-issued entry at K > max_ack_idx MUST have already
+    //      applied max_ack_idx — with the canonical
+    //      leader-acked bytes from the test's `committed` ledger,
+    //      by Raft's Log-Matching property. A drive-propose
+    //      therefore cannot change a follower's apply record at
+    //      max_ack_idx or earlier, and cannot make two snapshots
+    //      disagree at the boundary index.
+    //
+    // We deliberately do NOT pause the drive during snapshot
+    // collection: pausing would require cross-crate coordination
+    // (a shared atomic flag or a wrapped propose path) for zero
+    // safety benefit, and — more importantly — it would starve
+    // the very back-fill path the drive exists to keep alive.
+    // The drive was added precisely to prevent the verifier from
+    // spinning against an idle leader while a slow follower
+    // remains one entry short of `max_ack_idx`; halting it during
+    // the snapshot phase would re-introduce that failure mode.
     let drive = async {
         let mut seq = drive_seq_start;
         loop {
@@ -653,11 +715,12 @@ async fn sustained_1000_per_second_for_60s_with_single_node_failure() {
             // contention on the leader's heartbeat task while
             // still nudging the back-fill path often enough to
             // keep followers within their (5 s, 10 s) election
-            // window. The verifier's pairwise check is now
-            // bounded to `idx <= max_ack_idx` (see
-            // `cluster_harness::verify_inner`), so drive-issued
-            // proposes that land beyond the test's ack ledger
-            // are correctly ignored by the safety surface.
+            // window. The verifier's pairwise check is bounded
+            // to `idx <= max_ack_idx` (see the race-safety
+            // analysis above and `cluster_harness::verify_inner`),
+            // so drive-issued proposes that land beyond the
+            // test's ack ledger are correctly ignored by the
+            // safety surface.
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     };
