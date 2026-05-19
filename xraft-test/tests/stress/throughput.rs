@@ -654,7 +654,7 @@ async fn sustained_1000_per_second_for_60s_with_single_node_failure() {
     // brief's 60-s submit window envelope. The drive future never
     // resolves; the `tokio::select!` returns as soon as the
     // verifier completes (either Ok or Err with timeout).
-    let recovery_deadline = Duration::from_secs(600);
+    let recovery_deadline = Duration::from_secs(60);
     let drive_seq_start = quiesce_seq;
     //
     // # Cross-node snapshot-collection race-safety
