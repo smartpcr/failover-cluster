@@ -453,6 +453,95 @@ impl Default for ChaosRunConfig {
     }
 }
 
+/// Pending kill snapshot — populated when a
+/// [`FaultEvent::KillCurrentLeader`] event fires, consumed when its
+/// paired [`FaultEvent::RestartKilledLeader`] fires. The pair becomes
+/// one [`BeatRecovery`] in [`ChaosRunResult::recoveries`].
+///
+/// Lifted to module scope (rather than declared inside
+/// [`run_chaos_with_proposals`]) so the shared
+/// [`apply_event_with_tracking`] helper can mention it in its
+/// signature — both the main loop body AND the cap-bounded drain tail
+/// thread the same `&mut Option<PendingKill>` through the helper.
+struct PendingKill {
+    kill_at_sim: Duration,
+    killed_leader: Option<NodeId>,
+    term_before_kill: u64,
+}
+
+/// Apply a single scheduled fault event AND maintain the per-beat
+/// kill/restart tracking that produces [`BeatRecovery`] entries on
+/// [`ChaosRunResult::recoveries`].
+///
+/// Shared by the two apply sites inside [`run_chaos_with_proposals`]:
+/// the main loop body (when the next scheduled event's sim-time
+/// offset has come due) and the cap-bounded drain tail (when the
+/// `cfg.max_proposals` cap has fired and the loop is draining the
+/// schedule's trailing events at their scheduled sim-time offsets).
+///
+/// # Why a shared helper (and not two inline copies)
+///
+/// Both sites need IDENTICAL semantics: snapshot the live leader
+/// BEFORE `apply_fault` clears it (so `BeatRecovery.killed_leader`
+/// reports "we killed THIS leader at THIS term"), dispatch the
+/// event via [`apply_fault`], and then update `pending_kill` on
+/// kill / drain it into `result.recoveries` on restart. Earlier
+/// iterations of this file kept two inline copies of this block; a
+/// reviewer correctly flagged that any future change to a
+/// [`FaultEvent`] variant's per-beat tracking semantics (or to the
+/// [`BeatRecovery`] fields populated on each beat) would silently
+/// drift between the two sites. Centralising the logic here makes
+/// drift impossible by construction.
+#[allow(clippy::too_many_arguments)]
+async fn apply_event_with_tracking(
+    cluster: &mut SimulatedCluster,
+    ev: &FaultEvent,
+    ev_at: Duration,
+    kr_state: &mut KillRestartState,
+    pending_kill: &mut Option<PendingKill>,
+    result: &mut ChaosRunResult,
+    cfg: &ChaosRunConfig,
+    start_sim: Duration,
+) {
+    // Snapshot the pre-kill leader+term BEFORE apply_fault so
+    // the BeatRecovery for this beat reports "we killed THIS
+    // leader at THIS term" even though apply_fault clears the
+    // leader from the cluster.
+    let pre_kill_leader = if matches!(ev, FaultEvent::KillCurrentLeader) {
+        cluster.try_converged_leader().await
+    } else {
+        None
+    };
+
+    apply_fault(cluster, ev, kr_state).await;
+
+    match ev {
+        FaultEvent::KillCurrentLeader => {
+            *pending_kill = Some(PendingKill {
+                kill_at_sim: ev_at,
+                killed_leader: pre_kill_leader.map(|(l, _)| l),
+                term_before_kill: pre_kill_leader.map(|(_, t)| t).unwrap_or(0),
+            });
+        }
+        FaultEvent::RestartKilledLeader => {
+            if let Some(pk) = pending_kill.take() {
+                let observed = cluster.await_leader(cfg.recovery_observe_slack).await.ok();
+                let observed_at = cluster.clock.elapsed().saturating_sub(start_sim);
+                result.recoveries.push(BeatRecovery {
+                    kill_at_sim: pk.kill_at_sim,
+                    killed_leader: pk.killed_leader,
+                    term_before_kill: pk.term_before_kill,
+                    restart_at_sim: ev_at,
+                    observed_at_sim: observed_at,
+                    leader_after_restart: observed.map(|(l, _)| l),
+                    term_after_restart: observed.map(|(_, t)| t).unwrap_or(0),
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Drive `schedule` against `cluster` while concurrently issuing
 /// sequential proposals on the same async task. Returns the set of
 /// committed `(LogIndex, payload)` pairs the leader acknowledged.
@@ -502,12 +591,9 @@ pub async fn run_chaos_with_proposals(
     // Pending kill snapshot — populated when a `KillCurrentLeader`
     // event fires, consumed when its paired `RestartKilledLeader`
     // fires. The pair becomes one [`BeatRecovery`] in
-    // `result.recoveries`.
-    struct PendingKill {
-        kill_at_sim: Duration,
-        killed_leader: Option<NodeId>,
-        term_before_kill: u64,
-    }
+    // `result.recoveries`. The struct lives at module scope (see
+    // [`PendingKill`]) so [`apply_event_with_tracking`] can mention
+    // it in its signature.
     let mut pending_kill: Option<PendingKill> = None;
 
     // Poll interval for the sim-clock deadline race below. Keeping
@@ -532,43 +618,17 @@ pub async fn run_chaos_with_proposals(
             let ev_at = schedule.events[next_event_idx].0;
             let ev = schedule.events[next_event_idx].1.clone();
 
-            // Snapshot the pre-kill leader+term BEFORE apply_fault so
-            // the BeatRecovery for this beat reports "we killed THIS
-            // leader at THIS term" even though apply_fault clears the
-            // leader from the cluster.
-            let pre_kill_leader = if matches!(ev, FaultEvent::KillCurrentLeader) {
-                cluster.try_converged_leader().await
-            } else {
-                None
-            };
-
-            apply_fault(cluster, &ev, &mut kr_state).await;
-
-            match &ev {
-                FaultEvent::KillCurrentLeader => {
-                    pending_kill = Some(PendingKill {
-                        kill_at_sim: ev_at,
-                        killed_leader: pre_kill_leader.map(|(l, _)| l),
-                        term_before_kill: pre_kill_leader.map(|(_, t)| t).unwrap_or(0),
-                    });
-                }
-                FaultEvent::RestartKilledLeader => {
-                    if let Some(pk) = pending_kill.take() {
-                        let observed = cluster.await_leader(cfg.recovery_observe_slack).await.ok();
-                        let observed_at = cluster.clock.elapsed().saturating_sub(start_sim);
-                        result.recoveries.push(BeatRecovery {
-                            kill_at_sim: pk.kill_at_sim,
-                            killed_leader: pk.killed_leader,
-                            term_before_kill: pk.term_before_kill,
-                            restart_at_sim: ev_at,
-                            observed_at_sim: observed_at,
-                            leader_after_restart: observed.map(|(l, _)| l),
-                            term_after_restart: observed.map(|(_, t)| t).unwrap_or(0),
-                        });
-                    }
-                }
-                _ => {}
-            }
+            apply_event_with_tracking(
+                cluster,
+                &ev,
+                ev_at,
+                &mut kr_state,
+                &mut pending_kill,
+                &mut result,
+                cfg,
+                start_sim,
+            )
+            .await;
 
             next_event_idx += 1;
         }
@@ -604,39 +664,20 @@ pub async fn run_chaos_with_proposals(
 
                 // Mirror the main-loop per-beat tracking so cap-bounded
                 // tests still get BeatRecovery entries for kills that
-                // fire in the schedule's drain tail.
-                let pre_kill_leader = if matches!(ev, FaultEvent::KillCurrentLeader) {
-                    cluster.try_converged_leader().await
-                } else {
-                    None
-                };
-                apply_fault(cluster, &ev, &mut kr_state).await;
-                match &ev {
-                    FaultEvent::KillCurrentLeader => {
-                        pending_kill = Some(PendingKill {
-                            kill_at_sim: ev_at,
-                            killed_leader: pre_kill_leader.map(|(l, _)| l),
-                            term_before_kill: pre_kill_leader.map(|(_, t)| t).unwrap_or(0),
-                        });
-                    }
-                    FaultEvent::RestartKilledLeader => {
-                        if let Some(pk) = pending_kill.take() {
-                            let observed =
-                                cluster.await_leader(cfg.recovery_observe_slack).await.ok();
-                            let observed_at = cluster.clock.elapsed().saturating_sub(start_sim);
-                            result.recoveries.push(BeatRecovery {
-                                kill_at_sim: pk.kill_at_sim,
-                                killed_leader: pk.killed_leader,
-                                term_before_kill: pk.term_before_kill,
-                                restart_at_sim: ev_at,
-                                observed_at_sim: observed_at,
-                                leader_after_restart: observed.map(|(l, _)| l),
-                                term_after_restart: observed.map(|(_, t)| t).unwrap_or(0),
-                            });
-                        }
-                    }
-                    _ => {}
-                }
+                // fire in the schedule's drain tail. Same helper as the
+                // main loop — drift between the two apply sites is
+                // impossible by construction.
+                apply_event_with_tracking(
+                    cluster,
+                    &ev,
+                    ev_at,
+                    &mut kr_state,
+                    &mut pending_kill,
+                    &mut result,
+                    cfg,
+                    start_sim,
+                )
+                .await;
                 next_event_idx += 1;
             }
             break;
@@ -1770,28 +1811,6 @@ async fn await_quorum_convergence(
     }
 }
 
-/// Drive the cluster to FULL convergence after a chaos run:
-///
-/// 1. Find the current alive leader; read its `commit_index` as the
-///    convergence target.
-/// 2. Wait until every alive node's recording state machine has
-///    `last_applied >= target` (i.e. the leader's committed prefix
-///    is fully replicated AND applied on every alive replica).
-/// 3. Re-snapshot the leader. If the leader changed OR the
-///    `commit_index` advanced, set the new target and loop. If the
-///    leader+term+commit_index were stable across two consecutive
-///    poll passes AND every alive node was already caught up, the
-///    cluster has converged: return `Ok(converged_commit_index)`.
-///
-/// Uses a single GLOBAL `recovery_deadline` measured in simulated
-/// time (plus a generous wall-clock backstop) — leader churn or
-/// late-fetching followers can extend the wait, but cannot
-/// indefinitely refresh the deadline.
-///
-/// Returns `Ok(converged_commit_index)` on success or a diagnostic
-/// `String` on timeout. The string includes per-node
-/// `(node_id, last_applied, commit_index)` snapshots so the operator
-/// can see which replica stalled.
 /// Drive the cluster to FULL convergence after a chaos run:
 ///
 /// 1. Find the current alive leader; verify there's exactly one.
